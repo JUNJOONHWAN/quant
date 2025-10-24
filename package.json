@@ -1,0 +1,9 @@
+{
+  "name": "market-stability-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "generate:data": "node scripts/generate-data.js"
+  }
+}

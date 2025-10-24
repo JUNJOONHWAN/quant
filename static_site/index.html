@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>시장 안정성 대시보드</title>
+  <link rel="stylesheet" href="assets/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="assets/metrics.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>시장 안정성 지수</h1>
+    <p class="subtitle">자산 상관관계를 활용한 일별 시장 안정성 모니터링</p>
+    <div class="update-info">
+      <span id="last-updated"></span>
+      <span id="generated-at"></span>
+    </div>
+  </header>
+  <div id="error-box" class="error hidden"></div>
+  <section class="controls">
+    <label>
+      윈도우
+      <select id="window-select"></select>
+    </label>
+    <label>
+      표시 기간
+      <select id="range-select">
+        <option value="30">30일</option>
+        <option value="60">60일</option>
+        <option value="90">90일</option>
+        <option value="180">180일</option>
+      </select>
+    </label>
+    <label>
+      자산 쌍
+      <select id="pair-select"></select>
+    </label>
+  </section>
+  <main>
+    <section class="panel" id="gauge-panel">
+      <div class="panel-header">
+        <h2>시장 안정성 게이지</h2>
+        <button type="button" class="info" data-target="info-stability">ⓘ</button>
+      </div>
+      <div id="stability-gauge" class="chart"></div>
+      <ul class="legend">
+        <li><span class="legend-box red"></span>불안정 (0.0 - 0.3)</li>
+        <li><span class="legend-box yellow"></span>중립 (0.3 - 0.4)</li>
+        <li><span class="legend-box green"></span>안정 (0.4 - 1.0)</li>
+      </ul>
+    </section>
+
+    <section class="panel" id="subgauges-panel">
+      <div class="panel-header">
+        <h2>하위 지수</h2>
+        <button type="button" class="info" data-target="info-sub">ⓘ</button>
+      </div>
+      <div class="sub-gauges">
+        <div class="sub-gauge">
+          <h3>주식-암호화폐</h3>
+          <div id="stock-crypto-gauge" class="chart"></div>
+        </div>
+        <div class="sub-gauge">
+          <h3>전통자산</h3>
+          <div id="traditional-gauge" class="chart"></div>
+        </div>
+        <div class="sub-gauge">
+          <h3>안전자산 결합력</h3>
+          <div id="safe-neg-gauge" class="chart"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>지수 추이</h2>
+      </div>
+      <div id="history-chart" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>자산 상관관계 히트맵</h2>
+      </div>
+      <div id="heatmap-chart" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>자산 쌍 상세</h2>
+        <button type="button" class="info" data-target="info-pair">ⓘ</button>
+      </div>
+      <div id="pair-chart" class="chart"></div>
+    </section>
+  </main>
+
+  <section class="info-popover" id="info-stability">
+    <h3>시장 안정성 지수</h3>
+    <p>주요 자산 간 상관계수의 절댓값을 가중 평균하여 계산합니다. 값이 높을수록 자산들이 동조화되어 있으며, 충격 발생 시 스프레드 축소를 통해 안정화될 가능성이 높음을 뜻합니다.</p>
+  </section>
+  <section class="info-popover" id="info-sub">
+    <h3>하위 지수 설명</h3>
+    <ul>
+      <li><strong>주식-암호화폐</strong>: QQQ/SPY와 BTC 간 절댓값 상관계수 평균.</li>
+      <li><strong>전통자산</strong>: QQQ, SPY, TLT, GLD 간 절댓값 상관계수 평균.</li>
+      <li><strong>안전자산 결합력</strong>: 주식과 (TLT, GLD) 조합의 음의 상관관계를 0 이상으로 환산해 평균.</li>
+    </ul>
+  </section>
+  <section class="info-popover" id="info-pair">
+    <h3>자산 쌍 상세</h3>
+    <p>선택한 자산 쌍의 일별 가격(좌측 축)과 롤링 상관계수(우측 축)를 동시에 보여줍니다. 상관계수가 1에 가까울수록 두 자산이 같은 방향으로 움직이며, -1에 가까울수록 반대 방향으로 움직입니다.</p>
+  </section>
+
+  <footer>
+    <p>데이터 출처: Alpha Vantage 일별 엔드포인트(비상업적 이용). 투자 조언이 아니며 정확성을 보장하지 않습니다.</p>
+  </footer>
+</body>
+</html>
