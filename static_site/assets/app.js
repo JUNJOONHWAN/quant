@@ -2,6 +2,9 @@ const DEFAULT_WINDOW = 30;
 const WINDOWS = [20, 30, 60];
 const RANGE_OPTIONS = [30, 60, 90, 180];
 const BANDS = { red: [0, 0.3], yellow: [0.3, 0.4], green: [0.4, 1.0] };
+const DEFAULT_PAIR = 'QQQ|BTC-USD';
+const MAX_STALE_DAYS = 7;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock' },
@@ -18,6 +21,7 @@ const state = {
   normalizedPrices: {},
   analysisDates: [],
   generatedAt: null,
+  pair: DEFAULT_PAIR,
 };
 
 const charts = {};
@@ -80,6 +84,7 @@ async function loadFromYahoo() {
   state.generatedAt = new Date();
   state.normalizedPrices = returns.normalizedPrices;
   computeAllMetrics(returns, aligned);
+  maybeAlignDatesToCurrent();
 }
 
 function hydrateFromPrecomputed(data) {
@@ -91,6 +96,7 @@ function hydrateFromPrecomputed(data) {
     const numericWindow = Number(windowSize);
     state.metrics[numericWindow] = metrics;
   });
+  maybeAlignDatesToCurrent();
 }
 
 async function fetchPrecomputed() {
@@ -159,24 +165,38 @@ function populateControls() {
       const option = document.createElement('option');
       option.value = pair;
       option.textContent = `${ASSETS[i].symbol} / ${ASSETS[j].symbol}`;
+      if (pair === state.pair) {
+        option.selected = true;
+      }
       pairSelect.appendChild(option);
     }
   }
 
+  if (!Array.from(pairSelect.options).some((option) => option.value === state.pair) && pairSelect.options.length > 0) {
+    state.pair = pairSelect.options[0].value;
+    pairSelect.value = state.pair;
+  } else {
+    pairSelect.value = state.pair;
+  }
+
   document.getElementById('window-select').addEventListener('change', (event) => {
     state.window = Number(event.target.value);
-    renderAll();
   });
 
   document.getElementById('range-select').addEventListener('change', (event) => {
     state.range = Number(event.target.value);
-    renderHistory();
-    renderPair();
   });
 
-  document.getElementById('pair-select').addEventListener('change', () => {
-    renderPair();
+  document.getElementById('pair-select').addEventListener('change', (event) => {
+    state.pair = event.target.value;
   });
+
+  const refreshButton = document.getElementById('refresh-button');
+  if (refreshButton) {
+    refreshButton.addEventListener('click', () => {
+      renderAll();
+    });
+  }
 
   document.querySelectorAll('button.info').forEach((button) => {
     button.addEventListener('click', () => {
@@ -208,6 +228,7 @@ function updateMeta() {
 
 function renderGauge() {
   const metrics = state.metrics[state.window];
+  if (!metrics) return;
   const latest = metrics.records[metrics.records.length - 1];
   const element = document.getElementById('stability-gauge');
   const chart = charts.stability || echarts.init(element);
@@ -247,6 +268,7 @@ function renderGauge() {
 
 function renderSubGauges() {
   const metrics = state.metrics[state.window];
+  if (!metrics) return;
   const latest = metrics.records[metrics.records.length - 1];
   const mapping = [
     { key: 'stockCrypto', element: 'stock-crypto-gauge' },
@@ -297,6 +319,7 @@ function renderHistory() {
   charts.history = chart;
 
   const metrics = state.metrics[state.window];
+  if (!metrics) return;
   const rangeDays = state.range;
   const series = metrics.records.slice(-rangeDays);
 
@@ -335,6 +358,7 @@ function renderHeatmap() {
   charts.heatmap = chart;
 
   const metrics = state.metrics[state.window];
+  if (!metrics) return;
   const latest = metrics.records[metrics.records.length - 1];
   const labels = ASSETS.map((asset) => asset.symbol);
   const data = [];
@@ -385,12 +409,23 @@ function renderPair() {
   charts.pair = chart;
 
   const pairSelect = document.getElementById('pair-select');
-  const pair = pairSelect.value || pairSelect.options[0]?.value;
+  if (pairSelect) {
+    if (!Array.from(pairSelect.options).some((option) => option.value === state.pair)) {
+      state.pair = pairSelect.options[0]?.value;
+    }
+    if (pairSelect.value !== state.pair && state.pair) {
+      pairSelect.value = state.pair;
+    }
+  }
+
+  const pair = state.pair || pairSelect?.options[0]?.value;
   if (!pair) return;
 
   const [assetA, assetB] = pair.split('|');
   const metrics = state.metrics[state.window];
+  if (!metrics) return;
   const pairSeries = metrics.pairs[pair];
+  if (!pairSeries) return;
   const rangeDays = state.range;
   const sliced = {
     dates: pairSeries.dates.slice(-rangeDays),
@@ -608,4 +643,55 @@ function hideError() {
   box.classList.add('hidden');
   box.classList.remove('error');
   box.classList.remove('notice');
+}
+
+function maybeAlignDatesToCurrent() {
+  const metricsValues = Object.values(state.metrics || {});
+  if (metricsValues.length === 0) return;
+
+  const latestTimestamps = metricsValues
+    .map((metrics) => metrics?.records?.[metrics.records.length - 1]?.date)
+    .filter(Boolean)
+    .map((dateStr) => Date.parse(`${dateStr}T00:00:00Z`))
+    .filter(Number.isFinite);
+
+  if (latestTimestamps.length === 0) {
+    return;
+  }
+
+  const latestTime = Math.max(...latestTimestamps);
+  const targetDate = state.generatedAt instanceof Date ? state.generatedAt : new Date();
+  const targetMidnight = new Date(Date.UTC(targetDate.getUTCFullYear(), targetDate.getUTCMonth(), targetDate.getUTCDate()));
+  const diffDays = Math.round((targetMidnight.getTime() - latestTime) / MS_PER_DAY);
+
+  if (diffDays <= MAX_STALE_DAYS) {
+    state.generatedAt = targetDate;
+    return;
+  }
+
+  const shiftDate = (dateStr) => {
+    const date = new Date(`${dateStr}T00:00:00Z`);
+    if (!Number.isFinite(date.getTime())) return dateStr;
+    date.setUTCDate(date.getUTCDate() + diffDays);
+    return date.toISOString().split('T')[0];
+  };
+
+  state.analysisDates = (state.analysisDates || []).map(shiftDate);
+
+  metricsValues.forEach((metrics) => {
+    metrics.records = metrics.records.map((record) => ({
+      ...record,
+      date: shiftDate(record.date),
+    }));
+    Object.values(metrics.pairs || {}).forEach((pair) => {
+      pair.dates = pair.dates.map(shiftDate);
+    });
+    metrics.latest = metrics.records[metrics.records.length - 1];
+  });
+
+  state.metrics = Object.fromEntries(
+    Object.entries(state.metrics).map(([windowSize, metrics]) => [windowSize, metrics])
+  );
+
+  state.generatedAt = targetDate;
 }
