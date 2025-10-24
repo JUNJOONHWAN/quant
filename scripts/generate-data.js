@@ -17,15 +17,9 @@ const {
 } = require('../static_site/assets/metrics');
 
 const API_KEY = process.env.ALPHAVANTAGE_API_KEY;
-if (!API_KEY) {
-  console.error('error: ALPHAVANTAGE_API_KEY environment variable is not set.');
-  process.exit(1);
-}
-
-if (typeof fetch !== 'function') {
-  console.error('error: global fetch is not available. Please run the generator with Node.js 18 or newer.');
-  process.exit(1);
-}
+const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
+const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
+const SAMPLE_PATH = path.join(DATA_DIR, 'precomputed-sample.json');
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
@@ -40,30 +34,40 @@ const RANGE_YEARS = 5;
 const ONE_MINUTE = 60 * 1000;
 
 async function main() {
-  const assetSeries = [];
-  const cutoffDate = computeCutoffDate(RANGE_YEARS);
-
-  for (let index = 0; index < ASSETS.length; index += 1) {
-    const asset = ASSETS[index];
-    console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
-    const series = await fetchAlphaSeries(asset, cutoffDate);
-    assetSeries.push(series);
-
-    if (index < ASSETS.length - 1) {
-      console.log('Waiting to respect Alpha Vantage rate limits...');
-      await delay(ONE_MINUTE / 5 + 1000); // ~13 seconds between calls (5/min limit)
-    }
+  if (typeof fetch !== 'function') {
+    await useFallback('global fetch is not available. Please run on Node.js 18+ or rely on the bundled sample dataset.');
+    return;
   }
 
-  const aligned = alignSeries(assetSeries);
-  const returns = computeReturns(aligned);
-  const output = buildOutput(aligned, returns);
+  if (!API_KEY) {
+    await useFallback('ALPHAVANTAGE_API_KEY environment variable is not set. Using bundled sample dataset instead.');
+    return;
+  }
 
-  const targetDir = path.join(__dirname, '..', 'static_site', 'data');
-  await fs.mkdir(targetDir, { recursive: true });
-  const outputPath = path.join(targetDir, 'precomputed.json');
-  await fs.writeFile(outputPath, JSON.stringify(output));
-  console.log(`Wrote ${outputPath}`);
+  try {
+    const assetSeries = [];
+    const cutoffDate = computeCutoffDate(RANGE_YEARS);
+
+    for (let index = 0; index < ASSETS.length; index += 1) {
+      const asset = ASSETS[index];
+      console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
+      const series = await fetchAlphaSeries(asset, cutoffDate);
+      assetSeries.push(series);
+
+      if (index < ASSETS.length - 1) {
+        console.log('Waiting to respect Alpha Vantage rate limits...');
+        await delay(ONE_MINUTE / 5 + 1000); // ~13 seconds between calls (5/min limit)
+      }
+    }
+
+    const aligned = alignSeries(assetSeries);
+    const returns = computeReturns(aligned);
+    const output = buildOutput(aligned, returns);
+    await writeOutput(output);
+  } catch (error) {
+    console.error(error);
+    await useFallback('Failed to generate dataset from Alpha Vantage. Using bundled sample dataset instead.', error);
+  }
 }
 
 function computeCutoffDate(years) {
@@ -165,6 +169,23 @@ function buildOutput(aligned, returns) {
     assets: ASSETS.map(({ symbol, label, category }) => ({ symbol, label, category })),
     windows,
   };
+}
+
+async function writeOutput(output) {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(PRECOMPUTED_PATH, JSON.stringify(output));
+  console.log(`Wrote ${PRECOMPUTED_PATH}`);
+}
+
+async function useFallback(message, error) {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  console.warn(`warning: ${message}`);
+  if (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`detail: ${detail}`);
+  }
+  await fs.copyFile(SAMPLE_PATH, PRECOMPUTED_PATH);
+  console.warn(`Copied ${SAMPLE_PATH} -> ${PRECOMPUTED_PATH}`);
 }
 
 function computeWindowMetrics(window, returns, aligned) {
