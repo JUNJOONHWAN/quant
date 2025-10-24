@@ -35,10 +35,19 @@
       </select>
     </label>
     <label>
+      맞춤 시작일
+      <input type="date" id="custom-start" />
+    </label>
+    <label>
+      맞춤 종료일
+      <input type="date" id="custom-end" />
+    </label>
+    <label>
       자산 쌍
       <select id="pair-select"></select>
     </label>
     <button type="button" id="refresh-button" class="refresh-button">리프레시</button>
+    <p id="custom-range-feedback" class="controls-helper"></p>
   </section>
   <main>
     <section class="panel" id="gauge-panel">

@@ -22,6 +22,11 @@ const state = {
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
+  customRange: {
+    start: null,
+    end: null,
+    valid: true,
+  },
 };
 
 const charts = {};
@@ -134,6 +139,7 @@ function isLocalhost() {
 
 function populateControls() {
   const windowSelect = document.getElementById('window-select');
+  if (!windowSelect) return;
   windowSelect.innerHTML = '';
   WINDOWS.forEach((windowSize) => {
     const option = document.createElement('option');
@@ -146,6 +152,7 @@ function populateControls() {
   });
 
   const rangeSelect = document.getElementById('range-select');
+  if (!rangeSelect) return;
   rangeSelect.innerHTML = '';
   RANGE_OPTIONS.forEach((range) => {
     const option = document.createElement('option');
@@ -158,6 +165,7 @@ function populateControls() {
   });
 
   const pairSelect = document.getElementById('pair-select');
+  if (!pairSelect) return;
   pairSelect.innerHTML = '';
   for (let i = 0; i < ASSETS.length; i += 1) {
     for (let j = i + 1; j < ASSETS.length; j += 1) {
@@ -179,30 +187,100 @@ function populateControls() {
     pairSelect.value = state.pair;
   }
 
-  document.getElementById('window-select').addEventListener('change', (event) => {
-    state.window = Number(event.target.value);
-  });
+  if (!windowSelect.dataset.bound) {
+    windowSelect.addEventListener('change', (event) => {
+      state.window = Number(event.target.value);
+    });
+    windowSelect.dataset.bound = 'true';
+  }
 
-  document.getElementById('range-select').addEventListener('change', (event) => {
-    state.range = Number(event.target.value);
-  });
+  if (!rangeSelect.dataset.bound) {
+    rangeSelect.addEventListener('change', (event) => {
+      state.range = Number(event.target.value);
+    });
+    rangeSelect.dataset.bound = 'true';
+  }
 
-  document.getElementById('pair-select').addEventListener('change', (event) => {
-    state.pair = event.target.value;
-  });
+  if (!pairSelect.dataset.bound) {
+    pairSelect.addEventListener('change', (event) => {
+      state.pair = event.target.value;
+    });
+    pairSelect.dataset.bound = 'true';
+  }
 
   const refreshButton = document.getElementById('refresh-button');
-  if (refreshButton) {
+  const startInput = document.getElementById('custom-start');
+  const endInput = document.getElementById('custom-end');
+
+  const firstDate = state.analysisDates?.[0] || '';
+  const lastDate = state.analysisDates?.[state.analysisDates.length - 1] || '';
+
+  if (startInput) {
+    startInput.min = firstDate;
+    startInput.max = lastDate;
+    startInput.value = state.customRange.start || '';
+  }
+
+  if (endInput) {
+    endInput.min = firstDate;
+    endInput.max = lastDate;
+    endInput.value = state.customRange.end || '';
+  }
+
+  const handleCustomRangeChange = () => {
+    state.customRange.start = startInput?.value || null;
+    state.customRange.end = endInput?.value || null;
+
+    const startTime = parseDateSafe(state.customRange.start);
+    const endTime = parseDateSafe(state.customRange.end);
+    const hasSelection = startTime !== null || endTime !== null;
+    const invalid = startTime !== null && endTime !== null && startTime > endTime;
+
+    state.customRange.valid = !invalid;
+
+    if (refreshButton) {
+      refreshButton.disabled = invalid;
+    }
+
+    if (invalid) {
+      setCustomRangeFeedback('시작일은 종료일보다 앞서거나 같아야 합니다.');
+      return;
+    }
+
+    if (hasSelection) {
+      setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
+    } else {
+      setCustomRangeFeedback('');
+    }
+  };
+
+  if (startInput && !startInput.dataset.bound) {
+    startInput.addEventListener('change', handleCustomRangeChange);
+    startInput.dataset.bound = 'true';
+  }
+
+  if (endInput && !endInput.dataset.bound) {
+    endInput.addEventListener('change', handleCustomRangeChange);
+    endInput.dataset.bound = 'true';
+  }
+
+  handleCustomRangeChange();
+
+  if (refreshButton && !refreshButton.dataset.bound) {
     refreshButton.addEventListener('click', () => {
       renderAll();
     });
+    refreshButton.dataset.bound = 'true';
   }
 
   document.querySelectorAll('button.info').forEach((button) => {
-    button.addEventListener('click', () => {
-      const target = document.getElementById(button.dataset.target);
-      target.classList.toggle('visible');
-    });
+    if (!button.dataset.bound) {
+      button.addEventListener('click', () => {
+        const target = document.getElementById(button.dataset.target);
+        target.classList.toggle('visible');
+      });
+      button.dataset.bound = 'true';
+    }
   });
 }
 
@@ -320,8 +398,34 @@ function renderHistory() {
 
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const rangeDays = state.range;
-  const series = metrics.records.slice(-rangeDays);
+  const customRange = state.customRange || { start: null, end: null, valid: true };
+  const startTime = parseDateSafe(customRange.start);
+  const endTime = parseDateSafe(customRange.end);
+  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
+
+  let series = [];
+
+  if (hasCustomRange) {
+    series = metrics.records.filter((item) => {
+      const time = parseDateSafe(item.date);
+      if (time === null) return false;
+      if (startTime !== null && time < startTime) return false;
+      if (endTime !== null && time > endTime) return false;
+      return true;
+    });
+
+    if (series.length === 0) {
+      setCustomRangeFeedback('선택한 기간에 해당하는 데이터가 없습니다.');
+      chart.clear();
+      return;
+    }
+
+    setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
+  } else {
+    const rangeDays = state.range;
+    series = metrics.records.slice(-rangeDays);
+    setCustomRangeFeedback('');
+  }
 
   chart.setOption({
     tooltip: { trigger: 'axis' },
@@ -426,12 +530,38 @@ function renderPair() {
   if (!metrics) return;
   const pairSeries = metrics.pairs[pair];
   if (!pairSeries) return;
-  const rangeDays = state.range;
+  const customRange = state.customRange || { start: null, end: null, valid: true };
+  const startTime = parseDateSafe(customRange.start);
+  const endTime = parseDateSafe(customRange.end);
+  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
+
+  const indices = [];
+  if (hasCustomRange) {
+    pairSeries.dates.forEach((date, index) => {
+      const time = parseDateSafe(date);
+      if (time === null) return;
+      if (startTime !== null && time < startTime) return;
+      if (endTime !== null && time > endTime) return;
+      indices.push(index);
+    });
+  } else {
+    const rangeDays = state.range;
+    const startIndex = Math.max(pairSeries.dates.length - rangeDays, 0);
+    for (let idx = startIndex; idx < pairSeries.dates.length; idx += 1) {
+      indices.push(idx);
+    }
+  }
+
+  if (indices.length === 0) {
+    chart.clear();
+    return;
+  }
+
   const sliced = {
-    dates: pairSeries.dates.slice(-rangeDays),
-    correlation: pairSeries.correlation.slice(-rangeDays),
-    priceA: pairSeries.priceA.slice(-rangeDays),
-    priceB: pairSeries.priceB.slice(-rangeDays),
+    dates: indices.map((index) => pairSeries.dates[index]),
+    correlation: indices.map((index) => pairSeries.correlation[index]),
+    priceA: indices.map((index) => pairSeries.priceA[index]),
+    priceB: indices.map((index) => pairSeries.priceB[index]),
   };
 
   chart.setOption({
@@ -616,6 +746,18 @@ function safeNumber(value, fallback = 0) {
     return fallback;
   }
   return 0;
+}
+
+function parseDateSafe(value) {
+  if (!value) return null;
+  const time = Date.parse(`${value}T00:00:00Z`);
+  return Number.isFinite(time) ? time : null;
+}
+
+function setCustomRangeFeedback(message) {
+  const feedback = document.getElementById('custom-range-feedback');
+  if (!feedback) return;
+  feedback.textContent = message || '';
 }
 
 function showError(message) {
