@@ -10,45 +10,30 @@
 
 ## 2. Data Pipeline
 
-1. **Source**: Yahoo Finance (unofficial) via `yfinance`. Supports historical and daily close data for all assets.
-2. **Scheduler**: GitHub Actions cron at `30 21 * * *` (UTC) ≈ 06:30 KST. Triggers the collector once per day.
-3. **Collector (`collector/run.py`)**:
-   - Download two years of daily OHLCV data for the tracked symbols.
-   - Align trading days, remove dates with insufficient overlap, prevent forward filling across holidays.
-   - Compute log returns \(r_{a,t} = \ln(P_{a,t} / P_{a,t-1})\).
-   - Calculate rolling correlations for 20, 30, and 60 session windows.
-   - Derive the Market Stability Index and sub-indexes (see §4).
-   - Export JSON artifacts into `public/data/`.
-4. **Artifacts**:
-   - `current.json`: Latest index snapshot, trend delta, sub-index values.
-   - `history_<window>.json`: Time series for selected window (30, 60, 90, 180 day lookbacks).
-   - `corr_matrix_<date>_w<window>.json`: Correlation matrix with sample coverage for each lookback window.
-   - `meta.json`: Asset metadata, update timestamp, disclaimer text.
-5. **Hosting**: GitHub Pages (or Cloudflare Pages) serves `/public`. JSON files cached for 24 hours; bust cache by appending query string `?v=<iso-date>` when fetching.
-6. **Monitoring**: GitHub Actions email/Slack notification on workflow failure. "Stale" badge rendered in UI when `asof` is older than 36 hours.
+1. **Source**: Alpha Vantage daily endpoints. ETFs/ETNs use `TIME_SERIES_DAILY_ADJUSTED`; BTC-USD uses `DIGITAL_CURRENCY_DAILY`. Access requires the `ALPHAVANTAGE_API_KEY` secret.
+2. **Generator (`scripts/generate-data.js`)**: Node.js (18+) script that pulls five years of closes, aligns trading days, computes log returns, and derives rolling correlations for 20/30/60 session windows before emitting a consolidated JSON payload.
+3. **Trigger**: `.github/workflows/deploy.yml` executes the generator on every push to `main` (and on manual dispatch). Add a cron trigger if an automatic daily refresh is desired.
+4. **Artifact**: `static_site/data/precomputed.json` containing windowed records (stability, smoothed stability, deltas, correlation matrices, sub-indexes) plus pair-level price/correlation series and metadata (generation timestamp, asset catalog).
+5. **Hosting**: The same workflow uploads `static_site/`—including the freshly generated JSON—to GitHub Pages via the official Actions integration.
+6. **Monitoring**: Workflow failures surface in the GitHub Actions UI; the frontend shows a descriptive error if the JSON is missing or stale.
 
 ## 3. Repository Structure
 
 ```
 quant/
-├── collector/
-│   ├── run.py            # Entry point for the ETL job
-│   ├── config.json       # Correlation windows, weights, threshold values
-│   ├── utils.py          # Shared helpers (fetch, normalize, compute)
-│   └── tests/            # Regression tests using fixture CSV snapshots
-├── public/
-│   ├── data/             # Generated JSON artifacts served to the frontend
-│   └── index.html        # Bundled static site (built by web/)
-├── web/
-│   ├── package.json
-│   ├── src/
-│   │   ├── components/   # Gauges, heatmap, correlation charts
-│   │   ├── hooks/        # Data fetching, stale detection
-│   │   └── pages/        # Next.js pages (or static SPA entrypoint)
-│   └── tsconfig.json
 ├── .github/workflows/
-│   └── daily-collector.yml
-└── README.md             # High-level documentation
+│   └── deploy.yml              # Builds data + deploys static_site/ to GitHub Pages
+├── docs/
+│   └── market_stability_app_plan.md
+├── scripts/
+│   └── generate-data.js        # Alpha Vantage fetcher + precomputation logic
+├── static_site/
+│   ├── assets/                 # Browser JavaScript, CSS, shared metric helpers
+│   ├── data/                   # Holds precomputed.json generated during deployment
+│   └── index.html              # Dashboard entry point served by Pages
+├── tests/
+│   └── metrics.test.js         # Node-based regression tests for metric helpers
+└── README.md                   # Setup, deployment, and data source docs
 ```
 
 ## 4. Computation Specifications
@@ -82,32 +67,43 @@ quant/
 
 ## 5. API & Frontend Contract
 
-- The frontend consumes JSON via `fetch('/data/<file>.json?v=<date>')`.
-- Gauge components expect the following structure:
+- The frontend downloads a single payload: `static_site/data/precomputed.json`.
+- Top-level fields:
+  - `generatedAt`: ISO timestamp (UTC) when the dataset was produced.
+  - `analysisDates`: Array of ISO dates aligned with the rolling return series.
+  - `normalizedPrices`: Map from symbol to normalized price index (aligned with `analysisDates`).
+  - `assets`: Symbol metadata consumed by tooltips and selectors.
+  - `windows`: Object keyed by window length (`"20"`, `"30"`, `"60"`). Each entry contains:
+    - `records`: Array ordered by date with `stability`, `smoothed`, `delta`, `sub` (sub-index breakdown), and `matrix` (5×5 correlation matrix).
+    - `average180`: Mean stability over the trailing 180 trading days.
+    - `latest`: Convenience copy of the last record.
+    - `pairs`: Map of `<symbolA>|<symbolB>` to aligned `dates`, `correlation`, `priceA`, `priceB` arrays for the pair detail chart.
 
 ```json
 {
-  "S": 0.447,
-  "dS": 0.012,
-  "window": 30,
-  "sub": {
-    "stock_crypto": 0.667,
-    "traditional": 0.447,
-    "safe_neg": 0.310
+  "generatedAt": "2025-10-24T08:30:17.122Z",
+  "analysisDates": ["2024-01-02", "2024-01-03", "…"],
+  "normalizedPrices": {
+    "QQQ": [1.0, 1.003, "…"],
+    "SPY": [1.0, 0.998, "…"]
   },
-  "bands": {
-    "red": [0.0, 0.3],
-    "yellow": [0.3, 0.4],
-    "green": [0.4, 1.0]
-  },
-  "updated_at_kst": "2025-10-24T06:30:00+09:00"
+  "assets": [
+    { "symbol": "QQQ", "label": "QQQ (NASDAQ 100 ETF)", "category": "stock" }
+  ],
+  "windows": {
+    "30": {
+      "average180": 0.412,
+      "latest": { "date": "2025-10-23", "stability": 0.447, "delta": 0.012, "sub": { "stockCrypto": 0.667, "traditional": 0.447, "safeNegative": 0.310 } },
+      "records": [
+        { "date": "2024-02-15", "stability": 0.352, "smoothed": 0.344, "delta": -0.008, "matrix": [[1, 0.89, "…"]], "sub": { "stockCrypto": 0.51, "traditional": 0.44, "safeNegative": 0.28 } }
+      ],
+      "pairs": {
+        "QQQ|SPY": { "dates": ["2024-02-15", "…"], "correlation": [0.94, "…"], "priceA": [1.0, "…"], "priceB": [1.0, "…"] }
+      }
+    }
+  }
 }
 ```
-
-- Correlation matrix file contains:
-  - `symbols`: ordered list of asset tickers.
-  - `matrix`: 2D array of correlations for the specified window.
-  - `coverage`: 2D array of valid observation ratios (0–1).
 
 ## 6. Frontend Experience
 
@@ -117,15 +113,15 @@ quant/
 - **Correlation Heatmap**: 5×5 matrix (upper triangle) with diverging color palette. Clicking a cell opens the pair detail panel.
 - **Pair Detail View**: Dual-axis chart plotting normalized prices and rolling correlation for the selected window.
 - **Controls**: Dropdowns for date range (30/60/90/180 days), correlation window (20/30/60), asset toggles. Changes switch the JSON endpoint (no server computation required).
-- **Tooltips**: `ⓘ` icons deliver glossary entries (correlation definition, stability theory, data limitations) sourced from `meta.json`.
+- **Tooltips**: `ⓘ` icons deliver glossary entries (correlation definition, stability theory, data limitations) embedded directly in the frontend copy.
 - **Staleness Warning**: Banner if data older than 36 hours.
 
 ## 7. Deployment & Operations
 
-- **CI/CD**: Pull requests run unit and regression tests. Merges to `main` trigger the collector workflow and frontend build.
-- **Secrets**: No credentials required for Yahoo Finance. If migrated to paid feeds later, use GitHub Encrypted Secrets.
-- **Error Handling**: If daily job fails, retain previous JSON and mark `status` as `stale`.
-- **Documentation**: Update `README.md` with setup instructions, data source disclaimer, and frontend preview link.
+- **CI/CD**: Pull requests run unit tests (`npm test`). Pushes to `main` execute `deploy.yml`, which generates `precomputed.json` and deploys Pages.
+- **Secrets**: `ALPHAVANTAGE_API_KEY` is mandatory. Store it as a repository secret so the workflow can read it. Future paid feeds can reuse the same mechanism.
+- **Error Handling**: Workflow failure leaves the previous deployment intact; the frontend displays a "데이터를 생성하세요" message if the JSON is missing.
+- **Documentation**: README now covers key provisioning, local previews, and the Alpha Vantage disclaimer.
 
 ## 8. Future Enhancements
 

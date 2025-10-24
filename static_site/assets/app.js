@@ -22,23 +22,83 @@ const state = {
 
 const charts = {};
 
+const {
+  alignSeries,
+  computeReturns: computeReturnsForState,
+  buildCorrelationMatrix,
+  computeStability,
+  computeSubIndices,
+  ema,
+  mean,
+} = window.MarketMetrics;
+
 document.addEventListener('DOMContentLoaded', init);
 
 async function init() {
   showError('데이터를 불러오는 중입니다...');
+  state.metrics = {};
   try {
-    const assetSeries = await Promise.all(ASSETS.map(fetchYahooSeries));
-    const aligned = alignSeries(assetSeries);
-    const returns = computeReturns(aligned);
-    computeAllMetrics(returns, aligned);
+    const precomputed = await fetchPrecomputed();
+    if (precomputed.status === 'ok') {
+      hydrateFromPrecomputed(precomputed.payload);
+    } else if (isLocalhost()) {
+      await loadFromYahoo();
+    } else {
+      throw new Error('PRECOMPUTED_DATA_UNAVAILABLE');
+    }
 
     hideError();
     populateControls();
     renderAll();
   } catch (error) {
     console.error(error);
-    showError('Yahoo Finance 데이터를 불러오지 못했습니다. 잠시 후 다시 시도하거나 네트워크 상태를 확인하세요.');
+    if (error && error.message === 'PRECOMPUTED_DATA_UNAVAILABLE') {
+      showError('사전 계산된 데이터가 없습니다. README에 안내된 GitHub Actions 배치를 실행하거나 `npm run generate:data` 후 커밋해 주세요.');
+    } else {
+      showError('데이터를 불러오지 못했습니다. 네트워크 상태를 확인하거나 데이터를 다시 생성해 주세요.');
+    }
   }
+}
+
+async function loadFromYahoo() {
+  const assetSeries = await Promise.all(ASSETS.map(fetchYahooSeries));
+  const aligned = alignSeries(assetSeries);
+  const returns = computeReturnsForState(aligned);
+  state.analysisDates = returns.dates;
+  state.generatedAt = new Date();
+  state.normalizedPrices = returns.normalizedPrices;
+  computeAllMetrics(returns, aligned);
+}
+
+function hydrateFromPrecomputed(data) {
+  state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
+  state.analysisDates = data.analysisDates || [];
+  state.normalizedPrices = data.normalizedPrices || {};
+  state.metrics = {};
+  Object.entries(data.windows).forEach(([windowSize, metrics]) => {
+    const numericWindow = Number(windowSize);
+    state.metrics[numericWindow] = metrics;
+  });
+}
+
+async function fetchPrecomputed() {
+  try {
+    const response = await fetch('./data/precomputed.json', { cache: 'no-store' });
+    if (response.status === 404) {
+      return { status: 'missing' };
+    }
+    if (!response.ok) {
+      return { status: 'error', error: new Error(`precomputed fetch failed: ${response.status}`) };
+    }
+    const payload = await response.json();
+    return { status: 'ok', payload };
+  } catch (error) {
+    return { status: 'error', error };
+  }
+}
+
+function isLocalhost() {
+  return ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 }
 
 function populateControls() {
@@ -397,63 +457,6 @@ async function fetchYahooSeries(asset) {
   };
 }
 
-function alignSeries(seriesList) {
-  const dateCounts = new Map();
-  seriesList.forEach((series) => {
-    series.dates.forEach((date) => {
-      dateCounts.set(date, (dateCounts.get(date) || 0) + 1);
-    });
-  });
-
-  const targetCount = seriesList.length;
-  const commonDates = Array.from(dateCounts.entries())
-    .filter(([, count]) => count === targetCount)
-    .map(([date]) => date)
-    .sort();
-
-  const priceBySymbol = {};
-  seriesList.forEach((series) => {
-    const map = new Map();
-    series.dates.forEach((date, index) => {
-      map.set(date, series.prices[index]);
-    });
-    priceBySymbol[series.symbol] = commonDates.map((date) => map.get(date));
-  });
-
-  return {
-    dates: commonDates,
-    prices: priceBySymbol,
-    categories: Object.fromEntries(seriesList.map((series) => [series.symbol, series.category])),
-  };
-}
-
-function computeReturns(aligned) {
-  const analysisDates = aligned.dates.slice(1);
-  state.analysisDates = analysisDates;
-  state.generatedAt = new Date();
-
-  const normalizedPrices = {};
-  const returns = {};
-  Object.entries(aligned.prices).forEach(([symbol, prices]) => {
-    if (prices.length < 2) {
-      throw new Error(`${symbol}의 데이터가 충분하지 않습니다.`);
-    }
-    const assetReturns = [];
-    const normalized = [];
-    const base = prices[1];
-    for (let i = 1; i < prices.length; i += 1) {
-      const current = prices[i];
-      const previous = prices[i - 1];
-      assetReturns.push(Math.log(current / previous));
-      normalized.push(current / base);
-    }
-    returns[symbol] = assetReturns;
-    normalizedPrices[symbol] = normalized;
-  });
-  state.normalizedPrices = normalizedPrices;
-  return { dates: analysisDates, returns };
-}
-
 function computeAllMetrics(returns, aligned) {
   WINDOWS.forEach((window) => {
     const metrics = computeWindowMetrics(window, returns, aligned);
@@ -511,69 +514,6 @@ function computeWindowMetrics(window, returns, aligned) {
   };
 }
 
-function buildCorrelationMatrix(symbols, returns, startIndex, endIndex) {
-  const matrix = [];
-  symbols.forEach((symbolA, i) => {
-    const row = [];
-    symbols.forEach((symbolB, j) => {
-      if (i === j) {
-        row.push(1);
-      } else if (j < i) {
-        row.push(matrix[j][i]);
-      } else {
-        const seriesA = returns[symbolA].slice(startIndex, endIndex + 1);
-        const seriesB = returns[symbolB].slice(startIndex, endIndex + 1);
-        row.push(correlation(seriesA, seriesB));
-      }
-    });
-    matrix.push(row);
-  });
-  return matrix;
-}
-
-function computeStability(matrix, symbols, categories) {
-  let weighted = 0;
-  let totalWeight = 0;
-  for (let i = 0; i < symbols.length; i += 1) {
-    for (let j = i + 1; j < symbols.length; j += 1) {
-      const weight = pairWeight(symbols[i], symbols[j], categories);
-      weighted += weight * Math.abs(matrix[i][j]);
-      totalWeight += weight;
-    }
-  }
-  return totalWeight > 0 ? weighted / totalWeight : 0;
-}
-
-function computeSubIndices(matrix, symbols, categories) {
-  const stockSymbols = symbols.filter((symbol) => categories[symbol] === 'stock');
-  const cryptoSymbols = symbols.filter((symbol) => categories[symbol] === 'crypto');
-  const traditionalSymbols = symbols.filter((symbol) => ['stock', 'bond', 'gold'].includes(categories[symbol]));
-  const safeTargets = symbols.filter((symbol) => ['bond', 'gold'].includes(categories[symbol]));
-
-  const stockCrypto = averagePairs(matrix, symbols, stockSymbols, cryptoSymbols, Math.abs);
-  const traditional = averagePairs(matrix, symbols, traditionalSymbols, traditionalSymbols, Math.abs, true);
-  const safeNegative = averagePairs(matrix, symbols, stockSymbols, safeTargets, (value) => Math.max(0, -value));
-
-  return { stockCrypto, traditional, safeNegative };
-}
-
-function averagePairs(matrix, symbols, groupA, groupB, transform, skipSame = false) {
-  const index = new Map(symbols.map((symbol, idx) => [symbol, idx]));
-  const values = [];
-  groupA.forEach((symbolA) => {
-    groupB.forEach((symbolB) => {
-      if (skipSame && symbolA === symbolB) return;
-      if (symbolA === symbolB) return;
-      const i = index.get(symbolA);
-      const j = index.get(symbolB);
-      if (i == null || j == null) return;
-      const value = transform(matrix[Math.min(i, j)][Math.max(i, j)]);
-      values.push(value);
-    });
-  });
-  return values.length > 0 ? mean(values) : 0;
-}
-
 function buildPairSeries(records, window) {
   const pairs = {};
   const symbols = ASSETS.map((asset) => asset.symbol);
@@ -606,64 +546,6 @@ function buildPairSeries(records, window) {
   });
 
   return pairs;
-}
-
-function ema(values, period) {
-  if (values.length === 0) return [];
-  const result = [];
-  const k = 2 / (period + 1);
-  let prev = values[0];
-  result.push(prev);
-  for (let i = 1; i < values.length; i += 1) {
-    const current = values[i] * k + prev * (1 - k);
-    result.push(current);
-    prev = current;
-  }
-  return result;
-}
-
-function correlation(seriesA, seriesB) {
-  const n = Math.min(seriesA.length, seriesB.length);
-  if (n === 0) return 0;
-  let meanA = 0;
-  let meanB = 0;
-  for (let i = 0; i < n; i += 1) {
-    meanA += seriesA[i];
-    meanB += seriesB[i];
-  }
-  meanA /= n;
-  meanB /= n;
-  let numerator = 0;
-  let varA = 0;
-  let varB = 0;
-  for (let i = 0; i < n; i += 1) {
-    const da = seriesA[i] - meanA;
-    const db = seriesB[i] - meanB;
-    numerator += da * db;
-    varA += da * da;
-    varB += db * db;
-  }
-  if (varA === 0 || varB === 0) return 0;
-  return numerator / Math.sqrt(varA * varB);
-}
-
-function mean(values) {
-  if (!values || values.length === 0) return 0;
-  const sum = values.reduce((acc, value) => acc + value, 0);
-  return sum / values.length;
-}
-
-function pairWeight(symbolA, symbolB, categories) {
-  const categoryA = categories[symbolA];
-  const categoryB = categories[symbolB];
-  const pair = new Set([categoryA, categoryB]);
-
-  if (pair.has('stock') && pair.has('bond')) return 2.0;
-  if (pair.has('stock') && pair.has('gold')) return 1.5;
-  if (pair.size === 1 && pair.has('stock')) return 1.0;
-  if (pair.has('stock') && pair.has('crypto')) return 1.0;
-  if (pair.has('bond') && pair.has('gold')) return 1.0;
-  return 1.0;
 }
 
 function safeNumber(value, fallback = 0) {

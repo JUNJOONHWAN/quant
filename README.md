@@ -1,33 +1,53 @@
 # Market Stability Dashboard
 
-A static web application that visualizes cross-asset correlations and a derived market stability index directly in the browser. It fetches daily prices for QQQ, SPY, TLT, GLD, and BTC-USD from the unofficial Yahoo Finance API at runtime and renders gauges, historical charts, and pair-level analytics without any backend services.
+A static web application that visualizes cross-asset correlations and a derived market stability index directly in the browser.
+The site no longer talks to Yahoo Finance from the client; instead, a GitHub Actions workflow runs `scripts/generate-data.js`, which
+pulls daily prices for QQQ, SPY, TLT, GLD, and BTC-USD from Alpha Vantage, precomputes the correlation metrics, and uploads the
+resulting JSON bundle (`static_site/data/precomputed.json`) alongside the static assets. Browsers simply download that JSON and
+render gauges, history charts, and pair analytics—no backend services required.
 
 ## Repository layout
 
 - `docs/market_stability_app_plan.md` – system design and background notes for the dashboard.
-- `static_site/` – GitHub Pages–ready frontend (HTML, CSS, and JavaScript).
+- `scripts/generate-data.js` – Alpha Vantage fetcher + metric precomputation used by CI and local previews.
+- `static_site/` – GitHub Pages–ready frontend (HTML, CSS, JavaScript, and the generated data file).
 
 ## Deploy to GitHub Pages
 
-### One-click deploy with GitHub Actions (recommended)
+### 1. Provision an Alpha Vantage API key
 
-This repository ships with `.github/workflows/deploy.yml`, which publishes the contents of `static_site/` automatically.
+Create a free key at <https://www.alphavantage.co/support/#api-key>. You will need it both for local previews and for the automated
+GitHub Actions deployment.
+
+### 2. Store the key in the repository secrets
+
+1. Open your GitHub repository.
+2. Navigate to **Settings → Secrets and variables → Actions**.
+3. Create a new repository secret named **`ALPHAVANTAGE_API_KEY`** and paste the key value.
+
+### 3. One-click deploy with GitHub Actions (recommended)
+
+The `.github/workflows/deploy.yml` workflow installs Node.js, generates the precomputed dataset, and publishes `static_site/` on every
+push to `main`.
 
 1. Push the repository to GitHub with your work living on the `main` branch.
-2. In **Settings → Pages → Build and deployment**, set the source to **GitHub Actions**.
-3. Every push to `main` now triggers the workflow and deploys the latest `static_site/` bundle to Pages. You can also run the workflow manually from the **Actions** tab if you need to redeploy without new commits.
+2. In **Settings → Pages → Build and deployment**, pick **GitHub Actions** as the source (only required once).
+3. Every push to `main` now triggers the workflow. The job fails fast if the API key is missing or Alpha Vantage returns an error, so
+you immediately know when the data refresh needs attention. You can also run the workflow manually from the **Actions** tab.
 
 ### Manual branch deployment (fallback option)
 
-If you prefer not to use GitHub Actions, you can still configure Pages to serve directly from the branch:
+If you disable or delete the workflow—or want to publish without GitHub Actions—you can still configure Pages to serve directly from a
+branch, but you must generate the JSON yourself first:
 
-1. Push the contents of this repository to the branch that GitHub Pages serves (commonly `main`).
-2. In **Settings → Pages → Build and deployment**, choose **Deploy from a branch**, then select the branch and the `/static_site` folder.
-3. Wait for the deployment to finish and open the URL that GitHub Pages provides.
+1. Export the API key and run `npm run generate:data` locally to create `static_site/data/precomputed.json`.
+2. Commit the generated file (or copy it into the branch you're deploying).
+3. In **Settings → Pages → Build and deployment**, choose **Deploy from a branch**, then select the branch and the `/static_site` folder.
+4. Wait for the deployment to finish and open the URL that GitHub Pages provides.
 
 ### Push changes from your local clone
 
-If GitHub에서 변경 사항이 보이지 않는다면 로컬 변경분이 커밋되고 원격 저장소로 푸시되었는지 확인하세요.
+GitHub에 반영되지 않는다면 로컬 변경분이 커밋되고 원격 저장소로 푸시되었는지 확인하세요.
 
 ```bash
 # 1. 현재 작업 상태 확인
@@ -43,18 +63,25 @@ git commit -m "Update static site"
 git push origin main
 ```
 
-푸시가 완료되면 GitHub 저장소에서 커밋이 보여야 하며, 이후 Pages 배포가 자동으로(또는 몇 분 지연 후) 반영됩니다. 만약 Pages가 자동으로 갱신되지 않으면 **Settings → Pages** 화면에서 배포 상태를 확인하거나 “Rebuild” 버튼을 눌러 다시 배포를 트리거하세요.
+푸시 후 Pages 배포 상태는 **Settings → Pages** 페이지에서 확인할 수 있으며, 필요하면 “Rebuild”를 눌러 수동으로 재배포할 수 있습니다.
 
 ## Local preview
 
-Use a lightweight HTTP server so that the browser can perform HTTPS requests to Yahoo Finance:
+1. Export your Alpha Vantage key (or rely on the repository secret if you are running inside GitHub Codespaces with inherited secrets).
+2. Generate the dataset locally.
+3. Serve the static files.
+
+> **Note:** The generator requires Node.js 18 or newer to use the built-in `fetch` API.
 
 ```bash
+export ALPHAVANTAGE_API_KEY=your-key-here
+npm run generate:data
 cd static_site
 python -m http.server 8000
 ```
 
-Open <http://localhost:8000/> to check the dashboard before publishing.
+Then open <http://localhost:8000/>. The frontend will detect the freshly generated JSON and render the dashboard without making any
+external network calls. If the JSON is missing, the page shows a helpful error explaining how to create it.
 
 ## Automated tests
 
@@ -68,4 +95,5 @@ Running the suite is a quick way to verify that correlation, EMA, and weighting 
 
 ## Data notice
 
-The application relies on unofficial Yahoo Finance endpoints. Availability and accuracy are not guaranteed; treat the results as informational only and not as investment advice.
+The published numbers are derived from Alpha Vantage daily endpoints and are intended for informational purposes only. Accuracy and
+availability are not guaranteed, and the project does not provide investment advice.
