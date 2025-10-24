@@ -41,13 +41,25 @@ async function init() {
     const precomputed = await fetchPrecomputed();
     if (precomputed.status === 'ok') {
       hydrateFromPrecomputed(precomputed.payload);
-    } else if (isLocalhost()) {
+      hideError();
+    } else if (precomputed.status === 'missing') {
+      const fallback = await fetchFallbackPrecomputed();
+      if (fallback.status === 'ok') {
+        hydrateFromPrecomputed(fallback.payload);
+        showNotice('사전 계산된 데이터를 찾지 못해 샘플 데이터를 표시합니다. 최신 지표를 보려면 GitHub Actions 배치를 확인해 주세요.');
+      } else if (isLocalhost()) {
+        await loadFromYahoo();
+        hideError();
+      } else {
+        throw new Error('PRECOMPUTED_DATA_UNAVAILABLE');
+      }
+    } else if (precomputed.status === 'error' && isLocalhost()) {
       await loadFromYahoo();
+      hideError();
     } else {
-      throw new Error('PRECOMPUTED_DATA_UNAVAILABLE');
+      throw precomputed.error || new Error('PRECOMPUTED_DATA_UNAVAILABLE');
     }
 
-    hideError();
     populateControls();
     renderAll();
   } catch (error) {
@@ -89,6 +101,19 @@ async function fetchPrecomputed() {
     }
     if (!response.ok) {
       return { status: 'error', error: new Error(`precomputed fetch failed: ${response.status}`) };
+    }
+    const payload = await response.json();
+    return { status: 'ok', payload };
+  } catch (error) {
+    return { status: 'error', error };
+  }
+}
+
+async function fetchFallbackPrecomputed() {
+  try {
+    const response = await fetch('./data/precomputed-sample.json', { cache: 'no-store' });
+    if (!response.ok) {
+      return { status: 'error', error: new Error(`fallback fetch failed: ${response.status}`) };
     }
     const payload = await response.json();
     return { status: 'ok', payload };
@@ -563,6 +588,17 @@ function showError(message) {
   if (!box) return;
   box.textContent = message;
   box.classList.remove('hidden');
+  box.classList.add('error');
+  box.classList.remove('notice');
+}
+
+function showNotice(message) {
+  const box = document.getElementById('error-box');
+  if (!box) return;
+  box.textContent = message;
+  box.classList.remove('hidden');
+  box.classList.add('notice');
+  box.classList.remove('error');
 }
 
 function hideError() {
@@ -570,4 +606,6 @@ function hideError() {
   if (!box) return;
   box.textContent = '';
   box.classList.add('hidden');
+  box.classList.remove('error');
+  box.classList.remove('notice');
 }
