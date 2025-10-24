@@ -304,13 +304,63 @@ function updateMeta() {
   generatedAt.textContent = `계산 시각: ${localeTime}`;
 }
 
+function getFilteredRecords(metrics) {
+  const fallback = { records: [], empty: true, feedbackMessage: '' };
+  if (!metrics) return fallback;
+
+  const customRange = state.customRange || { start: null, end: null, valid: true };
+  const startTime = parseDateSafe(customRange.start);
+  const endTime = parseDateSafe(customRange.end);
+  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
+
+  if (hasCustomRange) {
+    const filtered = metrics.records.filter((item) => {
+      const time = parseDateSafe(item.date);
+      if (time === null) return false;
+      if (startTime !== null && time < startTime) return false;
+      if (endTime !== null && time > endTime) return false;
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      return { records: [], empty: true, feedbackMessage: '선택한 기간에 해당하는 데이터가 없습니다.' };
+    }
+
+    return { records: filtered, empty: false, feedbackMessage: '맞춤 기간이 설정되어 있습니다.' };
+  }
+
+  const rangeDays = state.range;
+  const sliced = metrics.records.slice(-rangeDays);
+  return { records: sliced, empty: sliced.length === 0, feedbackMessage: '' };
+}
+
 function renderGauge() {
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const latest = metrics.records[metrics.records.length - 1];
   const element = document.getElementById('stability-gauge');
+  if (!element) return;
   const chart = charts.stability || echarts.init(element);
   charts.stability = chart;
+
+  const { records: filteredRecords, empty, feedbackMessage } = getFilteredRecords(metrics);
+
+  if (empty) {
+    chart.clear();
+    setGaugePanelFeedback(feedbackMessage || '표시할 데이터가 없습니다.');
+    return;
+  }
+
+  setGaugePanelFeedback(feedbackMessage || '');
+
+  const latest = filteredRecords[filteredRecords.length - 1];
+  const stabilityValues = filteredRecords.map((item) => safeNumber(item.stability));
+  const averageWindow = stabilityValues.slice(-180);
+  const average180 = mean(averageWindow);
+  const shortEmaSeries = ema(stabilityValues, 3);
+  const longEmaSeries = ema(stabilityValues, 10);
+  const delta = shortEmaSeries.length > 0 && longEmaSeries.length > 0
+    ? safeNumber(shortEmaSeries[shortEmaSeries.length - 1] - longEmaSeries[longEmaSeries.length - 1])
+    : 0;
 
   chart.setOption({
     series: [{
@@ -335,11 +385,11 @@ function renderGauge() {
         width: 6,
       },
       detail: {
-        formatter: () => `지수: ${latest.stability.toFixed(3)}\n180일 평균: ${metrics.average180.toFixed(3)}\n추세: ${latest.delta >= 0 ? '▲' : '▼'} ${(Math.abs(latest.delta)).toFixed(3)}`,
+        formatter: () => `지수: ${safeNumber(latest.stability).toFixed(3)}\n180일 평균: ${safeNumber(average180).toFixed(3)}\n추세: ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
         fontSize: 16,
         offsetCenter: [0, '65%'],
       },
-      data: [{ value: latest.stability }],
+      data: [{ value: safeNumber(latest.stability) }],
     }],
   });
 }
@@ -347,7 +397,8 @@ function renderGauge() {
 function renderSubGauges() {
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const latest = metrics.records[metrics.records.length - 1];
+
+  const { records: filteredRecords, empty } = getFilteredRecords(metrics);
   const mapping = [
     { key: 'stockCrypto', element: 'stock-crypto-gauge' },
     { key: 'traditional', element: 'traditional-gauge' },
@@ -355,8 +406,17 @@ function renderSubGauges() {
   ];
 
   mapping.forEach(({ key, element }) => {
-    const chart = charts[element] || echarts.init(document.getElementById(element));
+    const container = document.getElementById(element);
+    if (!container) return;
+    const chart = charts[element] || echarts.init(container);
     charts[element] = chart;
+
+    if (empty) {
+      chart.clear();
+      return;
+    }
+
+    const latest = filteredRecords[filteredRecords.length - 1];
     const gaugeValue = safeNumber(latest.sub[key]);
     chart.setOption({
       series: [{
@@ -398,33 +458,16 @@ function renderHistory() {
 
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const customRange = state.customRange || { start: null, end: null, valid: true };
-  const startTime = parseDateSafe(customRange.start);
-  const endTime = parseDateSafe(customRange.end);
-  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
 
-  let series = [];
+  const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
 
-  if (hasCustomRange) {
-    series = metrics.records.filter((item) => {
-      const time = parseDateSafe(item.date);
-      if (time === null) return false;
-      if (startTime !== null && time < startTime) return false;
-      if (endTime !== null && time > endTime) return false;
-      return true;
-    });
+  if (typeof feedbackMessage === 'string') {
+    setCustomRangeFeedback(feedbackMessage);
+  }
 
-    if (series.length === 0) {
-      setCustomRangeFeedback('선택한 기간에 해당하는 데이터가 없습니다.');
-      chart.clear();
-      return;
-    }
-
-    setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
-  } else {
-    const rangeDays = state.range;
-    series = metrics.records.slice(-rangeDays);
-    setCustomRangeFeedback('');
+  if (empty) {
+    chart.clear();
+    return;
   }
 
   chart.setOption({
@@ -757,7 +800,34 @@ function parseDateSafe(value) {
 function setCustomRangeFeedback(message) {
   const feedback = document.getElementById('custom-range-feedback');
   if (!feedback) return;
-  feedback.textContent = message || '';
+  const text = message || '';
+  if (feedback.textContent === text) return;
+  feedback.textContent = text;
+}
+
+function setGaugePanelFeedback(message) {
+  const panel = document.getElementById('gauge-panel');
+  if (!panel) return;
+  let helper = panel.querySelector('.panel-feedback');
+  if (!message) {
+    if (helper) {
+      helper.remove();
+    }
+    return;
+  }
+
+  if (!helper) {
+    helper = document.createElement('p');
+    helper.className = 'panel-feedback';
+    const legend = panel.querySelector('.legend');
+    if (legend) {
+      panel.insertBefore(helper, legend);
+    } else {
+      panel.appendChild(helper);
+    }
+  }
+
+  helper.textContent = message;
 }
 
 function showError(message) {
