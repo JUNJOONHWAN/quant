@@ -9,6 +9,18 @@ A static web application that visualizes cross-asset correlations and a derived 
 
 ## Deploy to GitHub Pages
 
+### One-click deploy with GitHub Actions (recommended)
+
+This repository ships with `.github/workflows/deploy.yml`, which publishes the contents of `static_site/` automatically.
+
+1. Push the repository to GitHub with your work living on the `main` branch.
+2. In **Settings → Pages → Build and deployment**, set the source to **GitHub Actions**.
+3. Every push to `main` now triggers the workflow and deploys the latest `static_site/` bundle to Pages. You can also run the workflow manually from the **Actions** tab if you need to redeploy without new commits.
+
+### Manual branch deployment (fallback option)
+
+If you prefer not to use GitHub Actions, you can still configure Pages to serve directly from the branch:
+
 1. Push the contents of this repository to the branch that GitHub Pages serves (commonly `main`).
 2. In **Settings → Pages → Build and deployment**, choose **Deploy from a branch**, then select the branch and the `/static_site` folder.
 3. Wait for the deployment to finish and open the URL that GitHub Pages provides.
@@ -43,6 +55,16 @@ python -m http.server 8000
 ```
 
 Open <http://localhost:8000/> to check the dashboard before publishing.
+
+## Automated tests
+
+The shared numerical utilities that power the dashboard can be exercised with Node's built-in test runner:
+
+```bash
+npm test
+```
+
+Running the suite is a quick way to verify that correlation, EMA, and weighting logic behave as expected when you make code changes.
 
 ## Data notice
 
