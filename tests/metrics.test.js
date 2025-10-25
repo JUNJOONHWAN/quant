@@ -40,6 +40,8 @@ test('computeReturns emits log returns and normalized prices', () => {
   assert.deepEqual(result.dates, ['2024-01-02', '2024-01-03']);
   assert.equal(result.returns.AAA.length, 2);
   assert.equal(result.returns.BBB.length, 2);
+  assert.deepEqual(result.priceSeries.AAA, [110, 121]);
+  assert.deepEqual(result.priceSeries.BBB, [198, 210]);
 
   const epsilon = 1e-12;
   assert.ok(Math.abs(result.returns.AAA[0] - Math.log(110 / 100)) < epsilon);

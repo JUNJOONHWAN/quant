@@ -164,6 +164,8 @@ function buildOutput(aligned, returns) {
     generatedAt: new Date().toISOString(),
     analysisDates: returns.dates,
     normalizedPrices: returns.normalizedPrices,
+    priceSeries: returns.priceSeries,
+    priceSeriesSource: 'actual',
     assets: ASSETS.map(({ symbol, label, category }) => ({ symbol, label, category })),
     windows,
   };
@@ -222,7 +224,13 @@ function computeWindowMetrics(window, returns, aligned) {
     record.delta = shortEma[index] - longEma[index];
   });
 
-  const pairs = buildPairSeries(records, window, returns.normalizedPrices, symbols);
+  const pairs = buildPairSeries(
+    records,
+    window,
+    returns.priceSeries,
+    returns.normalizedPrices,
+    symbols,
+  );
 
   return {
     records,
@@ -232,7 +240,7 @@ function computeWindowMetrics(window, returns, aligned) {
   };
 }
 
-function buildPairSeries(records, window, normalizedPrices, symbols) {
+function buildPairSeries(records, window, priceSeries, normalizedPrices, symbols) {
   const pairs = {};
   const priceOffset = window - 1;
   for (let i = 0; i < symbols.length; i += 1) {
@@ -250,8 +258,23 @@ function buildPairSeries(records, window, normalizedPrices, symbols) {
         const pair = pairs[key];
         pair.dates.push(record.date);
         pair.correlation.push(record.matrix[i][j]);
-        pair.priceA.push(normalizedPrices[symbols[i]][priceIndex]);
-        pair.priceB.push(normalizedPrices[symbols[j]][priceIndex]);
+        const seriesA = Array.isArray(priceSeries?.[symbols[i]])
+          ? priceSeries[symbols[i]]
+          : normalizedPrices?.[symbols[i]];
+        const seriesB = Array.isArray(priceSeries?.[symbols[j]])
+          ? priceSeries[symbols[j]]
+          : normalizedPrices?.[symbols[j]];
+
+        const fallbackA = normalizedPrices?.[symbols[i]];
+        const fallbackB = normalizedPrices?.[symbols[j]];
+
+        const valueA = seriesA?.[priceIndex];
+        const valueB = seriesB?.[priceIndex];
+        const fallbackValueA = fallbackA?.[priceIndex];
+        const fallbackValueB = fallbackB?.[priceIndex];
+
+        pair.priceA.push(Number.isFinite(valueA) ? valueA : Number.isFinite(fallbackValueA) ? fallbackValueA : null);
+        pair.priceB.push(Number.isFinite(valueB) ? valueB : Number.isFinite(fallbackValueB) ? fallbackValueB : null);
       }
     }
   });
