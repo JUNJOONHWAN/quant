@@ -71,12 +71,8 @@ async function main() {
   }
 }
 
-function computeCutoffDate(years) {
-  const cutoff = new Date();
-  cutoff.setUTCDate(cutoff.getUTCDate() + 1); // ensure today included
-  cutoff.setUTCFullYear(cutoff.getUTCFullYear() - years);
-  const computed = cutoff.toISOString().slice(0, 10);
-  return computed > MINIMUM_CUTOFF_DATE ? computed : MINIMUM_CUTOFF_DATE;
+function computeCutoffDate() {
+  return MINIMUM_CUTOFF_DATE;
 }
 
 async function fetchAlphaSeries(asset, cutoffDate) {
