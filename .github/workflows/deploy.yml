@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '10 21 * * *'  # 06:10 KST
-    - cron: '50 3 * * *'   # 12:50 KST
+    - cron: '10 5 * * *'   # 14:10 KST
 
 permissions:
   contents: read
