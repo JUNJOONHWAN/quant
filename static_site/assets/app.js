@@ -808,9 +808,9 @@ function renderAll() {
   renderGauge();
   renderSubGauges();
   renderRisk();
-  renderBacktest();
   renderAlerts();
   renderHistory();
+  renderBacktest();
   renderHeatmap();
   renderPair();
 }
