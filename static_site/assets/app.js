@@ -155,7 +155,7 @@ const state = {
   metrics: {},
   normalizedPrices: {},
   priceSeries: {},
-  priceSeriesSource: 'normalized',
+  priceSeriesSource: 'actual',
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
@@ -260,6 +260,8 @@ const {
   computeSubIndices,
   ema,
   mean,
+  toReturns,
+  corr,
 } = window.MarketMetrics;
 
 document.addEventListener('DOMContentLoaded', init);
@@ -268,7 +270,6 @@ async function init() {
   showError('데이터를 불러오는 중입니다...');
   state.metrics = {};
   await hydrateAlphaKeyFromEnvironment();
-  await ensureBuildInfo();
   try {
     const precomputed = await loadPrecomputed();
     if (!precomputed) {
@@ -368,38 +369,21 @@ function hydrateFromPrecomputed(data) {
   state.analysisDates = Array.isArray(data.analysisDates) ? data.analysisDates.slice() : [];
 
   const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : null;
-  const rawNormalized = data.normalizedPrices && typeof data.normalizedPrices === 'object'
-    ? data.normalizedPrices
-    : null;
-  const hasPriceSeries = rawPriceSeries && Object.keys(rawPriceSeries).length > 0;
-  const hasNormalized = rawNormalized && Object.keys(rawNormalized).length > 0;
-
-  if (!hasPriceSeries && !hasNormalized) {
-    showEmptyState('실제 데이터가 없습니다.');
+  if (!rawPriceSeries || Object.keys(rawPriceSeries).length === 0) {
+    showEmptyState('priceSeries 누락');
     return;
   }
 
-  const normalizedPrices = hasNormalized
-    ? cloneSeriesMap(rawNormalized)
-    : hasPriceSeries
-      ? buildNormalizedPricesFromSeries(rawPriceSeries)
-      : {};
-
-  const priceSeries = hasPriceSeries
-    ? cloneSeriesMap(rawPriceSeries)
-    : Object.keys(normalizedPrices).length > 0
-      ? cloneSeriesMap(normalizedPrices)
-      : null;
-
-  if (!priceSeries) {
-    showEmptyState('실제 데이터가 없습니다.');
-    return;
-  }
+  const priceSeries = cloneSeriesMap(rawPriceSeries);
+  const normalizedSource =
+    data.normalizedPrices && typeof data.normalizedPrices === 'object'
+      ? data.normalizedPrices
+      : buildNormalizedPricesFromSeries(priceSeries);
+  const normalizedPrices = cloneSeriesMap(normalizedSource);
 
   state.priceSeries = priceSeries;
   state.normalizedPrices = normalizedPrices;
-  const declaredSource = data.priceSeriesSource === 'actual' ? 'actual' : 'normalized';
-  state.priceSeriesSource = hasPriceSeries ? declaredSource : 'normalized';
+  state.priceSeriesSource = 'actual';
   state.metrics = {};
   if (data.windows && typeof data.windows === 'object') {
     Object.entries(data.windows).forEach(([windowSize, metrics]) => {
@@ -411,79 +395,70 @@ function hydrateFromPrecomputed(data) {
   maybeAlignDatesToCurrent();
 }
 
+async function loadData() {
+  const now = Date.now();
+  let manifest = {};
+
+  try {
+    const manifestResponse = await fetch(`./data/version.json?ts=${now}`, { cache: 'no-store' });
+    if (manifestResponse.ok) {
+      manifest = await manifestResponse.json();
+    }
+  } catch (error) {
+    console.warn('버전 매니페스트를 불러오지 못했습니다.', error);
+  }
+
+  const dataFile =
+    manifest && typeof manifest === 'object' && typeof manifest.data === 'string' && manifest.data.trim()
+      ? manifest.data.trim()
+      : 'precomputed.json';
+  const cacheSeed =
+    manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
+  const targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
+  const response = await fetch(targetUrl, { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const text = await response.text();
+  const byteLength = new TextEncoder().encode(text).length;
+
+  try {
+    const json = JSON.parse(text);
+    return { json, byteLength };
+  } catch (parseError) {
+    const error = new Error('INVALID_JSON');
+    error.cause = parseError;
+    throw error;
+  }
+}
+
 async function loadPrecomputed() {
   try {
-    const now = Date.now();
-    const manifest = await fetchVersionManifest();
-    if (manifest && Object.keys(manifest).length > 0) {
-      applyBuildInfo(manifest);
-    }
-
-    const manifestFile = manifest?.data || manifest?.dataPath || manifest?.file;
-    const targetPath = manifestFile
-      ? normalizeDatasetPath(manifestFile)
-      : getDatasetPath();
     setDataInfo('데이터 크기를 계산 중입니다...');
-    const cacheSeed =
-      manifest?.build ||
-      manifest?.buildId ||
-      manifest?.cacheTag ||
-      manifest?.generatedAt ||
-      manifest?.timestamp ||
-      cacheTagRaw ||
-      now;
-    cacheTagRaw = `${cacheSeed}`;
-    const targetUrl = `${targetPath}?ts=${encodeURIComponent(cacheSeed)}`;
-    const res = await fetch(targetUrl, { cache: 'no-store' });
-    if (!res.ok) {
-      setDataInfo('데이터를 불러오지 못했습니다.', 'error');
-      throw new Error(`HTTP ${res.status}`);
+    const { json, byteLength } = await loadData();
+    if (!Array.isArray(json.analysisDates) || json.analysisDates.length === 0) {
+      setDataInfo('데이터 없음', 'error');
+      showEmptyState('데이터 없음');
+      return null;
     }
-    const rawText = await res.text();
-    const byteLength = new TextEncoder().encode(rawText).length;
+    if (!json.priceSeries || typeof json.priceSeries !== 'object') {
+      setDataInfo('priceSeries 누락', 'error');
+      showEmptyState('priceSeries 누락');
+      return null;
+    }
     setDataInfo(`데이터 크기: ${formatByteSize(byteLength)}`);
-    let json;
-    try {
-      json = JSON.parse(rawText);
-    } catch (parseError) {
-      console.warn('Failed to parse dataset JSON', parseError);
-      setDataInfo('데이터를 해석하지 못했습니다.', 'error');
-      showEmptyState('데이터를 해석하지 못했습니다.');
-      return null;
-    }
-    if (json && json.status === 'no_data') {
-      setDataInfo('데이터가 비어 있습니다.', 'error');
-      showEmptyState();
-      return null;
-    }
-    if (
-      !json ||
-      !Array.isArray(json.analysisDates) ||
-      json.analysisDates.length === 0 ||
-      (!json.priceSeries && !json.normalizedPrices)
-    ) {
-      setDataInfo('실제 데이터가 없습니다.', 'error');
-      showEmptyState('실제 데이터가 없습니다.');
-      return null;
-    }
     return json;
   } catch (error) {
-    if (IS_LOCAL) {
-      try {
-        const fallback = await fetch('./data/precomputed-sample.json', { cache: 'no-store' });
-        if (fallback.ok) {
-          const fallbackText = await fallback.text();
-          const fallbackBytes = new TextEncoder().encode(fallbackText).length;
-          setDataInfo(`데이터 크기: ${formatByteSize(fallbackBytes)} (샘플)`);
-          return JSON.parse(fallbackText);
-        }
-      } catch (fallbackError) {
-        console.warn('Failed to load sample dataset', fallbackError);
-      }
+    if (error?.message === 'INVALID_JSON') {
+      console.warn('Failed to parse dataset JSON', error?.cause || error);
+      setDataInfo('데이터를 해석하지 못했습니다.', 'error');
+      showEmptyState('데이터를 해석하지 못했습니다.');
+    } else {
+      console.warn('Failed to load precomputed dataset', error);
+      setDataInfo('데이터를 불러오지 못했습니다.', 'error');
+      showEmptyState('데이터를 불러오지 못했습니다.');
     }
-    console.warn('Failed to load precomputed dataset', error);
-    setDataInfo('데이터 크기를 불러오지 못했습니다.', 'error');
-    showEmptyState();
     return null;
   }
 }
@@ -993,18 +968,25 @@ function renderHistory() {
 
 function renderHeatmap() {
   const element = document.getElementById('heatmap-chart');
+  if (!element) {
+    return;
+  }
   const chart = charts.heatmap || echarts.init(element);
   charts.heatmap = chart;
 
-  const metrics = state.metrics[state.window];
-  if (!metrics) return;
-  const latest = metrics.records[metrics.records.length - 1];
   const labels = ASSETS.map((asset) => asset.symbol);
+  const matrix = computeHeatmapMatrix();
+  if (!matrix) {
+    chart.clear();
+    return;
+  }
+
   const data = [];
   for (let i = 0; i < labels.length; i += 1) {
     for (let j = 0; j < labels.length; j += 1) {
-      const value = i === j ? 1 : latest.matrix[i][j];
-      data.push([i, j, Number(value.toFixed(3))]);
+      const value = i === j ? 1 : matrix[i][j];
+      const display = Number.isFinite(value) ? Number(value.toFixed(3)) : 0;
+      data.push([i, j, display]);
     }
   }
 
@@ -1042,6 +1024,51 @@ function renderHeatmap() {
   });
 }
 
+function computeHeatmapMatrix() {
+  const symbols = ASSETS.map((asset) => asset.symbol);
+  const dates = Array.isArray(state.analysisDates) ? state.analysisDates : [];
+  const priceSeries = state.priceSeries || {};
+  if (dates.length === 0) {
+    return null;
+  }
+
+  const windowSize = Math.max(Number(state.window) || DEFAULT_WINDOW, 2);
+  if (dates.length < windowSize) {
+    return null;
+  }
+
+  const returnsMap = {};
+  for (let index = 0; index < symbols.length; index += 1) {
+    const symbol = symbols[index];
+    const prices = priceSeries[symbol];
+    if (!Array.isArray(prices) || prices.length !== dates.length) {
+      return null;
+    }
+    returnsMap[symbol] = toReturns(prices);
+  }
+
+  const endIndex = dates.length - 1;
+  const startIndex = Math.max(endIndex - windowSize + 1, 0);
+  const matrix = [];
+
+  for (let i = 0; i < symbols.length; i += 1) {
+    const row = [];
+    for (let j = 0; j < symbols.length; j += 1) {
+      if (i === j) {
+        row.push(1);
+      } else {
+        const sliceA = returnsMap[symbols[i]].slice(startIndex, endIndex + 1);
+        const sliceB = returnsMap[symbols[j]].slice(startIndex, endIndex + 1);
+        const value = corr(sliceA, sliceB);
+        row.push(Number.isFinite(value) ? value : null);
+      }
+    }
+    matrix.push(row);
+  }
+
+  return matrix;
+}
+
 function renderPair() {
   const priceElement = document.getElementById('pair-price-chart');
   const correlationElement = document.getElementById('pair-correlation-chart');
@@ -1065,6 +1092,7 @@ function renderPair() {
   }
 
   const pair = state.pair || pairSelect?.options[0]?.value;
+  state.pair = pair;
   if (!pair) {
     priceChart.clear();
     correlationChart.clear();
@@ -1072,18 +1100,78 @@ function renderPair() {
   }
 
   const [assetA, assetB] = pair.split('|');
-  const metrics = state.metrics[state.window];
-  if (!metrics) {
+  const pairSeries = computePairSeries(assetA, assetB);
+  if (!pairSeries) {
     priceChart.clear();
     correlationChart.clear();
     return;
   }
 
-  const pairSeries = metrics.pairs[pair];
-  if (!pairSeries) {
+  const indices = computeVisibleIndices(pairSeries.dates);
+  if (indices.length === 0) {
     priceChart.clear();
     correlationChart.clear();
     return;
+  }
+
+  const dates = indices.map((index) => pairSeries.dates[index]);
+  const priceA = indices.map((index) => pairSeries.priceA[index]);
+  const priceB = indices.map((index) => pairSeries.priceB[index]);
+  const correlationValues = indices.map((index) => pairSeries.correlation[index]);
+
+  const assetALabel = `${assetA} 가격`;
+  const assetBLabel = `${assetB} 가격`;
+  const correlationLabel = '롤링 상관계수';
+
+  renderPriceChart(priceChart, dates, priceA, priceB, assetALabel, assetBLabel);
+  renderCorrelationChart(correlationChart, dates, correlationValues, priceA, correlationLabel, assetALabel);
+}
+
+function computePairSeries(assetA, assetB) {
+  if (!assetA || !assetB) {
+    return null;
+  }
+
+  const dates = Array.isArray(state.analysisDates) ? state.analysisDates : [];
+  const priceSeries = state.priceSeries || {};
+  const pricesA = Array.isArray(priceSeries?.[assetA]) ? priceSeries[assetA] : null;
+  const pricesB = Array.isArray(priceSeries?.[assetB]) ? priceSeries[assetB] : null;
+
+  if (
+    !pricesA ||
+    !pricesB ||
+    pricesA.length !== dates.length ||
+    pricesB.length !== dates.length ||
+    dates.length === 0
+  ) {
+    return null;
+  }
+
+  const windowSize = Math.max(Number(state.window) || DEFAULT_WINDOW, 2);
+  const returnsA = toReturns(pricesA);
+  const returnsB = toReturns(pricesB);
+  const correlation = dates.map((_, index) => {
+    if (index < windowSize - 1) {
+      return null;
+    }
+    const start = Math.max(index - windowSize + 1, 0);
+    const sliceA = returnsA.slice(start, index + 1);
+    const sliceB = returnsB.slice(start, index + 1);
+    const value = corr(sliceA, sliceB);
+    return Number.isFinite(value) ? value : null;
+  });
+
+  return {
+    dates: dates.slice(),
+    priceA: pricesA.slice(),
+    priceB: pricesB.slice(),
+    correlation,
+  };
+}
+
+function computeVisibleIndices(dates) {
+  if (!Array.isArray(dates)) {
+    return [];
   }
 
   const customRange = state.customRange || { start: null, end: null, valid: true };
@@ -1091,53 +1179,46 @@ function renderPair() {
   const endTime = parseDateSafe(customRange.end);
   const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
 
-  const indices = [];
   if (hasCustomRange) {
-    pairSeries.dates.forEach((date, index) => {
+    const indices = [];
+    dates.forEach((date, index) => {
       const time = parseDateSafe(date);
       if (time === null) return;
       if (startTime !== null && time < startTime) return;
       if (endTime !== null && time > endTime) return;
       indices.push(index);
     });
-  } else {
-    const rangeDays = state.range;
-    const startIndex = Math.max(pairSeries.dates.length - rangeDays, 0);
-    for (let idx = startIndex; idx < pairSeries.dates.length; idx += 1) {
-      indices.push(idx);
-    }
+    return indices;
   }
 
-  if (indices.length === 0) {
-    priceChart.clear();
-    correlationChart.clear();
+  const rangeDays = state.range;
+  const indices = [];
+  const startIndex = Math.max(dates.length - rangeDays, 0);
+  for (let idx = startIndex; idx < dates.length; idx += 1) {
+    indices.push(idx);
+  }
+  return indices;
+}
+
+function renderPriceChart(chart, dates, priceA, priceB, assetALabel, assetBLabel) {
+  if (!chart) {
     return;
   }
 
-  const sliced = {
-    dates: indices.map((index) => pairSeries.dates[index]),
-    correlation: indices.map((index) => pairSeries.correlation[index]),
-    priceA: indices.map((index) => pairSeries.priceA[index]),
-    priceB: indices.map((index) => pairSeries.priceB[index]),
-  };
-
-  const priceLabel = state.priceSeriesSource === 'actual' ? '가격' : '정규화된 가격';
-  const assetALabel = `${assetA} ${priceLabel}`;
-  const assetBLabel = `${assetB} ${priceLabel}`;
-  const correlationLabel = '롤링 상관계수';
-
-  priceChart.setOption({
+  chart.setOption({
     tooltip: {
       trigger: 'axis',
     },
     legend: {
       data: [assetALabel, assetBLabel],
     },
-    xAxis: [{
-      type: 'category',
-      data: sliced.dates,
-      axisPointer: { type: 'shadow' },
-    }],
+    xAxis: [
+      {
+        type: 'category',
+        data: dates,
+        axisPointer: { type: 'shadow' },
+      },
+    ],
     yAxis: [
       {
         type: 'value',
@@ -1156,32 +1237,40 @@ function renderPair() {
       {
         name: assetALabel,
         type: 'line',
-        data: sliced.priceA,
+        data: priceA,
         smooth: true,
         yAxisIndex: 0,
       },
       {
         name: assetBLabel,
         type: 'line',
-        data: sliced.priceB,
+        data: priceB,
         smooth: true,
         yAxisIndex: 1,
       },
     ],
   });
+}
 
-  correlationChart.setOption({
+function renderCorrelationChart(chart, dates, correlationValues, priceA, correlationLabel, assetALabel) {
+  if (!chart) {
+    return;
+  }
+
+  chart.setOption({
     tooltip: {
       trigger: 'axis',
     },
     legend: {
       data: [correlationLabel, assetALabel],
     },
-    xAxis: [{
-      type: 'category',
-      data: sliced.dates,
-      axisPointer: { type: 'shadow' },
-    }],
+    xAxis: [
+      {
+        type: 'category',
+        data: dates,
+        axisPointer: { type: 'shadow' },
+      },
+    ],
     yAxis: [
       {
         type: 'value',
@@ -1201,14 +1290,14 @@ function renderPair() {
       {
         name: correlationLabel,
         type: 'line',
-        data: sliced.correlation,
+        data: correlationValues,
         smooth: true,
         yAxisIndex: 0,
       },
       {
         name: assetALabel,
         type: 'line',
-        data: sliced.priceA,
+        data: priceA,
         smooth: true,
         yAxisIndex: 1,
       },
@@ -1454,8 +1543,8 @@ function buildPairSeries(records, window) {
         const pair = pairs[key];
         pair.dates.push(record.date);
         pair.correlation.push(record.matrix[i][j]);
-        const seriesA = state.priceSeries?.[symbols[i]] || state.normalizedPrices?.[symbols[i]] || [];
-        const seriesB = state.priceSeries?.[symbols[j]] || state.normalizedPrices?.[symbols[j]] || [];
+        const seriesA = state.priceSeries?.[symbols[i]] || [];
+        const seriesB = state.priceSeries?.[symbols[j]] || [];
         const valueA = seriesA[priceIndex];
         const valueB = seriesB[priceIndex];
         pair.priceA.push(Number.isFinite(valueA) ? valueA : null);

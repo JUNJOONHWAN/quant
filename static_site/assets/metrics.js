@@ -77,6 +77,25 @@
     };
   }
 
+  function toReturns(values) {
+    if (!Array.isArray(values)) {
+      return [];
+    }
+
+    const result = new Array(values.length).fill(null);
+    for (let index = 1; index < values.length; index += 1) {
+      const prev = values[index - 1];
+      const current = values[index];
+      if (Number.isFinite(prev) && Number.isFinite(current) && prev !== 0) {
+        result[index] = current / prev - 1;
+      } else {
+        result[index] = null;
+      }
+    }
+
+    return result;
+  }
+
   function buildCorrelationMatrix(symbols, returnsBySymbol, startIndex, endIndex) {
     const matrix = [];
     symbols.forEach((symbolA, i) => {
@@ -179,6 +198,46 @@
     return numerator / Math.sqrt(varA * varB);
   }
 
+  function corr(seriesA, seriesB) {
+    const xs = [];
+    const ys = [];
+    const length = Math.min(seriesA.length, seriesB.length);
+
+    for (let index = 0; index < length; index += 1) {
+      const a = seriesA[index];
+      const b = seriesB[index];
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        xs.push(a);
+        ys.push(b);
+      }
+    }
+
+    const n = xs.length;
+    if (n < 2) {
+      return null;
+    }
+
+    const meanX = xs.reduce((sum, value) => sum + value, 0) / n;
+    const meanY = ys.reduce((sum, value) => sum + value, 0) / n;
+    let cov = 0;
+    let varX = 0;
+    let varY = 0;
+
+    for (let index = 0; index < n; index += 1) {
+      const dx = xs[index] - meanX;
+      const dy = ys[index] - meanY;
+      cov += dx * dy;
+      varX += dx * dx;
+      varY += dy * dy;
+    }
+
+    if (varX === 0 || varY === 0) {
+      return null;
+    }
+
+    return cov / Math.sqrt(varX * varY);
+  }
+
   function mean(values) {
     if (!values || values.length === 0) return 0;
     const sum = values.reduce((acc, value) => acc + value, 0);
@@ -207,6 +266,8 @@
     averagePairs,
     ema,
     correlation,
+    toReturns,
+    corr,
     mean,
     pairWeight,
   };
