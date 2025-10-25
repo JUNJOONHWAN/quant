@@ -874,7 +874,6 @@ function renderBacktest() {
     return;
   }
 
-  const { records: filtered } = getFilteredRecords(metrics);
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
     : computeRiskSeriesClassic(metrics, filtered);
@@ -1270,8 +1269,10 @@ function renderGauge() {
   const averageLabel = averageWindowSize > 0 ? `최근 ${averageWindowSize}일 평균` : '평균';
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
-  // Regime summary (Classic)
-  const riskSeries = computeRiskSeries(state.metrics[state.window]);
+  // Regime summary (Classic/Enhanced)
+  const riskSeries = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(state.metrics[state.window], filteredRecords)
+    : computeRiskSeriesClassic(state.metrics[state.window], filteredRecords);
   if (riskSeries && riskSeries.score.length > 0) {
     const idx = riskSeries.score.length - 1;
     const rState = riskSeries.state[idx];
