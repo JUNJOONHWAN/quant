@@ -13,6 +13,7 @@ const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 const DEFAULT_DATA_PATH = './data/precomputed.json';
 const RISK_MODE_STORAGE_KEY = 'risk-mode.v1';
+const CLASSIC_DIRECTION_LOOKBACK = 12;
 
 let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
@@ -816,7 +817,6 @@ function renderAll() {
 
 // --- Risk regime configs ---
 const RISK_BREADTH_SYMBOLS = SIGNAL.breadth;
-const CLASSIC_DIRECTION_LOOKBACK = 12;
 const ENHANCED_LOOKBACKS = { momentum: 12, breadth: 5 };
 const RISK_CFG_CLASSIC = {
   // corr-heavy classic with direction guard
