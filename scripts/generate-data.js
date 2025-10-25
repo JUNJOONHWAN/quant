@@ -21,10 +21,10 @@ const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
 const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
 
 const ASSETS = [
-  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
+  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
+  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY' },
+  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
 
@@ -54,6 +54,7 @@ async function main() {
       console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
       const series = await fetchAlphaSeries(asset, cutoffDate);
       assetSeries.push(series);
+      console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
 
       if (index < ASSETS.length - 1) {
         console.log('Waiting to respect Alpha Vantage rate limits...');
@@ -83,30 +84,20 @@ async function fetchAlphaSeries(asset, cutoffDate) {
 }
 
 async function fetchEquity(asset, cutoffDate) {
-  const adjustedUrl = buildAlphaUrl({
-    function: 'TIME_SERIES_DAILY_ADJUSTED',
+  const url = buildAlphaUrl({
+    function: 'TIME_SERIES_DAILY',
     symbol: asset.symbol,
     outputsize: 'full',
   });
 
-  let json = await fetchJson(adjustedUrl);
-  let series = extractEquitySeries(json);
-
-  if (!series && isPremiumNotice(json)) {
-    const fallbackUrl = buildAlphaUrl({
-      function: 'TIME_SERIES_DAILY',
-      symbol: asset.symbol,
-      outputsize: 'full',
-    });
-    json = await fetchJson(fallbackUrl);
-    series = extractEquitySeries(json);
-  }
+  const json = await fetchJson(url);
+  const series = extractEquitySeries(json);
 
   if (!series) {
     throw buildAlphaError(json, asset.symbol);
   }
 
-  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value['5. adjusted close'] ?? value['4. close']));
+  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value?.['4. close']));
 }
 
 async function fetchDigital(asset, cutoffDate) {
@@ -123,7 +114,8 @@ async function fetchDigital(asset, cutoffDate) {
     throw buildAlphaError(json, asset.symbol);
   }
 
-  const closeKey = selectDigitalCloseKey(series, market);
+  const primaryCloseKey = `4a. close (${market})`;
+  const secondaryCloseKey = `4b. close (${market})`;
   const dates = Object.keys(series)
     .filter((date) => date >= cutoffDate)
     .sort();
@@ -135,7 +127,7 @@ async function fetchDigital(asset, cutoffDate) {
   const prices = [];
   dates.forEach((date) => {
     const value = series[date];
-    const close = Number(value?.[closeKey]);
+    const close = Number(value?.[primaryCloseKey] ?? value?.[secondaryCloseKey]);
     if (Number.isFinite(close)) {
       filteredDates.push(date);
       prices.push(close);
@@ -153,20 +145,6 @@ async function fetchDigital(asset, cutoffDate) {
     dates: filteredDates,
     prices,
   };
-}
-
-function selectDigitalCloseKey(series, market) {
-  const [firstDate] = Object.keys(series);
-  const sample = firstDate ? series[firstDate] : undefined;
-  const primary = `4a. close (${market})`;
-  const secondary = `4b. close (${market})`;
-  if (sample && primary in sample) {
-    return primary;
-  }
-  if (sample && secondary in sample) {
-    return secondary;
-  }
-  return primary;
 }
 
 async function fetchJson(url) {
@@ -221,13 +199,7 @@ function buildAlphaUrl(params) {
 }
 
 function extractEquitySeries(payload) {
-  return payload?.['Time Series (Daily) (Adjusted)']
-    || payload?.['Time Series (Daily)'];
-}
-
-function isPremiumNotice(payload) {
-  const info = payload?.Information;
-  return typeof info === 'string' && info.includes('premium endpoint');
+  return payload?.['Time Series (Daily)'];
 }
 
 function parseCryptoSymbol(symbol) {
