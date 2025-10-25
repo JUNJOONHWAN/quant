@@ -12,6 +12,7 @@ const ACTIOND_WAIT_MS = 5000;
 const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 const DEFAULT_DATA_PATH = './data/precomputed.json';
+const RISK_MODE_STORAGE_KEY = 'risk-mode.v1';
 
 let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
@@ -149,6 +150,21 @@ const ASSETS = [
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
 
+function getInitialRiskMode() {
+  if (typeof window === 'undefined') {
+    return 'classic';
+  }
+  try {
+    const saved = window.localStorage?.getItem(RISK_MODE_STORAGE_KEY);
+    if (saved === 'classic' || saved === 'enhanced') {
+      return saved;
+    }
+  } catch (error) {
+    // ignore storage errors (private mode, etc.)
+  }
+  return 'classic';
+}
+
 const state = {
   window: DEFAULT_WINDOW,
   range: 180,
@@ -167,6 +183,7 @@ const state = {
     end: null,
     valid: true,
   },
+  riskMode: getInitialRiskMode(),
 };
 
 function normalizeDatasetPath(candidate) {
@@ -603,6 +620,28 @@ function populateControls() {
     pairSelect.dataset.bound = 'true';
   }
 
+  const riskModeSelect = document.getElementById('risk-mode');
+  if (riskModeSelect) {
+    const currentMode = state.riskMode === 'enhanced' ? 'enhanced' : 'classic';
+    state.riskMode = currentMode;
+    if (riskModeSelect.value !== currentMode) {
+      riskModeSelect.value = currentMode;
+    }
+    if (!riskModeSelect.dataset.bound) {
+      riskModeSelect.addEventListener('change', (event) => {
+        const next = event.target.value === 'enhanced' ? 'enhanced' : 'classic';
+        state.riskMode = next;
+        try {
+          window.localStorage?.setItem(RISK_MODE_STORAGE_KEY, next);
+        } catch (error) {
+          // ignore private-mode storage failures
+        }
+        scheduleRender();
+      });
+      riskModeSelect.dataset.bound = 'true';
+    }
+  }
+
 
   const refreshButton = document.getElementById('refresh-button');
   const startInput = document.getElementById('custom-start');
@@ -730,6 +769,8 @@ function renderAll() {
 }
 
 // --- Risk regime configs ---
+const RISK_BREADTH_SYMBOLS = ['QQQ', 'SPY', 'BTC-USD'];
+const ENHANCED_LOOKBACKS = { momentum: 10, breadth: 5 };
 const RISK_CFG_CLASSIC = {
   // corr-heavy classic
   weights: { sc: 0.85, safe: 0.15 },
@@ -812,13 +853,28 @@ function renderRisk() {
     chart.setOption({
       tooltip: { trigger: 'axis', formatter: (p) => {
         const idx = p?.[0]?.dataIndex ?? 0;
-        const state = series.state[idx];
-        const label = state > 0 ? (series.fragile?.[idx] ? 'Risk-On (Fragile)' : 'Risk-On') : state < 0 ? 'Risk-Off' : 'Neutral';
+        const stateValue = series.state[idx];
+        const label = stateValue > 0 ? (series.fragile?.[idx] ? 'Risk-On (Fragile)' : 'Risk-On') : stateValue < 0 ? 'Risk-Off' : 'Neutral';
         const sc = series.scCorr[idx];
         const sn = series.safeNeg[idx];
-        const mm = series.mm?.[idx];
-        const mmLine = state.riskMode === 'enhanced' && Number.isFinite(mm) ? `<br/>흡수비(λ1/N): ${Number(mm).toFixed(3)}` : '';
-        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${mmLine}`;
+        let extras = '';
+        if (state.riskMode === 'enhanced') {
+          const mm = series.mm?.[idx];
+          const guardVal = series.guard?.[idx];
+          const combo = series.comboMomentum?.[idx];
+          const breadthVal = series.breadth?.[idx];
+          const scoreVal = series.riskScore?.[idx];
+          const parts = [];
+          if (Number.isFinite(scoreVal)) parts.push(`점수 ${scoreVal.toFixed(3)}`);
+          if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
+          if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+          if (Number.isFinite(mm)) parts.push(`흡수비 ${mm.toFixed(3)}`);
+          if (Number.isFinite(guardVal)) parts.push(`위험가드 ${(guardVal * 100).toFixed(0)}%`);
+          if (parts.length > 0) {
+            extras = `<br/>${parts.join(' · ')}`;
+          }
+        }
+        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${extras}`;
       } },
       xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
       yAxis: { type: 'value', min: -1, max: 1, show: false },
@@ -1035,30 +1091,155 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   return { dates, score, state, scCorr, safeNeg };
 }
 
-// Enhanced: classic + simple absorption guards
+// Enhanced: classic + momentum, breadth, and absorption/stability guards
 function computeRiskSeriesEnhanced(metrics, recordsOverride) {
   const classic = computeRiskSeriesClassic(metrics, recordsOverride);
   if (!classic) return null;
-  const mm = new Array(classic.dates.length).fill(null);
-  const fragile = new Array(classic.dates.length).fill(false);
-  const th = RISK_CFG_ENH.thresholds;
-  let baseIdx = 0;
-  if (Array.isArray(recordsOverride) && recordsOverride.length > 0) {
-    const firstDate = recordsOverride[0]?.date;
-    const gIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
-    baseIdx = gIdx >= 0 ? gIdx : 0;
-  }
-  for (let i = 0; i < classic.dates.length; i += 1) {
-    const rec = metrics.records[baseIdx + i];
+  const records = metrics?.records || [];
+  if (!Array.isArray(records) || records.length === 0) return classic;
+
+  const dates = classic.dates;
+  const length = dates.length;
+  const mm = new Array(length).fill(null);
+  const fragile = new Array(length).fill(false);
+  const guard = new Array(length).fill(null);
+  const comboMomentum = new Array(length).fill(null);
+  const breadth = new Array(length).fill(null);
+  const stabilitySeries = new Array(length).fill(null);
+  const riskScore = new Array(length).fill(null);
+
+  const firstDate = Array.isArray(recordsOverride) && recordsOverride.length > 0
+    ? recordsOverride[0]?.date
+    : records[0]?.date;
+  let baseIdx = records.findIndex((r) => r.date === firstDate);
+  if (baseIdx < 0) baseIdx = 0;
+
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const prices = state.priceSeries || {};
+  const qqqSeries = prices.QQQ || [];
+  const btcSeries = prices['BTC-USD'] || [];
+
+  for (let i = 0; i < length; i += 1) {
+    const rec = records[baseIdx + i];
     const matrix = rec?.matrix;
-    if (Array.isArray(matrix)) {
+    if (Array.isArray(matrix) && matrix.length > 0) {
       const lambda1 = topEigenvalue(matrix) || 0;
       mm[i] = lambda1 / (matrix.length || 1);
-      if (classic.state[i] > 0 && mm[i] > th.mmMaxOn && mm[i] < th.mmMinOff) fragile[i] = true;
-      if (mm[i] >= th.mmMinOff && classic.state[i] > 0) classic.state[i] = 0; // degrade to Neutral
     }
+
+    const priceIndex = windowOffset + baseIdx + i;
+    const qqqRet = rollingReturnFromSeries(qqqSeries, priceIndex, ENHANCED_LOOKBACKS.momentum);
+    const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, ENHANCED_LOOKBACKS.momentum);
+    comboMomentum[i] = averageFinite(qqqRet, btcRet);
+    breadth[i] = computeRiskBreadth(priceIndex, ENHANCED_LOOKBACKS.breadth);
+    stabilitySeries[i] = rec?.stability ?? null;
+
+    const corrScore = clamp01((classic.scCorr[i] - 0.15) / 0.55);
+    const momentumScore = clamp01(((comboMomentum[i] ?? 0) + 0.02) / 0.08);
+    const breadthScore = clamp01(breadth[i] ?? 0);
+    const stabilityRelief = clamp01(1 - normalizeRangeSafe(mm[i], 0.78, 0.94));
+    const blendedScore = 0.45 * corrScore + 0.30 * momentumScore + 0.15 * breadthScore + 0.10 * stabilityRelief;
+    riskScore[i] = Number(blendedScore.toFixed(6));
+
+    const safePenalty = normalizeRangeSafe(classic.safeNeg[i], 0.35, 0.60);
+    const mmPenalty = normalizeRangeSafe(mm[i], 0.82, 0.95);
+    const deltaPenalty = normalizeRangeSafe(Math.max(0, rec?.delta ?? 0), 0.02, 0.06);
+    const guardScore = 0.6 * mmPenalty + 0.25 * safePenalty + 0.15 * deltaPenalty;
+    guard[i] = Number(guardScore.toFixed(6));
+
+    const combo = comboMomentum[i] ?? 0;
+    if (
+      blendedScore >= 0.63 &&
+      classic.scCorr[i] >= 0.35 &&
+      momentumScore >= 0.4 &&
+      guardScore < 0.9 &&
+      combo > -0.01
+    ) {
+      classic.state[i] = 1;
+      if (guardScore >= 0.55) {
+        fragile[i] = true;
+      }
+    } else if (
+      blendedScore <= 0.32 ||
+      classic.scCorr[i] <= 0 ||
+      combo <= -0.03 ||
+      (Number.isFinite(mm[i]) && mm[i] >= 0.95) ||
+      classic.safeNeg[i] >= 0.6 ||
+      guardScore >= 1
+    ) {
+      classic.state[i] = -1;
+    } else {
+      classic.state[i] = 0;
+      if (guardScore >= 0.8 && classic.scCorr[i] >= 0.3 && combo >= -0.02) {
+        fragile[i] = true;
+      }
+    }
+
+    classic.score[i] = riskScore[i];
   }
-  return { ...classic, mm, fragile };
+
+  return {
+    ...classic,
+    mm,
+    fragile,
+    guard,
+    comboMomentum,
+    breadth,
+    stabilitySeries,
+    riskScore,
+  };
+}
+
+function rollingReturnFromSeries(series, index, lookback) {
+  if (!Array.isArray(series) || !Number.isInteger(index) || !Number.isInteger(lookback) || lookback <= 0) {
+    return null;
+  }
+  if (index >= series.length || index - lookback < 0) {
+    return null;
+  }
+  const end = series[index];
+  const start = series[index - lookback];
+  if (!Number.isFinite(end) || !Number.isFinite(start) || start === 0) {
+    return null;
+  }
+  return end / start - 1;
+}
+
+function computeRiskBreadth(priceIndex, lookback) {
+  if (!Number.isInteger(priceIndex)) return null;
+  const prices = state.priceSeries || {};
+  let considered = 0;
+  let positive = 0;
+  RISK_BREADTH_SYMBOLS.forEach((symbol) => {
+    const ret = rollingReturnFromSeries(prices[symbol], priceIndex, lookback);
+    if (!Number.isFinite(ret)) return;
+    considered += 1;
+    if (ret > 0) {
+      positive += 1;
+    }
+  });
+  if (considered === 0) return null;
+  return positive / considered;
+}
+
+function clamp01(value) {
+  if (!Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  if (value >= 1) return 1;
+  return value;
+}
+
+function normalizeRangeSafe(value, min, max) {
+  if (!Number.isFinite(value) || max <= min) return 0;
+  if (value <= min) return 0;
+  if (value >= max) return 1;
+  return (value - min) / (max - min);
+}
+
+function averageFinite(...values) {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (finite.length === 0) return null;
+  return finite.reduce((acc, value) => acc + value, 0) / finite.length;
 }
 
 async function maybeAutoRefreshAfterLoad() {
@@ -1278,7 +1459,8 @@ function renderGauge() {
     const rState = riskSeries.state[idx];
     const rLabel = rState > 0 ? 'Risk-On' : rState < 0 ? 'Risk-Off' : 'Neutral';
     const rScore = safeNumber(riskSeries.score[idx]).toFixed(3);
-    const summary = `현재 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
+    const modeLabel = state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic';
+    const summary = `${modeLabel} 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
     setGaugePanelFeedback(summary);
   }
 
