@@ -19,7 +19,6 @@ const {
 const API_KEY = process.env.ALPHAVANTAGE_API_KEY;
 const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
 const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
-const SAMPLE_PATH = path.join(DATA_DIR, 'precomputed-sample.json');
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
@@ -36,12 +35,13 @@ const ONE_MINUTE = 60 * 1000;
 
 async function main() {
   if (typeof fetch !== 'function') {
-    await useFallback('global fetch is not available. Please run on Node.js 18+ or rely on the bundled sample dataset.');
+    await emitNoDataWithReason('global fetch is not available. emitting no_data placeholder.');
     return;
   }
 
   if (!API_KEY) {
-    await useFallback('ALPHAVANTAGE_API_KEY environment variable is not set. Using bundled sample dataset instead.');
+    console.warn('[generate-data] no API key -> emit no_data placeholder');
+    await emitNoDataPlaceholder();
     return;
   }
 
@@ -67,7 +67,7 @@ async function main() {
     await writeOutput(output);
   } catch (error) {
     console.error(error);
-    await useFallback('Failed to generate dataset from Alpha Vantage. Using bundled sample dataset instead.', error);
+    await emitNoDataWithReason('Failed to generate dataset from Alpha Vantage. emitting no_data placeholder.', error);
   }
 }
 
@@ -177,17 +177,6 @@ async function writeOutput(output) {
   console.log(`Wrote ${PRECOMPUTED_PATH}`);
 }
 
-async function useFallback(message, error) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  console.warn(`warning: ${message}`);
-  if (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    console.warn(`detail: ${detail}`);
-  }
-  await fs.copyFile(SAMPLE_PATH, PRECOMPUTED_PATH);
-  console.warn(`Copied ${SAMPLE_PATH} -> ${PRECOMPUTED_PATH}`);
-}
-
 function computeWindowMetrics(window, returns, aligned) {
   const symbols = ASSETS.map((asset) => asset.symbol);
   const categories = aligned.categories;
@@ -289,6 +278,25 @@ function buildAlphaError(payload, symbol) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function emitNoDataPlaceholder() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const payload = {
+    status: 'no_data',
+    generatedAt: new Date().toISOString(),
+  };
+  await fs.writeFile(PRECOMPUTED_PATH, `${JSON.stringify(payload, null, 2)}\n`);
+  console.warn(`[generate-data] wrote no_data placeholder to ${PRECOMPUTED_PATH}`);
+}
+
+async function emitNoDataWithReason(message, error) {
+  console.warn(`[generate-data] ${message}`);
+  if (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`[generate-data] detail: ${detail}`);
+  }
+  await emitNoDataPlaceholder();
 }
 
 main().catch((error) => {
