@@ -13,7 +13,6 @@ const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 const DEFAULT_DATA_PATH = './data/precomputed.json';
 const RISK_MODE_STORAGE_KEY = 'risk-mode.v1';
-const CLASSIC_DIRECTION_LOOKBACK = 12;
 
 let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
@@ -828,6 +827,7 @@ const RISK_CFG_CLASSIC = {
     corrMinOn: 0.20,
     corrOff: -0.05,
   },
+  directionLookback: 12,
   colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
   pairKey: SIGNAL.pairKey,
 };
@@ -1144,10 +1144,14 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   const prices = state.priceSeries || {};
   const stockSeries = prices[SIGNAL.primaryStock] || [];
   const btcSeries = prices['BTC-USD'] || [];
+  const dirLookback = Math.max(1, Number(RISK_CFG_CLASSIC.directionLookback) || 1);
   const dirMomentum = scCorr.map((_, idx) => {
     const priceIndex = windowOffset + baseIdx + idx;
-    const stockRet = rollingReturnFromSeries(stockSeries, priceIndex, CLASSIC_DIRECTION_LOOKBACK);
-    const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, CLASSIC_DIRECTION_LOOKBACK);
+    if (priceIndex < dirLookback) {
+      return null;
+    }
+    const stockRet = rollingReturnFromSeries(stockSeries, priceIndex, dirLookback);
+    const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, dirLookback);
     return averageFinite(stockRet, btcRet);
   });
 
