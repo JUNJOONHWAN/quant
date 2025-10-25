@@ -1660,12 +1660,61 @@ function renderHistory() {
     return;
   }
 
+  const dates = series.map((item) => item.date);
+  const stabilityValues = series.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
+  const smoothedValues = series.map((item) => (Number.isFinite(item.smoothed) ? item.smoothed : null));
+  const subConfigs = [
+    { key: 'stockCrypto', label: '주식-암호화폐', color: '#f97316' },
+    { key: 'traditional', label: '전통자산', color: '#38bdf8' },
+    { key: 'safeNegative', label: '안전자산 결합력', color: '#a855f7' },
+  ];
+  const legendNames = ['Stability', 'Smoothed', ...subConfigs.map((item) => item.label)];
+  const legendSelected = { Stability: true, Smoothed: true };
+  subConfigs.forEach((cfg) => {
+    legendSelected[cfg.label] = false;
+  });
+
+  const subSeries = subConfigs.map((cfg) => ({
+    name: cfg.label,
+    type: 'line',
+    data: series.map((item) => {
+      const value = item?.sub?.[cfg.key];
+      return Number.isFinite(value) ? Number(value.toFixed(6)) : null;
+    }),
+    smooth: true,
+    showSymbol: false,
+    lineStyle: {
+      width: 1.5,
+      type: 'dashed',
+      color: cfg.color,
+    },
+    emphasis: { focus: 'series' },
+  }));
+
   chart.setOption({
-    tooltip: { trigger: 'axis' },
-    legend: { data: ['Stability', 'Smoothed'] },
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params) => {
+        if (!Array.isArray(params) || params.length === 0) return '';
+        const header = params[0]?.axisValueLabel || params[0]?.axisValue || '';
+        const lines = params
+          .map((item) => {
+            const value = Number.isFinite(item.value) ? item.value : null;
+            if (value === null) return null;
+            return `${item.marker}${item.seriesName}: ${value.toFixed(3)}`;
+          })
+          .filter(Boolean)
+          .join('<br/>');
+        return lines ? `${header}<br/>${lines}` : header;
+      },
+    },
+    legend: {
+      data: legendNames,
+      selected: legendSelected,
+    },
     xAxis: {
       type: 'category',
-      data: series.map((item) => item.date),
+      data: dates,
     },
     yAxis: {
       type: 'value',
@@ -1676,7 +1725,7 @@ function renderHistory() {
       {
         name: 'Stability',
         type: 'line',
-        data: series.map((item) => item.stability),
+        data: stabilityValues,
         smooth: true,
         markArea: markAreas.length > 0 ? {
           silent: true,
@@ -1687,9 +1736,11 @@ function renderHistory() {
       {
         name: 'Smoothed',
         type: 'line',
-        data: series.map((item) => item.smoothed),
+        data: smoothedValues,
         smooth: true,
+        lineStyle: { width: 2, color: '#0ea5e9' },
       },
+      ...subSeries,
     ],
   });
 }
