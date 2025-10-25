@@ -81,6 +81,13 @@ header {
   min-height: 1.2rem;
 }
 
+.panel-feedback {
+  margin: 0.5rem 0 0;
+  text-align: center;
+  font-size: 0.9rem;
+  color: #e2e8f0;
+}
+
 .refresh-button {
   align-self: flex-end;
   padding: 0.55rem 1.35rem;
@@ -115,7 +122,9 @@ header {
 }
 
 select,
-input[type='date'] {
+input[type='date'],
+input[type='text'],
+input[type='password'] {
   margin-top: 0.3rem;
   padding: 0.4rem 0.6rem;
   border-radius: 0.5rem;
