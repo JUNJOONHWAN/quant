@@ -689,6 +689,8 @@ function renderAll() {
   renderGauge();
   renderSubGauges();
   renderRisk();
+  renderBacktest();
+  renderAlerts();
   renderHistory();
   renderHeatmap();
   renderPair();
@@ -806,6 +808,145 @@ function renderRisk() {
       }],
     });
   }
+}
+
+function computeRegimeSegments(dates, state) {
+  const segs = [];
+  let i = 0;
+  while (i < state.length) {
+    const cur = state[i];
+    let j = i + 1;
+    while (j < state.length && state[j] === cur) j += 1;
+    segs.push({ start: i, end: j - 1, v: cur });
+    i = j;
+  }
+  const areas = segs.map((s) => ({
+    itemStyle: {
+      color: s.v > 0 ? 'rgba(34,197,94,0.12)' : s.v < 0 ? 'rgba(248,113,113,0.12)' : 'rgba(250,204,21,0.10)',
+    },
+    name: s.v > 0 ? 'Risk-On' : s.v < 0 ? 'Risk-Off' : 'Neutral',
+    xAxis: dates[s.start],
+    xAxis2: dates[s.end],
+  }));
+  return areas;
+}
+
+function renderBacktest() {
+  const metrics = state.metrics[state.window];
+  const el = document.getElementById('backtest-chart');
+  const stats = document.getElementById('backtest-stats');
+  if (!metrics || !el) return;
+
+  const { records: filtered, empty } = getFilteredRecords(metrics);
+  if (empty || !state.priceSeries?.QQQ) {
+    if (charts.backtest) charts.backtest.clear();
+    if (stats) stats.textContent = '';
+    return;
+  }
+
+  const series = computeRiskSeriesMulti(metrics, filtered);
+  if (!series) return;
+
+  const symbol = 'QQQ';
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  // Build returns aligned to records
+  const prices = state.priceSeries[symbol] || [];
+  const dates = series.dates;
+  const pos = series.state.map((v) => (v > 0 ? 1 : 0));
+  const ret = [];
+  for (let idx = 0; idx < dates.length; idx += 1) {
+    const priceIndex = windowOffset + idx;
+    const prevIndex = priceIndex - 1;
+    let r = 0;
+    if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
+      r = prices[priceIndex] / prices[prevIndex] - 1;
+    }
+    ret.push(r);
+  }
+
+  // Equity curves
+  const eqStrat = [];
+  const eqBH = [];
+  let s = 1;
+  let b = 1;
+  for (let i = 0; i < ret.length; i += 1) {
+    s *= 1 + ret[i] * pos[i];
+    b *= 1 + ret[i];
+    eqStrat.push(Number(s.toFixed(6)));
+    eqBH.push(Number(b.toFixed(6)));
+  }
+
+  // Hit rates (1d and 5d)
+  const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
+  const state1 = series.state.slice(0, series.state.length - 1);
+  const hr1 = computeHitRate(state1, fwd1);
+  const horizon = 5;
+  const fwd5 = [];
+  for (let i = 0; i < ret.length; i += 1) {
+    let prod = 1;
+    for (let k = 1; k <= horizon && i + k < ret.length; k += 1) prod *= 1 + ret[i + k];
+    fwd5.push(prod - 1);
+  }
+  const state5 = series.state.slice(0, series.state.length - 1);
+  const hr5 = computeHitRate(state5, fwd5.slice(0, state5.length));
+
+  const chart = charts.backtest || echarts.init(el);
+  charts.backtest = chart;
+  chart.setOption({
+    legend: { data: ['전략', '벤치마크'] },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: dates },
+    yAxis: { type: 'value', scale: true },
+    series: [
+      { name: '전략', type: 'line', data: eqStrat, smooth: true },
+      { name: '벤치마크', type: 'line', data: eqBH, smooth: true },
+    ],
+    markArea: { silent: true, itemStyle: { opacity: 1 }, data: computeRegimeSegments(dates, series.state).map((a) => [{ xAxis: a.xAxis }, { xAxis: a.xAxis2, itemStyle: a.itemStyle, name: a.name }]) },
+  });
+
+  if (stats) {
+    const total = ret.length;
+    const out = `히트율(1일): ${(hr1 * 100).toFixed(1)}% · 히트율(5일): ${(hr5 * 100).toFixed(1)}% · 전략 누적 ${(pct(eqStrat[eqStrat.length - 1] - 1))} · 벤치마크 누적 ${pct(eqBH[eqBH.length - 1] - 1)}`;
+    stats.textContent = out;
+  }
+}
+
+function computeHitRate(stateArr, fwdRetArr) {
+  let wins = 0;
+  let cnt = 0;
+  for (let i = 0; i < Math.min(stateArr.length, fwdRetArr.length); i += 1) {
+    const s = stateArr[i];
+    if (s === 0) continue; // skip neutral
+    const r = fwdRetArr[i];
+    if (s > 0 && r > 0) wins += 1;
+    if (s < 0 && r < 0) wins += 1;
+    cnt += 1;
+  }
+  return cnt > 0 ? wins / cnt : 0;
+}
+
+function pct(x) { return `${(x * 100).toFixed(1)}%`; }
+
+function renderAlerts() {
+  const metrics = state.metrics[state.window];
+  const box = document.getElementById('regime-alerts');
+  if (!box || !metrics) return;
+  const { records: filtered, empty } = getFilteredRecords(metrics);
+  if (empty) { box.innerHTML = ''; return; }
+  const series = computeRiskSeriesMulti(metrics, filtered);
+  if (!series) { box.innerHTML = ''; return; }
+  const dates = series.dates;
+  const states = series.state;
+  // Find last transitions
+  const events = [];
+  for (let i = 1; i < states.length; i += 1) {
+    if (states[i] !== states[i - 1]) {
+      events.push({ date: dates[i], state: states[i] });
+    }
+  }
+  const last = events.slice(-5);
+  if (last.length === 0) { box.innerHTML = ''; return; }
+  box.innerHTML = last.map((e) => `<span class="badge ${e.state > 0 ? 'on' : e.state < 0 ? 'off' : 'neutral'}">${e.date} · ${e.state > 0 ? 'On' : e.state < 0 ? 'Off' : 'Neutral'}</span>`).join('');
 }
 
 function computeRiskSeriesMulti(metrics, recordsOverride) {
