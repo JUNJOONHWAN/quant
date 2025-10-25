@@ -186,6 +186,24 @@ const state = {
   riskMode: getInitialRiskMode(),
 };
 
+function applyRiskMode(nextMode, { persist = true } = {}) {
+  const normalized = nextMode === 'enhanced' ? 'enhanced' : 'classic';
+  state.riskMode = normalized;
+  if (persist) {
+    try {
+      window.localStorage?.setItem(RISK_MODE_STORAGE_KEY, normalized);
+    } catch (error) {
+      // ignore private-mode storage failures
+    }
+  }
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.dataset.riskMode = normalized;
+  }
+  return normalized;
+}
+
+applyRiskMode(state.riskMode, { persist: false });
+
 function normalizeDatasetPath(candidate) {
   if (!candidate || typeof candidate !== 'string') {
     return DEFAULT_DATA_PATH;
@@ -277,6 +295,11 @@ function scheduleRender() {
     renderScheduled = false;
     renderAll();
   }, 50);
+}
+
+function renderImmediately() {
+  renderScheduled = false;
+  renderAll();
 }
 
 const {
@@ -623,20 +646,13 @@ function populateControls() {
   const riskModeSelect = document.getElementById('risk-mode');
   if (riskModeSelect) {
     const currentMode = state.riskMode === 'enhanced' ? 'enhanced' : 'classic';
-    state.riskMode = currentMode;
     if (riskModeSelect.value !== currentMode) {
       riskModeSelect.value = currentMode;
     }
     if (!riskModeSelect.dataset.bound) {
       riskModeSelect.addEventListener('change', (event) => {
-        const next = event.target.value === 'enhanced' ? 'enhanced' : 'classic';
-        state.riskMode = next;
-        try {
-          window.localStorage?.setItem(RISK_MODE_STORAGE_KEY, next);
-        } catch (error) {
-          // ignore private-mode storage failures
-        }
-        scheduleRender();
+        applyRiskMode(event.target.value);
+        renderImmediately();
       });
       riskModeSelect.dataset.bound = 'true';
     }
