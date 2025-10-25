@@ -264,7 +264,13 @@ const {
   corr,
 } = window.MarketMetrics;
 
-document.addEventListener('DOMContentLoaded', init);
+// Ensure init runs even when this script is loaded after DOMContentLoaded
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  // DOM is already ready (interactive or complete), run immediately
+  init();
+}
 
 async function init() {
   showError('데이터를 불러오는 중입니다...');
