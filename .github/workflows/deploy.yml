@@ -1,9 +1,11 @@
-name: Deploy static site to GitHub Pages
+name: Build & Deploy Pages (daily refresh)
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '10 21 * * *'  # 06:10 KST
 
 permissions:
   contents: read
@@ -12,35 +14,43 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Upload static_site to GitHub Pages
+  build:
     runs-on: ubuntu-latest
+    env:
+      ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
+          cache: 'npm'
 
-      - name: Generate precomputed dataset
-        env:
-          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+      - run: npm ci
+
+      - name: Generate dataset
         run: npm run generate:data
 
-      - name: Set up Pages
-        uses: actions/configure-pages@v4
+      - name: Sanity check
+        run: |
+          test -s static_site/data/precomputed.json || { echo "missing precomputed.json"; exit 1; }
+          echo "KEY_PRESENT=$([ -n "$ALPHAVANTAGE_API_KEY" ] && echo 1 || echo 0)"
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: static_site
 
-      - name: Deploy to GitHub Pages
-        id: deployment
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
         uses: actions/deploy-pages@v4
