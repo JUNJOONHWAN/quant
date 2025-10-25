@@ -251,6 +251,16 @@ function getDatasetPath() {
 }
 
 const charts = {};
+let renderScheduled = false;
+
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  setTimeout(() => {
+    renderScheduled = false;
+    renderAll();
+  }, 50);
+}
 
 const {
   alignSeries,
@@ -258,6 +268,7 @@ const {
   buildCorrelationMatrix,
   computeStability,
   computeSubIndices,
+  averagePairs,
   ema,
   mean,
   toReturns,
@@ -415,16 +426,23 @@ async function loadData() {
     console.warn('버전 매니페스트를 불러오지 못했습니다.', error);
   }
 
-  const dataFile =
+  let dataFile =
     manifest && typeof manifest === 'object' && typeof manifest.data === 'string' && manifest.data.trim()
       ? manifest.data.trim()
       : 'precomputed.json';
   const cacheSeed =
     manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
-  const targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
-  const response = await fetch(targetUrl, { cache: 'no-store' });
+  let targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
+  let response = await fetch(targetUrl, { cache: 'no-store' });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    // Fallback to sample if available
+    dataFile = 'precomputed-sample.json';
+    targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
+    response = await fetch(targetUrl, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    setDataInfo('실제 데이터가 없어 샘플 데이터로 표시합니다.');
   }
 
   const text = await response.text();
@@ -444,6 +462,11 @@ async function loadPrecomputed() {
   try {
     setDataInfo('데이터 크기를 계산 중입니다...');
     const { json, byteLength } = await loadData();
+    if (json && json.status === 'no_data') {
+      setDataInfo('실제 데이터가 없어 샘플/플레이스홀더를 표시합니다.', 'notice');
+      showEmptyState('실제 데이터가 없습니다.', 'Actions가 아직 자료를 생성하지 못했습니다. 스케줄 실행 후 자동 갱신됩니다.');
+      return null;
+    }
     if (!Array.isArray(json.analysisDates) || json.analysisDates.length === 0) {
       setDataInfo('데이터 없음', 'error');
       showEmptyState('데이터 없음');
@@ -527,6 +550,7 @@ function populateControls() {
   if (!windowSelect.dataset.bound) {
     windowSelect.addEventListener('change', (event) => {
       state.window = Number(event.target.value);
+      scheduleRender();
     });
     windowSelect.dataset.bound = 'true';
   }
@@ -534,6 +558,7 @@ function populateControls() {
   if (!rangeSelect.dataset.bound) {
     rangeSelect.addEventListener('change', (event) => {
       state.range = Number(event.target.value);
+      scheduleRender();
     });
     rangeSelect.dataset.bound = 'true';
   }
@@ -541,6 +566,7 @@ function populateControls() {
   if (!pairSelect.dataset.bound) {
     pairSelect.addEventListener('change', (event) => {
       state.pair = event.target.value;
+      scheduleRender();
     });
     pairSelect.dataset.bound = 'true';
   }
@@ -589,6 +615,7 @@ function populateControls() {
     } else {
       setCustomRangeFeedback('');
     }
+    scheduleRender();
   };
 
   if (startInput && !startInput.dataset.bound) {
@@ -671,7 +698,14 @@ function renderRisk() {
   const elementTimeline = document.getElementById('risk-timeline');
   if (!metrics || (!elementGauge && !elementTimeline)) return;
 
-  const series = computeRiskSeriesMulti(metrics);
+  const { records: filteredRecords, empty } = getFilteredRecords(metrics);
+  if (empty) {
+    if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
+    if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
+    return;
+  }
+
+  const series = computeRiskSeriesMulti(metrics, filteredRecords);
   if (!series) {
     if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
     if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
@@ -736,8 +770,9 @@ function renderRisk() {
   }
 }
 
-function computeRiskSeriesMulti(metrics) {
-  if (!metrics || !Array.isArray(metrics.records)) return null;
+function computeRiskSeriesMulti(metrics, recordsOverride) {
+  const records = Array.isArray(recordsOverride) ? recordsOverride : metrics?.records;
+  if (!Array.isArray(records)) return null;
   const symbols = ASSETS.map((a) => a.symbol);
   const categories = {};
   ASSETS.forEach((a) => { categories[a.symbol] = a.category; });
@@ -749,7 +784,7 @@ function computeRiskSeriesMulti(metrics) {
   const mm = [];       // market mode = top eigenvalue share
   const allAbs = [];   // average absolute correlation across all pairs
 
-  metrics.records.forEach((rec) => {
+  records.forEach((rec) => {
     const matrix = rec.matrix;
     if (!Array.isArray(matrix)) return;
     dates.push(rec.date);
@@ -776,7 +811,7 @@ function computeRiskSeriesMulti(metrics) {
     return 0; // Neutral
   });
 
-  return { dates, score, state, scCorr: scSigned, safeNeg: metrics.records.map((r) => r.sub?.safeNegative ?? 0) };
+  return { dates, score, state, scCorr: scSigned, safeNeg: records.map((r) => r.sub?.safeNegative ?? 0) };
 }
 
 async function maybeAutoRefreshAfterLoad() {
@@ -986,6 +1021,17 @@ function renderGauge() {
 
   const averageLabel = averageWindowSize > 0 ? `최근 ${averageWindowSize}일 평균` : '평균';
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
+
+  // Regime summary based on multi-asset risk score
+  const riskSeries = computeRiskSeriesMulti(state.metrics[state.window], filteredRecords);
+  if (riskSeries && riskSeries.score.length > 0) {
+    const idx = riskSeries.score.length - 1;
+    const rState = riskSeries.state[idx];
+    const rLabel = rState > 0 ? 'Risk-On' : rState < 0 ? 'Risk-Off' : 'Neutral';
+    const rScore = safeNumber(riskSeries.score[idx]).toFixed(3);
+    const summary = `현재 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
+    setGaugePanelFeedback(summary);
+  }
 
   chart.setOption({
     series: [{
