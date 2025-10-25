@@ -5,14 +5,112 @@ const BANDS = { red: [0, 0.3], yellow: [0.3, 0.4], green: [0.4, 1.0] };
 const DEFAULT_PAIR = 'QQQ|BTC-USD';
 const MAX_STALE_DAYS = 7;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const MINIMUM_DATA_DATE = '2020-01-01';
+const ALPHA_RANGE_YEARS = 5;
+const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
+
+const STORAGE_KEYS = {
+  alphaKey: 'market-stability.alpha-key',
+};
+
+function loadStoredAlphaKey() {
+  try {
+    return localStorage.getItem(STORAGE_KEYS.alphaKey) || '';
+  } catch (error) {
+    console.warn('Alpha key storage unavailable', error);
+    return '';
+  }
+}
+
+function storeAlphaKey(value) {
+  try {
+    if (!value) {
+      localStorage.removeItem(STORAGE_KEYS.alphaKey);
+    } else {
+      localStorage.setItem(STORAGE_KEYS.alphaKey, value);
+    }
+  } catch (error) {
+    console.warn('Failed to persist Alpha Vantage key', error);
+  }
+}
+
+function resolveActiondEnvironment(name) {
+  const globalCandidates = [
+    window.__ACTIOND_ENV__,
+    window.ACTIOND_ENV,
+    window.actiond?.env,
+    window.actiond?.secrets,
+    window.actiond,
+    window.__ENV__,
+    window.env,
+    window.process?.env,
+  ];
+
+  for (let index = 0; index < globalCandidates.length; index += 1) {
+    const candidate = globalCandidates[index];
+    if (candidate && typeof candidate === 'object' && candidate[name]) {
+      return candidate[name];
+    }
+  }
+
+  return '';
+}
+
+async function fetchActiondSecret(name) {
+  const actiond = window.actiond;
+  if (!actiond || typeof actiond !== 'object') {
+    return '';
+  }
+
+  const methodNames = ['getSecret', 'getEnv', 'get'];
+  for (let index = 0; index < methodNames.length; index += 1) {
+    const methodName = methodNames[index];
+    const method = actiond[methodName];
+    if (typeof method !== 'function') {
+      continue; // eslint-disable-line no-continue
+    }
+    try {
+      const value = await method.call(actiond, name);
+      if (value) {
+        return value;
+      }
+    } catch (error) {
+      console.warn(`Failed to read ${name} via actiond.${methodName}`, error);
+    }
+  }
+
+  return '';
+}
+
+async function hydrateAlphaKeyFromEnvironment() {
+  if (state.alphaKey) {
+    state.alphaKeySource = 'storage';
+    return;
+  }
+
+  const direct = resolveActiondEnvironment('ALPHAVANTAGE_API_KEY');
+  if (direct) {
+    state.alphaKey = direct;
+    state.alphaKeySource = 'environment';
+    return;
+  }
+
+  const fetched = await fetchActiondSecret('ALPHAVANTAGE_API_KEY');
+  if (fetched) {
+    state.alphaKey = fetched;
+    state.alphaKeySource = 'environment';
+  }
+}
 
 const ASSETS = [
-  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock' },
-  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock' },
-  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond' },
-  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold' },
-  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto' },
+  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
+
+const storedAlphaKey = loadStoredAlphaKey();
 
 const state = {
   window: DEFAULT_WINDOW,
@@ -22,6 +120,9 @@ const state = {
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
+  alphaKey: storedAlphaKey,
+  alphaKeySource: storedAlphaKey ? 'storage' : 'unknown',
+  refreshing: false,
   customRange: {
     start: null,
     end: null,
@@ -46,6 +147,7 @@ document.addEventListener('DOMContentLoaded', init);
 async function init() {
   showError('데이터를 불러오는 중입니다...');
   state.metrics = {};
+  await hydrateAlphaKeyFromEnvironment();
   try {
     const precomputed = await fetchPrecomputed();
     if (precomputed.status === 'ok') {
@@ -90,6 +192,28 @@ async function loadFromYahoo() {
   state.normalizedPrices = returns.normalizedPrices;
   computeAllMetrics(returns, aligned);
   maybeAlignDatesToCurrent();
+}
+
+async function loadFromAlphaVantage(apiKey) {
+  const cutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
+  const effectiveCutoff = cutoff > MINIMUM_DATA_DATE ? MINIMUM_DATA_DATE : cutoff;
+  const assetSeries = [];
+
+  for (let index = 0; index < ASSETS.length; index += 1) {
+    const asset = ASSETS[index];
+    const series = await fetchAlphaSeriesBrowser(asset, apiKey, effectiveCutoff);
+    assetSeries.push(series);
+    if (index < ASSETS.length - 1) {
+      await delay(ALPHA_RATE_DELAY);
+    }
+  }
+
+  const aligned = alignSeries(assetSeries);
+  const returns = computeReturnsForState(aligned);
+  state.analysisDates = returns.dates;
+  state.generatedAt = new Date();
+  state.normalizedPrices = returns.normalizedPrices;
+  computeAllMetrics(returns, aligned);
 }
 
 function hydrateFromPrecomputed(data) {
@@ -209,11 +333,31 @@ function populateControls() {
   }
 
   const refreshButton = document.getElementById('refresh-button');
+  const alphaKeyInput = document.getElementById('alpha-key');
   const startInput = document.getElementById('custom-start');
   const endInput = document.getElementById('custom-end');
 
   const firstDate = state.analysisDates?.[0] || '';
   const lastDate = state.analysisDates?.[state.analysisDates.length - 1] || '';
+
+  if (alphaKeyInput) {
+    if (state.alphaKeySource === 'environment') {
+      alphaKeyInput.value = state.alphaKey || '';
+      alphaKeyInput.disabled = true;
+      alphaKeyInput.title = 'GitHub 환경 구성을 통해 제공된 키를 사용합니다.';
+      alphaKeyInput.classList.add('readonly');
+    } else {
+      alphaKeyInput.value = state.alphaKey || '';
+      if (!alphaKeyInput.dataset.bound) {
+        alphaKeyInput.addEventListener('input', (event) => {
+          state.alphaKey = event.target.value.trim();
+          state.alphaKeySource = state.alphaKey ? 'manual' : 'unknown';
+          storeAlphaKey(state.alphaKey);
+        });
+        alphaKeyInput.dataset.bound = 'true';
+      }
+    }
+  }
 
   if (startInput) {
     startInput.min = firstDate;
@@ -267,9 +411,7 @@ function populateControls() {
   handleCustomRangeChange();
 
   if (refreshButton && !refreshButton.dataset.bound) {
-    refreshButton.addEventListener('click', () => {
-      renderAll();
-    });
+    refreshButton.addEventListener('click', handleRefreshClick);
     refreshButton.dataset.bound = 'true';
   }
 
@@ -293,6 +435,66 @@ function renderAll() {
   renderPair();
 }
 
+async function handleRefreshClick() {
+  const refreshButton = document.getElementById('refresh-button');
+  if (state.refreshing) {
+    return;
+  }
+
+  state.refreshing = true;
+  const originalLabel = refreshButton ? refreshButton.textContent : '';
+  if (refreshButton) {
+    refreshButton.disabled = true;
+    refreshButton.textContent = '갱신 중...';
+  }
+
+  try {
+    const fetched = await maybeRefreshData();
+    if (fetched) {
+      hideError();
+    }
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    showError('최신 데이터를 불러오지 못했습니다. API 키와 네트워크 상태를 확인해 주세요.');
+  } finally {
+    if (refreshButton) {
+      refreshButton.disabled = false;
+      refreshButton.textContent = originalLabel || '리프레시';
+    }
+    state.refreshing = false;
+  }
+}
+
+async function maybeRefreshData() {
+  const metrics = state.metrics[state.window];
+  const records = metrics?.records || [];
+  const earliest = state.analysisDates?.[0]
+    || records[0]?.date
+    || null;
+  const latest = state.analysisDates?.[state.analysisDates.length - 1]
+    || records[records.length - 1]?.date
+    || null;
+
+  const needsRangeCoverage = !earliest || earliest > MINIMUM_DATA_DATE;
+  const needsFreshLatest = isLatestDateStale(latest);
+  const shouldFetch = needsRangeCoverage || needsFreshLatest || !metrics;
+
+  if (!shouldFetch) {
+    return false;
+  }
+
+  if (!state.alphaKey) {
+    showNotice('Alpha Vantage API 키를 입력하면 최신 데이터를 불러올 수 있습니다.');
+    return false;
+  }
+
+  showNotice('Alpha Vantage에서 최신 데이터를 불러오는 중입니다...');
+  await loadFromAlphaVantage(state.alphaKey);
+  hideError();
+  return true;
+}
+
 function updateMeta() {
   const metrics = state.metrics[state.window];
   if (!metrics) return;
@@ -304,13 +506,87 @@ function updateMeta() {
   generatedAt.textContent = `계산 시각: ${localeTime}`;
 }
 
+function getFilteredRecords(metrics) {
+  const fallback = { records: [], empty: true, feedbackMessage: '', rangeLabel: '' };
+  if (!metrics) return fallback;
+
+  const customRange = state.customRange || { start: null, end: null, valid: true };
+  const startTime = parseDateSafe(customRange.start);
+  const endTime = parseDateSafe(customRange.end);
+  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
+
+  if (hasCustomRange) {
+    const filtered = metrics.records.filter((item) => {
+      const time = parseDateSafe(item.date);
+      if (time === null) return false;
+      if (startTime !== null && time < startTime) return false;
+      if (endTime !== null && time > endTime) return false;
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      return {
+        records: [],
+        empty: true,
+        feedbackMessage: '선택한 기간에 해당하는 데이터가 없습니다.',
+        rangeLabel: '맞춤 기간',
+      };
+    }
+
+    const dayCount = computeCustomRangeDays(startTime, endTime, filtered.length);
+    const label = typeof dayCount === 'number' && dayCount > 0
+      ? `맞춤 ${dayCount}일`
+      : '맞춤 기간';
+
+    return {
+      records: filtered,
+      empty: false,
+      feedbackMessage: '맞춤 기간이 설정되어 있습니다.',
+      rangeLabel: label,
+    };
+  }
+
+  const rangeDays = state.range;
+  const sliced = metrics.records.slice(-rangeDays);
+  return {
+    records: sliced,
+    empty: sliced.length === 0,
+    feedbackMessage: '',
+    rangeLabel: `${rangeDays}일`,
+  };
+}
+
 function renderGauge() {
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const latest = metrics.records[metrics.records.length - 1];
   const element = document.getElementById('stability-gauge');
+  if (!element) return;
   const chart = charts.stability || echarts.init(element);
   charts.stability = chart;
+
+  const { records: filteredRecords, empty, feedbackMessage, rangeLabel } = getFilteredRecords(metrics);
+
+  if (empty) {
+    chart.clear();
+    setGaugePanelFeedback(feedbackMessage || '표시할 데이터가 없습니다.');
+    return;
+  }
+
+  setGaugePanelFeedback(feedbackMessage || '');
+
+  const latest = filteredRecords[filteredRecords.length - 1];
+  const stabilityValues = filteredRecords.map((item) => safeNumber(item.stability));
+  const averageWindowSize = Math.min(stabilityValues.length, 180);
+  const averageWindow = stabilityValues.slice(-averageWindowSize);
+  const average180 = mean(averageWindow);
+  const shortEmaSeries = ema(stabilityValues, 3);
+  const longEmaSeries = ema(stabilityValues, 10);
+  const delta = shortEmaSeries.length > 0 && longEmaSeries.length > 0
+    ? safeNumber(shortEmaSeries[shortEmaSeries.length - 1] - longEmaSeries[longEmaSeries.length - 1])
+    : 0;
+
+  const averageLabel = averageWindowSize > 0 ? `최근 ${averageWindowSize}일 평균` : '평균';
+  const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
   chart.setOption({
     series: [{
@@ -335,11 +611,11 @@ function renderGauge() {
         width: 6,
       },
       detail: {
-        formatter: () => `지수: ${latest.stability.toFixed(3)}\n180일 평균: ${metrics.average180.toFixed(3)}\n추세: ${latest.delta >= 0 ? '▲' : '▼'} ${(Math.abs(latest.delta)).toFixed(3)}`,
+        formatter: () => `지수: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
         fontSize: 16,
         offsetCenter: [0, '65%'],
       },
-      data: [{ value: latest.stability }],
+      data: [{ value: safeNumber(latest.stability) }],
     }],
   });
 }
@@ -347,7 +623,8 @@ function renderGauge() {
 function renderSubGauges() {
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const latest = metrics.records[metrics.records.length - 1];
+
+  const { records: filteredRecords, empty } = getFilteredRecords(metrics);
   const mapping = [
     { key: 'stockCrypto', element: 'stock-crypto-gauge' },
     { key: 'traditional', element: 'traditional-gauge' },
@@ -355,8 +632,17 @@ function renderSubGauges() {
   ];
 
   mapping.forEach(({ key, element }) => {
-    const chart = charts[element] || echarts.init(document.getElementById(element));
+    const container = document.getElementById(element);
+    if (!container) return;
+    const chart = charts[element] || echarts.init(container);
     charts[element] = chart;
+
+    if (empty) {
+      chart.clear();
+      return;
+    }
+
+    const latest = filteredRecords[filteredRecords.length - 1];
     const gaugeValue = safeNumber(latest.sub[key]);
     chart.setOption({
       series: [{
@@ -398,33 +684,16 @@ function renderHistory() {
 
   const metrics = state.metrics[state.window];
   if (!metrics) return;
-  const customRange = state.customRange || { start: null, end: null, valid: true };
-  const startTime = parseDateSafe(customRange.start);
-  const endTime = parseDateSafe(customRange.end);
-  const hasCustomRange = customRange.valid && (startTime !== null || endTime !== null);
 
-  let series = [];
+  const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
 
-  if (hasCustomRange) {
-    series = metrics.records.filter((item) => {
-      const time = parseDateSafe(item.date);
-      if (time === null) return false;
-      if (startTime !== null && time < startTime) return false;
-      if (endTime !== null && time > endTime) return false;
-      return true;
-    });
+  if (typeof feedbackMessage === 'string') {
+    setCustomRangeFeedback(feedbackMessage);
+  }
 
-    if (series.length === 0) {
-      setCustomRangeFeedback('선택한 기간에 해당하는 데이터가 없습니다.');
-      chart.clear();
-      return;
-    }
-
-    setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
-  } else {
-    const rangeDays = state.range;
-    series = metrics.records.slice(-rangeDays);
-    setCustomRangeFeedback('');
+  if (empty) {
+    chart.clear();
+    return;
   }
 
   chart.setOption({
@@ -578,8 +847,8 @@ function renderPair() {
     }],
     yAxis: [
       {
-        type: 'value',
-        name: '가격지수',
+        type: 'log',
+        name: '가격지수 (로그)',
         position: 'left',
       },
       {
@@ -611,6 +880,118 @@ function renderPair() {
         smooth: true,
       },
     ],
+  });
+}
+
+function computeAlphaCutoffDate(years) {
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() + 1);
+  cutoff.setUTCFullYear(cutoff.getUTCFullYear() - years);
+  return cutoff.toISOString().slice(0, 10);
+}
+
+async function fetchAlphaSeriesBrowser(asset, apiKey, cutoffDate) {
+  if (asset.source === 'DIGITAL_CURRENCY_DAILY') {
+    return fetchAlphaDigital(asset, apiKey, cutoffDate);
+  }
+  return fetchAlphaEquity(asset, apiKey, cutoffDate);
+}
+
+async function fetchAlphaEquity(asset, apiKey, cutoffDate) {
+  const url = new URL('https://www.alphavantage.co/query');
+  url.searchParams.set('function', 'TIME_SERIES_DAILY_ADJUSTED');
+  url.searchParams.set('symbol', asset.symbol);
+  url.searchParams.set('outputsize', 'full');
+  url.searchParams.set('apikey', apiKey);
+
+  const json = await fetchAlphaJson(url, asset.symbol);
+  const series = json['Time Series (Daily)'];
+  if (!series) {
+    throw buildAlphaError(json, asset.symbol);
+  }
+  return normalizeAlphaSeries(asset, series, cutoffDate, (value) => Number(value['5. adjusted close'] || value['4. close']));
+}
+
+async function fetchAlphaDigital(asset, apiKey, cutoffDate) {
+  const url = new URL('https://www.alphavantage.co/query');
+  url.searchParams.set('function', 'DIGITAL_CURRENCY_DAILY');
+  url.searchParams.set('symbol', asset.symbol.split('-')[0]);
+  url.searchParams.set('market', 'USD');
+  url.searchParams.set('apikey', apiKey);
+
+  const json = await fetchAlphaJson(url, asset.symbol);
+  const series = json['Time Series (Digital Currency Daily)'];
+  if (!series) {
+    throw buildAlphaError(json, asset.symbol);
+  }
+  return normalizeAlphaSeries(asset, series, cutoffDate, (value) => Number(value['4a. close (USD)'] || value['4b. close (USD)']));
+}
+
+async function fetchAlphaJson(url, symbol) {
+  const response = await fetch(url.toString(), { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`${symbol || 'Alpha Vantage'}: 요청 실패 (${response.status})`);
+  }
+  const json = await response.json();
+  if (json?.Note || json?.Information || json?.['Error Message']) {
+    throw buildAlphaError(json, symbol || url.searchParams.get('symbol') || '요청');
+  }
+  return json;
+}
+
+function normalizeAlphaSeries(asset, rawSeries, cutoffDate, extractClose) {
+  const dates = Object.keys(rawSeries)
+    .filter((date) => date >= cutoffDate)
+    .sort();
+
+  if (dates.length === 0) {
+    throw new Error(`${asset.symbol}: ${cutoffDate} 이후 데이터가 없습니다.`);
+  }
+
+  const filteredDates = [];
+  const prices = [];
+  dates.forEach((date) => {
+    const close = extractClose(rawSeries[date]);
+    if (Number.isFinite(close)) {
+      filteredDates.push(date);
+      prices.push(close);
+    }
+  });
+
+  if (filteredDates.length < 2) {
+    throw new Error(`${asset.symbol}: Alpha Vantage에서 충분한 표본을 받지 못했습니다.`);
+  }
+
+  return {
+    symbol: asset.symbol,
+    category: asset.category,
+    dates: filteredDates,
+    prices,
+  };
+}
+
+function buildAlphaError(payload, symbol) {
+  if (payload && typeof payload === 'object') {
+    const message = payload['Error Message'] || payload.Note || payload.Information;
+    if (message) {
+      return new Error(`${symbol}: Alpha Vantage 오류 - ${message}`);
+    }
+  }
+  return new Error(`${symbol}: Alpha Vantage 응답을 해석할 수 없습니다.`);
+}
+
+function isLatestDateStale(dateStr) {
+  if (!dateStr) return true;
+  const latestTime = parseDateSafe(dateStr);
+  if (!Number.isFinite(latestTime)) return true;
+  const today = new Date();
+  const todayMidnight = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  return todayMidnight - latestTime > MS_PER_DAY;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
 
@@ -748,6 +1129,22 @@ function safeNumber(value, fallback = 0) {
   return 0;
 }
 
+function computeCustomRangeDays(startTime, endTime, recordLength = 0) {
+  if (Number.isFinite(startTime) && Number.isFinite(endTime) && endTime >= startTime) {
+    const diff = endTime - startTime;
+    const days = Math.floor(diff / MS_PER_DAY) + 1;
+    if (days > 0) {
+      return days;
+    }
+  }
+
+  if (Number.isFinite(startTime) || Number.isFinite(endTime)) {
+    return recordLength > 0 ? recordLength : null;
+  }
+
+  return recordLength > 0 ? recordLength : null;
+}
+
 function parseDateSafe(value) {
   if (!value) return null;
   const time = Date.parse(`${value}T00:00:00Z`);
@@ -757,7 +1154,34 @@ function parseDateSafe(value) {
 function setCustomRangeFeedback(message) {
   const feedback = document.getElementById('custom-range-feedback');
   if (!feedback) return;
-  feedback.textContent = message || '';
+  const text = message || '';
+  if (feedback.textContent === text) return;
+  feedback.textContent = text;
+}
+
+function setGaugePanelFeedback(message) {
+  const panel = document.getElementById('gauge-panel');
+  if (!panel) return;
+  let helper = panel.querySelector('.panel-feedback');
+  if (!message) {
+    if (helper) {
+      helper.remove();
+    }
+    return;
+  }
+
+  if (!helper) {
+    helper = document.createElement('p');
+    helper.className = 'panel-feedback';
+    const legend = panel.querySelector('.legend');
+    if (legend) {
+      panel.insertBefore(helper, legend);
+    } else {
+      panel.appendChild(helper);
+    }
+  }
+
+  helper.textContent = message;
 }
 
 function showError(message) {
