@@ -880,13 +880,17 @@ function renderBacktest() {
 
   const symbol = 'QQQ';
   const windowOffset = Math.max(1, Number(state.window) - 1);
+  // Align filtered to global records to compute price index correctly
+  const firstDate = filtered[0]?.date;
+  const globalStartIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
+  const baseIdx = globalStartIdx >= 0 ? globalStartIdx : 0;
   // Build returns aligned to records
   const prices = state.priceSeries[symbol] || [];
   const dates = series.dates;
   const pos = series.state.map((v) => (v > 0 ? 1 : 0));
   const ret = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
-    const priceIndex = windowOffset + idx;
+    const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
     let r = 0;
     if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
@@ -1011,6 +1015,13 @@ function computeRiskSeriesMulti(metrics, recordsOverride) {
   // appetite inputs
   const k = Math.max(2, Number(RISK_CFG.appetite.kDays) || 10);
   const windowOffset = Math.max(1, Number(state.window) - 1);
+  // Align to global records if recordsOverride provided
+  let baseIdx = 0;
+  if (recordsOverride && Array.isArray(metrics?.records) && records?.length > 0) {
+    const firstDate = records[0]?.date;
+    const gIdx = metrics.records.findIndex((r) => r.date === firstDate);
+    baseIdx = gIdx >= 0 ? gIdx : 0;
+  }
   const rbDaily = [];
   const rbK = [];
   const rbBreadth = [];
@@ -1026,10 +1037,17 @@ function computeRiskSeriesMulti(metrics, recordsOverride) {
     safeNegArr.push(rec?.sub?.safeNegative ?? 0);
     // QQQ-BTC pair corr aligned to records
     const pairs = metrics?.pairs?.[RISK_CFG.pairKey]?.correlation;
-    pairCorr.push(Array.isArray(pairs) ? (pairs[pairCorr.length] ?? 0) : 0);
+    if (Array.isArray(pairs)) {
+      // index into global series using baseIdx + local idx
+      const localIdx = dates.length - 1; // current record index within filtered
+      pairCorr.push(pairs[baseIdx + localIdx] ?? 0);
+    } else {
+      pairCorr.push(0);
+    }
 
     // risk-basket daily return at this record
-    const priceIndex = windowOffset + rbDaily.length;
+    const localIdx = rbDaily.length; // index of this record within filtered
+    const priceIndex = windowOffset + baseIdx + localIdx;
     const prevIndex = priceIndex - 1;
     let eqRet = 0; let count = 0;
     risk.forEach((sym) => {
