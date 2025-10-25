@@ -730,39 +730,28 @@ function renderAll() {
 
 // --- Risk regime: score + timeline ---
 const RISK_CFG = {
-  weights: { sc: 0.7, safe: 0.3 },
-  thresholds: { on: 0.6, off: 0.3, scMinOn: 0.2, scMaxOff: -0.1 },
-  colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171' },
+  // appetite (directional) block: momentum + breadth on a risk basket
+  appetite: { kDays: 10, breadthMinOn: 0.67, momScale: 0.05 }, // 10d +5% -> fully on
+  // context (structural) block: signed corr among risk + (1 - absorption)
+  contextWeights: { sc: 0.5, mm: 0.5 },
+  blend: { appetite: 0.6, context: 0.4 },
+  thresholds: {
+    on: 0.6,
+    off: 0.3,
+    scMinOn: 0.1,
+    scMaxOff: -0.2,
+    pairMinOn: 0.10,  // QQQ-BTC gating
+    pairMaxOff: -0.10,
+    mmMaxOn: 0.80,
+    mmMinOff: 0.85,
+    safeNegMinOn: 0.15,
+    rbDownCut: -0.02, // 10d cumulative <= -2% -> Off
+  },
+  colors: { on: '#22c55e', onFragile: '#86efac', neutral: '#facc15', off: '#f87171' },
   pairKey: 'QQQ|BTC-USD',
 };
 
-function computeRiskSeries(metrics) {
-  if (!metrics || !Array.isArray(metrics.records)) return null;
-  const pair = (metrics.pairs && metrics.pairs[RISK_CFG.pairKey]) || null;
-  if (!pair || !Array.isArray(pair.correlation)) return null;
-
-  const dates = metrics.records.map((r) => r.date);
-  const scCorr = pair.correlation.slice(); // signed correlation [-1..1]
-  const safeNeg = metrics.records.map((r) => safeNumber(r.sub?.safeNegative)); // [0..1]
-
-  const weights = RISK_CFG.weights;
-  const th = RISK_CFG.thresholds;
-
-  const score = scCorr.map((c, i) => {
-    const scPos = Math.max(0, Number(c));
-    const s = weights.sc * scPos + weights.safe * safeNeg[i];
-    return Math.max(0, Math.min(1, s));
-  });
-
-  const state = scCorr.map((c, i) => {
-    const s = score[i];
-    if (s >= th.on && c >= th.scMinOn) return 1; // Risk-On
-    if (s <= th.off || c <= th.scMaxOff) return -1; // Risk-Off
-    return 0; // Neutral
-  });
-
-  return { dates, score, state, scCorr, safeNeg };
-}
+// (old computeRiskSeries removed; replaced by computeRiskSeriesMulti)
 
 function renderRisk() {
   const metrics = state.metrics[state.window];
@@ -787,8 +776,9 @@ function renderRisk() {
   const latestIdx = series.score.length - 1;
   const latestScore = series.score[latestIdx] || 0;
   const latestState = series.state[latestIdx] || 0;
-  const stateLabel = latestState > 0 ? 'Risk-On' : latestState < 0 ? 'Risk-Off' : 'Neutral';
-  const stateColor = latestState > 0 ? RISK_CFG.colors.on : latestState < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+  const fragile = isFragile(series, latestIdx);
+  const stateLabel = latestState > 0 ? (fragile ? 'Risk-On (Fragile)' : 'Risk-On') : latestState < 0 ? 'Risk-Off' : 'Neutral';
+  const stateColor = latestState > 0 ? (fragile ? RISK_CFG.colors.onFragile : RISK_CFG.colors.on) : latestState < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
 
   if (elementGauge) {
     const gauge = charts.riskGauge || echarts.init(elementGauge);
@@ -820,10 +810,15 @@ function renderRisk() {
       tooltip: { trigger: 'axis', formatter: (p) => {
         const idx = p?.[0]?.dataIndex ?? 0;
         const state = series.state[idx];
-        const label = state > 0 ? 'Risk-On' : state < 0 ? 'Risk-Off' : 'Neutral';
+        const lblFrag = isFragile(series, idx) ? ' (Fragile)' : '';
+        const label = state > 0 ? 'Risk-On' + lblFrag : state < 0 ? 'Risk-Off' : 'Neutral';
+        const pair = series.pairCorr?.[idx];
         const sc = series.scCorr[idx];
         const sn = series.safeNeg[idx];
-        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}`;
+        const mm = series.mm?.[idx];
+        const br = series.rbBreadth?.[idx];
+        const mk = series.rbK?.[idx];
+        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC: ${Number(pair).toFixed(3)} · 위험자산서명: ${Number(sc).toFixed(3)}<br/>흡수비(λ1/N): ${Number(mm).toFixed(3)} · 10일 누적: ${(Number(mk)*100).toFixed(2)}% · 10일 상승비중: ${Math.round((Number(br)||0)*100)}%<br/>Safe-NEG: ${Number(sn).toFixed(3)}`;
       } },
       xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
       yAxis: { type: 'value', min: -1, max: 1, show: false },
@@ -833,8 +828,12 @@ function renderRisk() {
         barWidth: '90%',
         itemStyle: {
           color: (params) => {
-            const v = series.state[params.dataIndex];
-            return v > 0 ? RISK_CFG.colors.on : v < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+            const i = params.dataIndex;
+            const v = series.state[i];
+            if (v > 0) {
+              return isFragile(series, i) ? RISK_CFG.colors.onFragile : RISK_CFG.colors.on;
+            }
+            return v < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
           },
         },
       }],
@@ -1006,36 +1005,95 @@ function computeRiskSeriesMulti(metrics, recordsOverride) {
   const scSigned = []; // signed mean correlation among risk assets
   const mm = [];       // market mode = top eigenvalue share
   const allAbs = [];   // average absolute correlation across all pairs
+  const safeNegArr = [];
+  const pairCorr = [];
+
+  // appetite inputs
+  const k = Math.max(2, Number(RISK_CFG.appetite.kDays) || 10);
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const rbDaily = [];
+  const rbK = [];
+  const rbBreadth = [];
 
   records.forEach((rec) => {
     const matrix = rec.matrix;
     if (!Array.isArray(matrix)) return;
     dates.push(rec.date);
-    // mean signed correlation among risk assets
     scSigned.push(averagePairs(matrix, symbols, risk, risk, (x) => x, true));
-    // average absolute correlation across all assets
     allAbs.push(averagePairs(matrix, symbols, symbols, symbols, Math.abs, true));
-    // market mode via top eigenvalue ratio
     const lambda1 = topEigenvalue(matrix) || 0;
     mm.push(lambda1 / symbols.length);
+    safeNegArr.push(rec?.sub?.safeNegative ?? 0);
+    // QQQ-BTC pair corr aligned to records
+    const pairs = metrics?.pairs?.[RISK_CFG.pairKey]?.correlation;
+    pairCorr.push(Array.isArray(pairs) ? (pairs[pairCorr.length] ?? 0) : 0);
+
+    // risk-basket daily return at this record
+    const priceIndex = windowOffset + rbDaily.length;
+    const prevIndex = priceIndex - 1;
+    let eqRet = 0; let count = 0;
+    risk.forEach((sym) => {
+      const px = state.priceSeries?.[sym];
+      if (Array.isArray(px) && Number.isFinite(px[priceIndex]) && Number.isFinite(px[prevIndex]) && px[prevIndex] !== 0) {
+        eqRet += px[priceIndex] / px[prevIndex] - 1;
+        count += 1;
+      }
+    });
+    rbDaily.push(count > 0 ? eqRet / count : 0);
+    // breadth on k-day change
+    let pos = 0; let cnt = 0;
+    risk.forEach((sym) => {
+      const px = state.priceSeries?.[sym];
+      if (Array.isArray(px) && priceIndex - k >= 0 && Number.isFinite(px[priceIndex]) && Number.isFinite(px[priceIndex - k]) && px[priceIndex - k] !== 0) {
+        const chg = px[priceIndex] / px[priceIndex - k] - 1;
+        if (chg > 0) pos += 1;
+        cnt += 1;
+      }
+    });
+    rbBreadth.push(cnt > 0 ? pos / cnt : 0);
+    // rolling k-day cumulative
+    let cum = 1; for (let i = Math.max(0, rbDaily.length - k); i < rbDaily.length; i += 1) cum *= 1 + rbDaily[i];
+    rbK.push(cum - 1);
   });
 
-  // risk-on score: emphasize positive co-movement of risk assets and penalize high market-mode herding
-  const score = scSigned.map((sc, i) => {
-    const scPos = Math.max(0, sc);           // [-1,1] -> [0,1] for positive only
-    const mmPenalty = 1 - Math.min(1, Math.max(0, mm[i])); // [0,1] -> [1,0]
-    return Math.max(0, Math.min(1, 0.7 * scPos + 0.3 * mmPenalty));
+  // appetite score: momentum (rbK) + breadth
+  const momScale = Math.max(0.001, Number(RISK_CFG.appetite.momScale) || 0.05);
+  const momNorm = rbK.map((v) => clamp01(0.5 + 0.5 * (v / momScale)));
+  const appetite = rbBreadth.map((br, i) => clamp01(0.6 * br + 0.4 * momNorm[i]));
+
+  // context score: risk signed corr (>=0 선호) + (1 - mm)
+  const ctxW = RISK_CFG.contextWeights;
+  const context = scSigned.map((sc, i) => clamp01(ctxW.sc * Math.max(0, sc) + ctxW.mm * (1 - Math.min(1, Math.max(0, mm[i])))));
+
+  // blended score
+  const blend = RISK_CFG.blend;
+  const score = appetite.map((a, i) => clamp01(blend.appetite * a + blend.context * context[i]));
+
+  // Discrete regime with BTC-QQQ gate & fragility check
+  const th = RISK_CFG.thresholds;
+  const stateOut = score.map((s, i) => {
+    const breadthOk = rbBreadth[i] >= RISK_CFG.appetite.breadthMinOn;
+    const momOk = rbK[i] > 0;
+    const scOk = scSigned[i] >= th.scMinOn;
+    const mmOk = mm[i] <= th.mmMaxOn;
+    const safeOk = safeNegArr[i] >= th.safeNegMinOn;
+    const pairOk = pairCorr[i] >= th.pairMinOn;
+    const pairTooLow = pairCorr[i] <= th.pairMaxOff;
+    if (s >= th.on && breadthOk && momOk && mmOk && scOk && safeOk && pairOk) return 1;
+    if (s <= th.off || rbK[i] <= th.rbDownCut || scSigned[i] <= th.scMaxOff || pairTooLow || mm[i] >= th.mmMinOff || allAbs[i] >= 0.8) return -1;
+    return 0;
   });
 
-  // Discrete regime
-  const state = score.map((s, i) => {
-    if (s >= 0.6 && scSigned[i] >= 0.2 && mm[i] <= 0.7) return 1; // Risk-On
-    if (s <= 0.3 || scSigned[i] <= -0.1 || mm[i] >= 0.75 || allAbs[i] >= 0.75) return -1; // Risk-Off
-    return 0; // Neutral
-  });
-
-  return { dates, score, state, scCorr: scSigned, safeNeg: records.map((r) => r.sub?.safeNegative ?? 0) };
+  return { dates, score, state: stateOut, scCorr: scSigned, safeNeg: safeNegArr, pairCorr, appetite, rbK, rbBreadth, mm };
 }
+
+function isFragile(series, i) {
+  const mm = Number(series.mm?.[i] ?? 0);
+  const allAbs = 0; // optional future: pass if needed
+  return mm >= (RISK_CFG.thresholds.mmMaxOn + 0.02); // ≥0.82 treated as fragile within On
+}
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
 async function maybeAutoRefreshAfterLoad() {
   if (state.autoRefreshAttempted || state.refreshing) {
