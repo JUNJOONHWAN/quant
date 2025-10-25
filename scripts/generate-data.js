@@ -122,14 +122,51 @@ async function fetchDigital(asset, cutoffDate) {
   if (!series) {
     throw buildAlphaError(json, asset.symbol);
   }
-  const closeKey = `4a. close (${market})`;
-  const secondaryCloseKey = `4b. close (${market})`;
-  return normalizeSeries(
-    asset,
-    series,
-    cutoffDate,
-    (value) => Number(value[closeKey] ?? value[secondaryCloseKey]),
-  );
+
+  const closeKey = selectDigitalCloseKey(series, market);
+  const dates = Object.keys(series)
+    .filter((date) => date >= cutoffDate)
+    .sort();
+  if (dates.length === 0) {
+    throw new Error(`${asset.symbol}: no samples after ${cutoffDate}`);
+  }
+
+  const filteredDates = [];
+  const prices = [];
+  dates.forEach((date) => {
+    const value = series[date];
+    const close = Number(value?.[closeKey]);
+    if (Number.isFinite(close)) {
+      filteredDates.push(date);
+      prices.push(close);
+    }
+  });
+
+  if (filteredDates.length < 2) {
+    console.warn(`${asset.symbol}: short series ${filteredDates.length}d after cutoff ${cutoffDate}`);
+  }
+
+  return {
+    symbol: asset.symbol,
+    label: asset.label,
+    category: asset.category,
+    dates: filteredDates,
+    prices,
+  };
+}
+
+function selectDigitalCloseKey(series, market) {
+  const [firstDate] = Object.keys(series);
+  const sample = firstDate ? series[firstDate] : undefined;
+  const primary = `4a. close (${market})`;
+  const secondary = `4b. close (${market})`;
+  if (sample && primary in sample) {
+    return primary;
+  }
+  if (sample && secondary in sample) {
+    return secondary;
+  }
+  return primary;
 }
 
 async function fetchJson(url) {
