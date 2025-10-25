@@ -122,7 +122,9 @@ header {
 }
 
 select,
-input[type='date'] {
+input[type='date'],
+input[type='text'],
+input[type='password'] {
   margin-top: 0.3rem;
   padding: 0.4rem 0.6rem;
   border-radius: 0.5rem;
