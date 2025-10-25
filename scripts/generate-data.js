@@ -219,6 +219,7 @@ function buildOutput(aligned, returns) {
   });
 
   return {
+    status: 'ok',
     generatedAt: new Date().toISOString(),
     analysisDates: returns.dates,
     normalizedPrices: returns.normalizedPrices,

@@ -179,17 +179,18 @@ function applyBuildInfo(info) {
 }
 
 async function fetchVersionManifest() {
+  const ts = Date.now();
   try {
-    const response = await fetch(`./data/version.json?ts=${Date.now()}`, { cache: 'no-store' });
+    const response = await fetch(`./data/version.json?ts=${ts}`, { cache: 'no-store' });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      return {};
     }
     const json = await response.json();
     versionManifest = json;
     return json;
   } catch (error) {
     console.warn('버전 매니페스트를 불러오지 못했습니다.', error);
-    return null;
+    return {};
   }
 }
 
@@ -213,13 +214,6 @@ async function ensureBuildInfo() {
   if (!datasetPath) {
     datasetPath = DEFAULT_DATA_PATH;
   }
-}
-
-function getCacheBuster() {
-  if (!cacheTagRaw) {
-    cacheTagRaw = `${Date.now()}`;
-  }
-  return encodeURIComponent(cacheTagRaw);
 }
 
 function getDatasetPath() {
@@ -335,23 +329,42 @@ function hydrateFromPrecomputed(data) {
     return;
   }
 
+  if (!Array.isArray(data.analysisDates) || data.analysisDates.length === 0) {
+    showEmptyState('실제 데이터가 없습니다.');
+    return;
+  }
+
   state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
   state.analysisDates = Array.isArray(data.analysisDates) ? data.analysisDates.slice() : [];
 
-  const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : {};
-  const rawNormalized = data.normalizedPrices && typeof data.normalizedPrices === 'object' ? data.normalizedPrices : {};
-  const hasPriceSeries = Object.keys(rawPriceSeries).length > 0;
-  const hasNormalized = Object.keys(rawNormalized).length > 0;
+  const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : null;
+  const rawNormalized = data.normalizedPrices && typeof data.normalizedPrices === 'object'
+    ? data.normalizedPrices
+    : null;
+  const hasPriceSeries = rawPriceSeries && Object.keys(rawPriceSeries).length > 0;
+  const hasNormalized = rawNormalized && Object.keys(rawNormalized).length > 0;
 
   if (!hasPriceSeries && !hasNormalized) {
     showEmptyState('실제 데이터가 없습니다.');
     return;
   }
 
-  const priceSeries = hasPriceSeries ? cloneSeriesMap(rawPriceSeries) : cloneSeriesMap(rawNormalized);
   const normalizedPrices = hasNormalized
     ? cloneSeriesMap(rawNormalized)
-    : buildNormalizedPricesFromSeries(priceSeries);
+    : hasPriceSeries
+      ? buildNormalizedPricesFromSeries(rawPriceSeries)
+      : {};
+
+  const priceSeries = hasPriceSeries
+    ? cloneSeriesMap(rawPriceSeries)
+    : Object.keys(normalizedPrices).length > 0
+      ? cloneSeriesMap(normalizedPrices)
+      : null;
+
+  if (!priceSeries) {
+    showEmptyState('실제 데이터가 없습니다.');
+    return;
+  }
 
   state.priceSeries = priceSeries;
   state.normalizedPrices = normalizedPrices;
@@ -371,29 +384,25 @@ function hydrateFromPrecomputed(data) {
 async function loadPrecomputed() {
   try {
     const now = Date.now();
-    let manifest = null;
-    try {
-      manifest = await fetchVersionManifest();
-      if (manifest) {
-        applyBuildInfo(manifest);
-      }
-    } catch (manifestError) {
-      console.warn('Failed to refresh version manifest', manifestError);
+    const manifest = await fetchVersionManifest();
+    if (manifest && Object.keys(manifest).length > 0) {
+      applyBuildInfo(manifest);
     }
 
     const manifestFile = manifest?.data || manifest?.dataPath || manifest?.file;
-    const manifestTag =
+    const targetPath = manifestFile
+      ? normalizeDatasetPath(manifestFile)
+      : getDatasetPath();
+    const cacheSeed =
       manifest?.build ||
       manifest?.buildId ||
       manifest?.cacheTag ||
       manifest?.generatedAt ||
-      manifest?.timestamp;
-    const targetPath = manifestFile
-      ? normalizeDatasetPath(manifestFile)
-      : getDatasetPath();
-    const cacheBuster = manifestTag ? encodeURIComponent(manifestTag) : getCacheBuster();
-    const ts = cacheBuster || `${now}`;
-    const targetUrl = `${targetPath}?ts=${ts}`;
+      manifest?.timestamp ||
+      cacheTagRaw ||
+      now;
+    cacheTagRaw = `${cacheSeed}`;
+    const targetUrl = `${targetPath}?ts=${encodeURIComponent(cacheSeed)}`;
     const res = await fetch(targetUrl, { cache: 'no-store' });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -403,7 +412,12 @@ async function loadPrecomputed() {
       showEmptyState();
       return null;
     }
-    if (!json || (!json.priceSeries && !json.normalizedPrices)) {
+    if (
+      !json ||
+      !Array.isArray(json.analysisDates) ||
+      json.analysisDates.length === 0 ||
+      (!json.priceSeries && !json.normalizedPrices)
+    ) {
       showEmptyState('실제 데이터가 없습니다.');
       return null;
     }
