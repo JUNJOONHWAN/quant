@@ -299,32 +299,101 @@ async function loadFromAlphaVantage(apiKey) {
   computeAllMetrics(returns, aligned);
 }
 
-function hydrateFromPrecomputed(data) {
-  state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
-  state.analysisDates = data.analysisDates || [];
-  state.normalizedPrices = data.normalizedPrices || {};
-  const declaredSource = data.priceSeriesSource === 'actual' ? 'actual' : 'normalized';
-  if (data.priceSeries && Object.keys(data.priceSeries).length > 0) {
-    state.priceSeries = data.priceSeries;
-    state.priceSeriesSource = declaredSource;
-  } else {
-    state.priceSeries = Object.fromEntries(
-      Object.entries(state.normalizedPrices).map(([symbol, values]) => [symbol, Array.isArray(values) ? values.slice() : []]),
-    );
-    state.priceSeriesSource = 'normalized';
+function buildNormalizedPricesFromSeries(seriesMap) {
+  if (!seriesMap || typeof seriesMap !== 'object') {
+    return {};
   }
+
+  const normalize = (values) => {
+    if (!Array.isArray(values) || values.length === 0) {
+      return [];
+    }
+    const base = values.find((value) => Number.isFinite(value) && Math.abs(value) > 0);
+    if (!Number.isFinite(base) || Math.abs(base) === 0) {
+      return values.map(() => null);
+    }
+    return values.map((value) => (Number.isFinite(value) ? value / base : null));
+  };
+
+  return Object.fromEntries(
+    Object.entries(seriesMap).map(([symbol, values]) => [symbol, normalize(values)]),
+  );
+}
+
+function cloneSeriesMap(seriesMap) {
+  if (!seriesMap || typeof seriesMap !== 'object') {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(seriesMap).map(([symbol, values]) => [symbol, Array.isArray(values) ? values.slice() : []]),
+  );
+}
+
+function hydrateFromPrecomputed(data) {
+  if (!data || typeof data !== 'object') {
+    showEmptyState('실제 데이터가 없습니다.');
+    return;
+  }
+
+  state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
+  state.analysisDates = Array.isArray(data.analysisDates) ? data.analysisDates.slice() : [];
+
+  const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : {};
+  const rawNormalized = data.normalizedPrices && typeof data.normalizedPrices === 'object' ? data.normalizedPrices : {};
+  const hasPriceSeries = Object.keys(rawPriceSeries).length > 0;
+  const hasNormalized = Object.keys(rawNormalized).length > 0;
+
+  if (!hasPriceSeries && !hasNormalized) {
+    showEmptyState('실제 데이터가 없습니다.');
+    return;
+  }
+
+  const priceSeries = hasPriceSeries ? cloneSeriesMap(rawPriceSeries) : cloneSeriesMap(rawNormalized);
+  const normalizedPrices = hasNormalized
+    ? cloneSeriesMap(rawNormalized)
+    : buildNormalizedPricesFromSeries(priceSeries);
+
+  state.priceSeries = priceSeries;
+  state.normalizedPrices = normalizedPrices;
+  const declaredSource = data.priceSeriesSource === 'actual' ? 'actual' : 'normalized';
+  state.priceSeriesSource = hasPriceSeries ? declaredSource : 'normalized';
   state.metrics = {};
-  Object.entries(data.windows).forEach(([windowSize, metrics]) => {
-    const numericWindow = Number(windowSize);
-    state.metrics[numericWindow] = metrics;
-  });
+  if (data.windows && typeof data.windows === 'object') {
+    Object.entries(data.windows).forEach(([windowSize, metrics]) => {
+      const numericWindow = Number(windowSize);
+      state.metrics[numericWindow] = metrics;
+    });
+  }
   refreshPairSeriesFromPrices();
   maybeAlignDatesToCurrent();
 }
 
 async function loadPrecomputed() {
   try {
-    const targetUrl = `${getDatasetPath()}?v=${getCacheBuster()}`;
+    const now = Date.now();
+    let manifest = null;
+    try {
+      manifest = await fetchVersionManifest();
+      if (manifest) {
+        applyBuildInfo(manifest);
+      }
+    } catch (manifestError) {
+      console.warn('Failed to refresh version manifest', manifestError);
+    }
+
+    const manifestFile = manifest?.data || manifest?.dataPath || manifest?.file;
+    const manifestTag =
+      manifest?.build ||
+      manifest?.buildId ||
+      manifest?.cacheTag ||
+      manifest?.generatedAt ||
+      manifest?.timestamp;
+    const targetPath = manifestFile
+      ? normalizeDatasetPath(manifestFile)
+      : getDatasetPath();
+    const cacheBuster = manifestTag ? encodeURIComponent(manifestTag) : getCacheBuster();
+    const ts = cacheBuster || `${now}`;
+    const targetUrl = `${targetPath}?ts=${ts}`;
     const res = await fetch(targetUrl, { cache: 'no-store' });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -332,6 +401,10 @@ async function loadPrecomputed() {
     const json = await res.json();
     if (json && json.status === 'no_data') {
       showEmptyState();
+      return null;
+    }
+    if (!json || (!json.priceSeries && !json.normalizedPrices)) {
+      showEmptyState('실제 데이터가 없습니다.');
       return null;
     }
     return json;
