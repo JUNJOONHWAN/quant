@@ -116,6 +116,7 @@ async function fetchDigital(asset, cutoffDate) {
 
   const primaryCloseKey = `4a. close (${market})`;
   const secondaryCloseKey = `4b. close (${market})`;
+  const legacyCloseKey = '4. close';
   const dates = Object.keys(series)
     .filter((date) => date >= cutoffDate)
     .sort();
@@ -127,7 +128,11 @@ async function fetchDigital(asset, cutoffDate) {
   const prices = [];
   dates.forEach((date) => {
     const value = series[date];
-    const close = Number(value?.[primaryCloseKey] ?? value?.[secondaryCloseKey]);
+    const close = Number(
+      value?.[primaryCloseKey]
+        ?? value?.[secondaryCloseKey]
+        ?? value?.[legacyCloseKey]
+    );
     if (Number.isFinite(close)) {
       filteredDates.push(date);
       prices.push(close);
