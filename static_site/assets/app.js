@@ -729,12 +729,25 @@ function renderAll() {
   renderPair();
 }
 
-// --- Risk regime (Classic) ---
-const RISK_CFG = {
-  weights: { sc: 0.7, safe: 0.3 },
-  thresholds: { on: 0.6, off: 0.3, scMinOn: 0.2, scMaxOff: -0.1 },
-  colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171' },
+// --- Risk regime configs ---
+const RISK_CFG_CLASSIC = {
+  // corr-heavy classic
+  weights: { sc: 0.85, safe: 0.15 },
+  thresholds: {
+    scoreOn: 0.60,
+    scoreOff: 0.30,
+    corrOn: 0.50,   // corr-dominant gate
+    corrMinOn: 0.20,
+    corrOff: -0.10,
+  },
+  colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
   pairKey: 'QQQ|BTC-USD',
+};
+
+const RISK_CFG_ENH = {
+  // absorption guards only (no overfit)
+  thresholds: { mmMaxOn: 0.80, mmMinOff: 0.85 },
+  colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
 };
 
 // (old computeRiskSeries removed; replaced by computeRiskSeriesMulti)
@@ -752,7 +765,10 @@ function renderRisk() {
     return;
   }
 
-  const series = computeRiskSeries(metrics);
+  const { records: filteredRecords2 } = getFilteredRecords(metrics);
+  const series = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
+    : computeRiskSeriesClassic(metrics, filteredRecords2);
   if (!series) {
     if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
     if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
@@ -762,8 +778,10 @@ function renderRisk() {
   const latestIdx = series.score.length - 1;
   const latestScore = series.score[latestIdx] || 0;
   const latestState = series.state[latestIdx] || 0;
-  const stateLabel = latestState > 0 ? 'Risk-On' : latestState < 0 ? 'Risk-Off' : 'Neutral';
-  const stateColor = latestState > 0 ? RISK_CFG.colors.on : latestState < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+  const palette = state.riskMode === 'enhanced' ? RISK_CFG_ENH.colors : RISK_CFG_CLASSIC.colors;
+  const fragile = !!series.fragile?.[latestIdx];
+  const stateLabel = latestState > 0 ? (fragile ? 'Risk-On (Fragile)' : 'Risk-On') : latestState < 0 ? 'Risk-Off' : 'Neutral';
+  const stateColor = latestState > 0 ? (fragile ? (palette.onFragile || palette.on) : palette.on) : latestState < 0 ? palette.off : palette.neutral;
 
   if (elementGauge) {
     const gauge = charts.riskGauge || echarts.init(elementGauge);
@@ -795,10 +813,12 @@ function renderRisk() {
       tooltip: { trigger: 'axis', formatter: (p) => {
         const idx = p?.[0]?.dataIndex ?? 0;
         const state = series.state[idx];
-        const label = state > 0 ? 'Risk-On' : state < 0 ? 'Risk-Off' : 'Neutral';
+        const label = state > 0 ? (series.fragile?.[idx] ? 'Risk-On (Fragile)' : 'Risk-On') : state < 0 ? 'Risk-Off' : 'Neutral';
         const sc = series.scCorr[idx];
         const sn = series.safeNeg[idx];
-        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}`;
+        const mm = series.mm?.[idx];
+        const mmLine = state.riskMode === 'enhanced' && Number.isFinite(mm) ? `<br/>흡수비(λ1/N): ${Number(mm).toFixed(3)}` : '';
+        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${mmLine}`;
       } },
       xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
       yAxis: { type: 'value', min: -1, max: 1, show: false },
@@ -808,8 +828,11 @@ function renderRisk() {
         barWidth: '90%',
         itemStyle: {
           color: (params) => {
-            const v = series.state[params.dataIndex];
-            return v > 0 ? RISK_CFG.colors.on : v < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+            const i = params.dataIndex; const v = series.state[i];
+            if (v > 0) {
+              return series.fragile?.[i] ? (palette.onFragile || palette.on) : palette.on;
+            }
+            return v < 0 ? palette.off : palette.neutral;
           },
         },
       }],
@@ -851,14 +874,18 @@ function renderBacktest() {
     return;
   }
 
-  const series = computeRiskSeries(metrics);
+  const { records: filtered } = getFilteredRecords(metrics);
+  const series = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, filtered)
+    : computeRiskSeriesClassic(metrics, filtered);
   if (!series) return;
 
   const symbol = 'QQQ';
   const windowOffset = Math.max(1, Number(state.window) - 1);
   // Align filtered to global records to compute price index correctly
-  const firstDate = (metrics.records || [])[0]?.date;
-  const baseIdx = 0;
+  const firstDate = filtered?.[0]?.date;
+  let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
+  if (baseIdx < 0) baseIdx = 0;
   // Build returns aligned to records
   const prices = state.priceSeries[symbol] || [];
   const dates = series.dates;
@@ -955,7 +982,9 @@ function renderAlerts() {
   if (!box || !metrics) return;
   const { records: filtered, empty } = getFilteredRecords(metrics);
   if (empty) { box.innerHTML = ''; return; }
-  const series = computeRiskSeries(metrics);
+  const series = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, filtered)
+    : computeRiskSeriesClassic(metrics, filtered);
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -971,38 +1000,66 @@ function renderAlerts() {
   box.innerHTML = last.map((e) => `<span class="badge ${e.state > 0 ? 'on' : e.state < 0 ? 'off' : 'neutral'}">${e.date} · ${e.state > 0 ? 'On' : e.state < 0 ? 'Off' : 'Neutral'}</span>`).join('');
 }
 
-// Classic series computation only; enhanced path removed
-function computeRiskSeriesMulti(metrics, recordsOverride) {
-  const records = Array.isArray(recordsOverride) ? recordsOverride : metrics?.records;
-  if (!Array.isArray(records)) return null;
-  // Defer to classic computation
-  return computeRiskSeries(metrics);
-}
-
-// no-op placeholders removed (fragility/enhanced path deleted)
-
-// Classic risk series (QQQ-BTC corr + Safe-NEG)
-function computeRiskSeries(metrics) {
+// Classic risk series (corr-dominant + Safe-NEG)
+function computeRiskSeriesClassic(metrics, recordsOverride) {
   if (!metrics || !Array.isArray(metrics.records)) return null;
-  const pair = (metrics.pairs && metrics.pairs[RISK_CFG.pairKey]) || null;
+  const pair = (metrics.pairs && metrics.pairs[RISK_CFG_CLASSIC.pairKey]) || null;
   if (!pair || !Array.isArray(pair.correlation)) return null;
 
-  const dates = metrics.records.map((r) => r.date);
-  const scCorr = pair.correlation.slice();
-  const safeNeg = metrics.records.map((r) => safeNumber(r.sub?.safeNegative));
-  const w = RISK_CFG.weights;
-  const th = RISK_CFG.thresholds;
+  // align to filtered view but compute from global indices
+  const allDates = metrics.records.map((r) => r.date);
+  let baseIdx = 0; let length = allDates.length;
+  if (Array.isArray(recordsOverride) && recordsOverride.length > 0) {
+    const firstDate = recordsOverride[0]?.date;
+    const gIdx = metrics.records.findIndex((r) => r.date === firstDate);
+    baseIdx = gIdx >= 0 ? gIdx : 0;
+    length = recordsOverride.length;
+  }
+  const dates = allDates.slice(baseIdx, baseIdx + length);
+  const scCorr = pair.correlation.slice(baseIdx, baseIdx + length);
+  const safeNeg = metrics.records.slice(baseIdx, baseIdx + length).map((r) => safeNumber(r.sub?.safeNegative));
+
+  const w = RISK_CFG_CLASSIC.weights;
+  const th = RISK_CFG_CLASSIC.thresholds;
   const score = scCorr.map((c, i) => {
     const scPos = Math.max(0, Number(c));
     return Math.max(0, Math.min(1, w.sc * scPos + w.safe * safeNeg[i]));
   });
   const state = scCorr.map((c, i) => {
     const s = score[i];
-    if (s >= th.on && c >= th.scMinOn) return 1;
-    if (s <= th.off || c <= th.scMaxOff) return -1;
+    // Corr-dominant gate
+    if (c >= th.corrOn) return 1;
+    if (c <= th.corrOff || s <= th.scoreOff) return -1;
+    if (s >= th.scoreOn && c >= th.corrMinOn) return 1;
     return 0;
   });
   return { dates, score, state, scCorr, safeNeg };
+}
+
+// Enhanced: classic + simple absorption guards
+function computeRiskSeriesEnhanced(metrics, recordsOverride) {
+  const classic = computeRiskSeriesClassic(metrics, recordsOverride);
+  if (!classic) return null;
+  const mm = new Array(classic.dates.length).fill(null);
+  const fragile = new Array(classic.dates.length).fill(false);
+  const th = RISK_CFG_ENH.thresholds;
+  let baseIdx = 0;
+  if (Array.isArray(recordsOverride) && recordsOverride.length > 0) {
+    const firstDate = recordsOverride[0]?.date;
+    const gIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
+    baseIdx = gIdx >= 0 ? gIdx : 0;
+  }
+  for (let i = 0; i < classic.dates.length; i += 1) {
+    const rec = metrics.records[baseIdx + i];
+    const matrix = rec?.matrix;
+    if (Array.isArray(matrix)) {
+      const lambda1 = topEigenvalue(matrix) || 0;
+      mm[i] = lambda1 / (matrix.length || 1);
+      if (classic.state[i] > 0 && mm[i] > th.mmMaxOn && mm[i] < th.mmMinOff) fragile[i] = true;
+      if (mm[i] >= th.mmMinOff && classic.state[i] > 0) classic.state[i] = 0; // degrade to Neutral
+    }
+  }
+  return { ...classic, mm, fragile };
 }
 
 async function maybeAutoRefreshAfterLoad() {
