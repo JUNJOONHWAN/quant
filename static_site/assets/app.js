@@ -17,6 +17,36 @@ let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
 let versionManifest = null;
 
+function setDataInfo(message, variant = 'notice') {
+  const element = document.getElementById('data-info');
+  if (!element) {
+    return;
+  }
+
+  element.textContent = message;
+  element.classList.remove('hidden');
+  element.classList.remove('notice', 'error');
+  element.classList.add(variant === 'error' ? 'error' : 'notice');
+}
+
+function formatByteSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return '알 수 없음';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = bytes;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  const display = unitIndex === 0 ? size : size.toFixed(1);
+  return `${display} ${units[unitIndex]}`;
+}
+
 function resolveActiondEnvironment(name) {
   const globalCandidates = [
     window.__ACTIOND_ENV__,
@@ -393,6 +423,7 @@ async function loadPrecomputed() {
     const targetPath = manifestFile
       ? normalizeDatasetPath(manifestFile)
       : getDatasetPath();
+    setDataInfo('데이터 크기를 계산 중입니다...');
     const cacheSeed =
       manifest?.build ||
       manifest?.buildId ||
@@ -405,10 +436,23 @@ async function loadPrecomputed() {
     const targetUrl = `${targetPath}?ts=${encodeURIComponent(cacheSeed)}`;
     const res = await fetch(targetUrl, { cache: 'no-store' });
     if (!res.ok) {
+      setDataInfo('데이터를 불러오지 못했습니다.', 'error');
       throw new Error(`HTTP ${res.status}`);
     }
-    const json = await res.json();
+    const rawText = await res.text();
+    const byteLength = new TextEncoder().encode(rawText).length;
+    setDataInfo(`데이터 크기: ${formatByteSize(byteLength)}`);
+    let json;
+    try {
+      json = JSON.parse(rawText);
+    } catch (parseError) {
+      console.warn('Failed to parse dataset JSON', parseError);
+      setDataInfo('데이터를 해석하지 못했습니다.', 'error');
+      showEmptyState('데이터를 해석하지 못했습니다.');
+      return null;
+    }
     if (json && json.status === 'no_data') {
+      setDataInfo('데이터가 비어 있습니다.', 'error');
       showEmptyState();
       return null;
     }
@@ -418,6 +462,7 @@ async function loadPrecomputed() {
       json.analysisDates.length === 0 ||
       (!json.priceSeries && !json.normalizedPrices)
     ) {
+      setDataInfo('실제 데이터가 없습니다.', 'error');
       showEmptyState('실제 데이터가 없습니다.');
       return null;
     }
@@ -427,13 +472,17 @@ async function loadPrecomputed() {
       try {
         const fallback = await fetch('./data/precomputed-sample.json', { cache: 'no-store' });
         if (fallback.ok) {
-          return await fallback.json();
+          const fallbackText = await fallback.text();
+          const fallbackBytes = new TextEncoder().encode(fallbackText).length;
+          setDataInfo(`데이터 크기: ${formatByteSize(fallbackBytes)} (샘플)`);
+          return JSON.parse(fallbackText);
         }
       } catch (fallbackError) {
         console.warn('Failed to load sample dataset', fallbackError);
       }
     }
     console.warn('Failed to load precomputed dataset', error);
+    setDataInfo('데이터 크기를 불러오지 못했습니다.', 'error');
     showEmptyState();
     return null;
   }
