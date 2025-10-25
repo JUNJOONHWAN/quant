@@ -22,11 +22,16 @@ const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
+  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
   { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
   { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY' },
   { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
+
+const SIGNAL = {
+  symbols: ['IWM', 'SPY', 'TLT', 'GLD', 'BTC-USD'],
+};
 
 const WINDOWS = [20, 30, 60];
 const RANGE_YEARS = 5;
@@ -237,22 +242,25 @@ async function writeOutput(output) {
 }
 
 function computeWindowMetrics(window, returns, aligned) {
-  const symbols = ASSETS.map((asset) => asset.symbol);
+  const allSymbols = ASSETS.map((asset) => asset.symbol);
+  const signalSymbols = SIGNAL.symbols;
   const categories = aligned.categories;
   const records = [];
   const stabilityValues = [];
 
   for (let endIndex = window - 1; endIndex < returns.dates.length; endIndex += 1) {
     const startIndex = endIndex - window + 1;
-    const matrix = buildCorrelationMatrix(symbols, returns.returns, startIndex, endIndex);
-    const stability = computeStability(matrix, symbols, categories);
-    const sub = computeSubIndices(matrix, symbols, categories);
+    const fullMatrix = buildCorrelationMatrix(allSymbols, returns.returns, startIndex, endIndex);
+    const signalMatrix = buildCorrelationMatrix(signalSymbols, returns.returns, startIndex, endIndex);
+    const stability = computeStability(signalMatrix, signalSymbols, categories);
+    const sub = computeSubIndices(signalMatrix, signalSymbols, categories);
 
     records.push({
       date: returns.dates[endIndex],
       stability,
       sub,
-      matrix,
+      matrix: signalMatrix,
+      fullMatrix,
       smoothed: stability,
       delta: 0,
     });
@@ -276,7 +284,7 @@ function computeWindowMetrics(window, returns, aligned) {
     records,
     window,
     aligned.prices,
-    symbols,
+    allSymbols,
   );
 
   return {
@@ -298,6 +306,7 @@ function buildPairSeries(records, window, alignedPrices, symbols) {
   }
 
   records.forEach((record, idx) => {
+    const matrix = Array.isArray(record.fullMatrix) ? record.fullMatrix : record.matrix;
     const returnsIndex = priceOffset + idx;
     const alignedIndex = returnsIndex + 1;
     for (let i = 0; i < symbols.length; i += 1) {
@@ -305,7 +314,8 @@ function buildPairSeries(records, window, alignedPrices, symbols) {
         const key = `${symbols[i]}|${symbols[j]}`;
         const pair = pairs[key];
         pair.dates.push(record.date);
-        pair.correlation.push(record.matrix[i][j]);
+        const corrValue = Array.isArray(matrix) && matrix[i] ? matrix[i][j] : null;
+        pair.correlation.push(Number.isFinite(corrValue) ? corrValue : null);
         const seriesA = Array.isArray(alignedPrices?.[symbols[i]])
           ? alignedPrices[symbols[i]]
           : [];

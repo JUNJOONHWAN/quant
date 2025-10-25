@@ -2,7 +2,8 @@
 
 A static web application that visualizes cross-asset correlations and a derived market stability index directly in the browser.
 The site no longer talks to Yahoo Finance from the client; instead, a GitHub Actions workflow runs `scripts/generate-data.js`, which
-pulls daily prices for QQQ, SPY, TLT, GLD, and BTC-USD from Alpha Vantage, precomputes the correlation metrics, and uploads the
+pulls daily prices for QQQ, IWM, SPY, TLT, GLD, and BTC-USD from Alpha Vantage, precomputes the correlation metrics (signals are built
+on IWM·SPY·TLT·GLD·BTC-USD, while the backtest benchmark stays on QQQ/TQQQ), and uploads the
 resulting JSON bundle (`static_site/data/precomputed.json`) alongside the static assets. Browsers simply download that JSON and
 render gauges, history charts, and pair analytics—no backend services required.
 

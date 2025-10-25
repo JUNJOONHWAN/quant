@@ -3,7 +3,7 @@
 ## 1. Objectives and Constraints
 
 - **Purpose**: Provide a public, web-based dashboard that tracks correlations between major assets and translates them into a "Market Stability Index" between 0 and 1.
-- **Assets**: QQQ, SPY, TLT, GLD, BTC-USD.
+- **Assets**: QQQ (backtest/benchmark), IWM, SPY, TLT, GLD, BTC-USD (signal universe).
 - **Data Freshness**: Daily close data refreshed once per day (free data tier).
 - **Audience**: Open access; raw market data is not redistributed to comply with licensing.
 - **Language/Locale**: Primary audience in Korea; timestamps displayed in KST.
@@ -41,10 +41,10 @@ quant/
 ### 4.1 Market Stability Index
 
 - Pair weights \(w_{ij}\):
-  - Stock–Bond: 2.0 (QQQ/SPY with TLT)
-  - Stock–Gold: 1.5 (QQQ/SPY with GLD)
-  - Stock–Crypto: 1.0 (QQQ/SPY with BTC-USD)
-  - Stock–Stock: 1.0 (QQQ with SPY)
+  - Stock–Bond: 2.0 (IWM/SPY with TLT)
+  - Stock–Gold: 1.5 (IWM/SPY with GLD)
+  - Stock–Crypto: 1.0 (IWM/SPY with BTC-USD)
+  - Stock–Stock: 1.0 (IWM with SPY)
   - Bond–Gold: 1.0 (TLT with GLD)
 - Raw index:
   \[
@@ -55,8 +55,8 @@ quant/
 
 ### 4.2 Sub-Indexes
 
-- **Stock–Crypto**: Mean absolute correlation for \{QQQ, SPY\} × \{BTC-USD\}.
-- **Traditional Assets**: Mean absolute correlation across \{QQQ, SPY, TLT, GLD\}.
+- **Stock–Crypto**: Mean absolute correlation for \{IWM, SPY\} × \{BTC-USD\}.
+- **Traditional Assets**: Mean absolute correlation across \{IWM, SPY, TLT, GLD\}.
 - **Safe-Haven Coupling**: Mean of `max(0, -ρ)` for stock pairs vs. TLT/GLD (captures inverse co-movement strength).
 
 ### 4.3 Quality Guards
@@ -85,10 +85,12 @@ quant/
   "analysisDates": ["2024-01-02", "2024-01-03", "…"],
   "normalizedPrices": {
     "QQQ": [1.0, 1.003, "…"],
+    "IWM": [0.99, 1.01, "…"],
     "SPY": [1.0, 0.998, "…"]
   },
   "assets": [
-    { "symbol": "QQQ", "label": "QQQ (NASDAQ 100 ETF)", "category": "stock" }
+    { "symbol": "QQQ", "label": "QQQ (NASDAQ 100 ETF)", "category": "stock" },
+    { "symbol": "IWM", "label": "IWM (Russell 2000 ETF)", "category": "stock" }
   ],
   "windows": {
     "30": {
@@ -98,6 +100,7 @@ quant/
         { "date": "2024-02-15", "stability": 0.352, "smoothed": 0.344, "delta": -0.008, "matrix": [[1, 0.89, "…"]], "sub": { "stockCrypto": 0.51, "traditional": 0.44, "safeNegative": 0.28 } }
       ],
       "pairs": {
+        "IWM|BTC-USD": { "dates": ["2024-02-15", "…"], "correlation": [0.42, "…"], "priceA": [1.0, "…"], "priceB": [1.0, "…"] },
         "QQQ|SPY": { "dates": ["2024-02-15", "…"], "correlation": [0.94, "…"], "priceA": [1.0, "…"], "priceB": [1.0, "…"] }
       }
     }
@@ -129,4 +132,3 @@ quant/
 - Persist historical data in a lightweight database (DuckDB or SQLite) for faster backfills.
 - Add alternative assets (e.g., EEM, DXY) with configurable weights.
 - Incorporate alerting (email/webhook) when stability index exits predefined thresholds.
-

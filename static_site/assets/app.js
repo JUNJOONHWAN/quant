@@ -2,7 +2,7 @@ const DEFAULT_WINDOW = 30;
 const WINDOWS = [20, 30, 60];
 const RANGE_OPTIONS = [30, 60, 90, 180];
 const BANDS = { red: [0, 0.3], yellow: [0.3, 0.4], green: [0.4, 1.0] };
-const DEFAULT_PAIR = 'QQQ|BTC-USD';
+const DEFAULT_PAIR = 'IWM|BTC-USD';
 const MAX_STALE_DAYS = 7;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ALPHA_RANGE_YEARS = 5;
@@ -144,11 +144,26 @@ async function hydrateAlphaKeyFromEnvironment() {
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
+  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
+
+const SIGNAL = {
+  symbols: ['IWM', 'SPY', 'TLT', 'GLD', 'BTC-USD'],
+  primaryStock: 'IWM',
+  breadth: ['IWM', 'SPY', 'BTC-USD'],
+  pairKey: DEFAULT_PAIR,
+  trade: {
+    baseSymbol: 'QQQ',
+    leveredSymbol: 'TQQQ',
+    leverage: 3,
+  },
+};
+
+const REQUIRED_SYMBOLS = Array.from(new Set([...SIGNAL.symbols, SIGNAL.trade.baseSymbol]));
 
 function getInitialRiskMode() {
   if (typeof window === 'undefined') {
@@ -412,6 +427,20 @@ function cloneSeriesMap(seriesMap) {
   );
 }
 
+function findMissingSymbols(seriesMap, symbols) {
+  if (!Array.isArray(symbols) || symbols.length === 0) {
+    return [];
+  }
+  const missing = [];
+  symbols.forEach((symbol) => {
+    const series = seriesMap?.[symbol];
+    if (!Array.isArray(series) || series.length === 0) {
+      missing.push(symbol);
+    }
+  });
+  return missing;
+}
+
 function hydrateFromPrecomputed(data) {
   if (!data || typeof data !== 'object') {
     showEmptyState('실제 데이터가 없습니다.');
@@ -429,6 +458,14 @@ function hydrateFromPrecomputed(data) {
   const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : null;
   if (!rawPriceSeries || Object.keys(rawPriceSeries).length === 0) {
     showEmptyState('priceSeries 누락');
+    return;
+  }
+
+  const missingSymbols = findMissingSymbols(rawPriceSeries, REQUIRED_SYMBOLS);
+  if (missingSymbols.length > 0) {
+    const summary = `필수 자산 데이터 누락: ${missingSymbols.join(', ')}`;
+    setDataInfo(summary, 'error');
+    showEmptyState(summary, 'static_site/data/precomputed.json을 다시 생성해 주세요.');
     return;
   }
 
@@ -505,16 +542,9 @@ async function loadData() {
   const cacheSeed =
     manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
   let targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
-  let response = await fetch(targetUrl, { cache: 'no-store' });
+  const response = await fetch(targetUrl, { cache: 'no-store' });
   if (!response.ok) {
-    // Fallback to sample if available
-    dataFile = 'precomputed-sample.json';
-    targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
-    response = await fetch(targetUrl, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    setDataInfo('실제 데이터가 없어 샘플 데이터로 표시합니다.');
+    throw new Error(`HTTP ${response.status} - ${dataFile}`);
   }
 
   const text = await response.text();
@@ -535,8 +565,8 @@ async function loadPrecomputed() {
     setDataInfo('데이터 크기를 계산 중입니다...');
     const { json, byteLength } = await loadData();
     if (json && json.status === 'no_data') {
-      setDataInfo('실제 데이터가 없어 샘플/플레이스홀더를 표시합니다.', 'notice');
-      showEmptyState('실제 데이터가 없습니다.', 'Actions가 아직 자료를 생성하지 못했습니다. 스케줄 실행 후 자동 갱신됩니다.');
+      setDataInfo('데이터 파일이 비어 있습니다. 다시 생성해 주세요.', 'error');
+      showEmptyState('데이터 파일이 비어 있습니다.', 'scripts/generate-data.js를 실행해 최신 precomputed.json을 생성해야 합니다.');
       return null;
     }
     if (!Array.isArray(json.analysisDates) || json.analysisDates.length === 0) {
@@ -785,7 +815,7 @@ function renderAll() {
 }
 
 // --- Risk regime configs ---
-const RISK_BREADTH_SYMBOLS = ['QQQ', 'SPY', 'BTC-USD'];
+const RISK_BREADTH_SYMBOLS = SIGNAL.breadth;
 const ENHANCED_LOOKBACKS = { momentum: 10, breadth: 5 };
 const RISK_CFG_CLASSIC = {
   // corr-heavy classic
@@ -798,7 +828,7 @@ const RISK_CFG_CLASSIC = {
     corrOff: -0.10,
   },
   colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
-  pairKey: 'QQQ|BTC-USD',
+  pairKey: SIGNAL.pairKey,
 };
 
 const RISK_CFG_ENH = {
@@ -808,6 +838,11 @@ const RISK_CFG_ENH = {
 };
 
 // (old computeRiskSeries removed; replaced by computeRiskSeriesMulti)
+
+function formatRiskPairLabel() {
+  const [left, right] = SIGNAL.pairKey.split('|');
+  return `${left}↔${right} corr`;
+}
 
 function renderRisk() {
   const metrics = state.metrics[state.window];
@@ -890,7 +925,8 @@ function renderRisk() {
             extras = `<br/>${parts.join(' · ')}`;
           }
         }
-        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${extras}`;
+        const corrLabel = formatRiskPairLabel();
+        return `${series.dates[idx]}<br/>${label}<br/>${corrLabel}: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${extras}`;
       } },
       xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
       yAxis: { type: 'value', min: -1, max: 1, show: false },
@@ -940,7 +976,9 @@ function renderBacktest() {
   if (!metrics || !el) return;
 
   const { records: filtered, empty } = getFilteredRecords(metrics);
-  if (empty || !state.priceSeries?.QQQ) {
+  const tradeConfig = SIGNAL.trade;
+  const baseSymbol = tradeConfig.baseSymbol;
+  if (empty || !state.priceSeries?.[baseSymbol]) {
     if (charts.backtest) charts.backtest.clear();
     if (stats) stats.textContent = '';
     return;
@@ -951,7 +989,7 @@ function renderBacktest() {
     : computeRiskSeriesClassic(metrics, filtered);
   if (!series) return;
 
-  const symbol = 'QQQ';
+  const symbol = baseSymbol;
   const windowOffset = Math.max(1, Number(state.window) - 1);
   // Align filtered to global records to compute price index correctly
   const firstDate = filtered?.[0]?.date;
@@ -959,8 +997,8 @@ function renderBacktest() {
   if (baseIdx < 0) baseIdx = 0;
   const dates = series.dates;
   const prices = state.priceSeries[symbol] || [];
-  const qqqReturns = [];
-  const tqqqReturns = [];
+  const baseReturns = [];
+  const leveredReturns = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
@@ -968,8 +1006,8 @@ function renderBacktest() {
     if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
       daily = prices[priceIndex] / prices[prevIndex] - 1;
     }
-    qqqReturns.push(daily);
-    tqqqReturns.push(leveragedReturn(daily, 3));
+    baseReturns.push(daily);
+    leveredReturns.push(leveragedReturn(daily, tradeConfig.leverage));
   }
 
   const laggedState = series.state.map((value, idx) => {
@@ -977,9 +1015,9 @@ function renderBacktest() {
     return series.state[idx - 1] || 0;
   });
   const stratReturns = laggedState.map((regime, idx) => {
-    if (regime > 0) return tqqqReturns[idx];
+    if (regime > 0) return leveredReturns[idx];
     if (regime < 0) return 0; // cash
-    return qqqReturns[idx]; // neutral holds QQQ
+    return baseReturns[idx]; // neutral holds base asset
   });
 
   // Equity curves
@@ -989,13 +1027,13 @@ function renderBacktest() {
   let b = 1;
   for (let i = 0; i < stratReturns.length; i += 1) {
     s *= 1 + (stratReturns[i] || 0);
-    b *= 1 + (qqqReturns[i] || 0);
+    b *= 1 + (baseReturns[i] || 0);
     eqStrat.push(Number(s.toFixed(6)));
     eqBH.push(Number(b.toFixed(6)));
   }
 
   // Hit rates (1d and 5d)
-  const ret = qqqReturns;
+  const ret = baseReturns;
   const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
   const state1 = series.state.slice(0, series.state.length - 1);
   const hr1 = computeHitRate(state1, fwd1);
@@ -1036,7 +1074,8 @@ function renderBacktest() {
   });
 
   if (stats) {
-    const configNote = '포지션: On=TQQQ · Neutral=QQQ · Off=현금 (1일 지연)';
+    const onLabel = tradeConfig.leveredSymbol || `${tradeConfig.leverage}x ${tradeConfig.baseSymbol}`;
+    const configNote = `포지션: On=${onLabel} · Neutral=${tradeConfig.baseSymbol} · Off=현금 (1일 지연)`;
     const out = `히트율(1일): ${(hr1 * 100).toFixed(1)}% · 히트율(5일): ${(hr5 * 100).toFixed(1)}% · 전략 누적 ${(pct(eqStrat[eqStrat.length - 1] - 1))} · 벤치마크 누적 ${pct(eqBH[eqBH.length - 1] - 1)} · ${configNote}`;
     stats.textContent = out;
   }
@@ -1143,7 +1182,7 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
 
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const prices = state.priceSeries || {};
-  const qqqSeries = prices.QQQ || [];
+  const stockSeries = prices[SIGNAL.primaryStock] || [];
   const btcSeries = prices['BTC-USD'] || [];
 
   for (let i = 0; i < length; i += 1) {
@@ -1155,9 +1194,9 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
     }
 
     const priceIndex = windowOffset + baseIdx + i;
-    const qqqRet = rollingReturnFromSeries(qqqSeries, priceIndex, ENHANCED_LOOKBACKS.momentum);
+    const stockRet = rollingReturnFromSeries(stockSeries, priceIndex, ENHANCED_LOOKBACKS.momentum);
     const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, ENHANCED_LOOKBACKS.momentum);
-    comboMomentum[i] = averageFinite(qqqRet, btcRet);
+    comboMomentum[i] = averageFinite(stockRet, btcRet);
     breadth[i] = computeRiskBreadth(priceIndex, ENHANCED_LOOKBACKS.breadth);
     stabilitySeries[i] = rec?.stability ?? null;
 
@@ -1643,7 +1682,7 @@ function renderHeatmap() {
   const chart = charts.heatmap || echarts.init(element);
   charts.heatmap = chart;
 
-  const labels = ASSETS.map((asset) => asset.symbol);
+  const labels = SIGNAL.symbols.slice();
   const matrix = computeHeatmapMatrix();
   if (!matrix) {
     chart.clear();
@@ -1694,7 +1733,7 @@ function renderHeatmap() {
 }
 
 function computeHeatmapMatrix() {
-  const symbols = ASSETS.map((asset) => asset.symbol);
+  const symbols = SIGNAL.symbols;
   const dates = Array.isArray(state.analysisDates) ? state.analysisDates : [];
   const priceSeries = state.priceSeries || {};
   if (dates.length === 0) {
@@ -2124,7 +2163,8 @@ function computeAllMetrics(returns, aligned) {
 }
 
 function computeWindowMetrics(window, returns, aligned) {
-  const symbols = ASSETS.map((asset) => asset.symbol);
+  const allSymbols = ASSETS.map((asset) => asset.symbol);
+  const signalSymbols = SIGNAL.symbols;
   const categories = aligned.categories;
   const dates = returns.dates;
   const records = [];
@@ -2132,16 +2172,18 @@ function computeWindowMetrics(window, returns, aligned) {
 
   for (let endIndex = window - 1; endIndex < returns.dates.length; endIndex += 1) {
     const startIndex = endIndex - window + 1;
-    const matrix = buildCorrelationMatrix(symbols, returns.returns, startIndex, endIndex);
-    const stability = computeStability(matrix, symbols, categories);
-    const sub = computeSubIndices(matrix, symbols, categories);
+    const fullMatrix = buildCorrelationMatrix(allSymbols, returns.returns, startIndex, endIndex);
+    const signalMatrix = buildCorrelationMatrix(signalSymbols, returns.returns, startIndex, endIndex);
+    const stability = computeStability(signalMatrix, signalSymbols, categories);
+    const sub = computeSubIndices(signalMatrix, signalSymbols, categories);
     const smoothed = stability; // placeholder for EMA, updated later
 
     records.push({
       date: dates[endIndex],
       stability,
       sub,
-      matrix,
+      matrix: signalMatrix,
+      fullMatrix,
       smoothed,
       delta: 0,
     });
@@ -2163,7 +2205,7 @@ function computeWindowMetrics(window, returns, aligned) {
 
   const latest = records[records.length - 1];
   const average180 = mean(stabilityValues.slice(-180));
-  const pairs = buildPairSeries(records, window);
+  const pairs = buildPairSeries(records, window, allSymbols);
 
   return {
     records,
@@ -2183,13 +2225,25 @@ function refreshPairSeriesFromPrices() {
     if (!metrics || !Array.isArray(metrics.records)) {
       return;
     }
-    metrics.pairs = buildPairSeries(metrics.records, numericWindow);
+    metrics.pairs = buildPairSeries(metrics.records, numericWindow, ASSETS.map((asset) => asset.symbol));
   });
 }
 
-function buildPairSeries(records, window) {
+function selectMatrixForSymbols(record, symbols) {
+  if (!record || !Array.isArray(symbols)) {
+    return null;
+  }
+  if (Array.isArray(record.fullMatrix) && record.fullMatrix.length === symbols.length) {
+    return record.fullMatrix;
+  }
+  if (Array.isArray(record.matrix) && record.matrix.length === symbols.length) {
+    return record.matrix;
+  }
+  return null;
+}
+
+function buildPairSeries(records, window, symbols = ASSETS.map((asset) => asset.symbol)) {
   const pairs = {};
-  const symbols = ASSETS.map((asset) => asset.symbol);
   const priceOffset = window - 1;
 
   for (let i = 0; i < symbols.length; i += 1) {
@@ -2205,13 +2259,15 @@ function buildPairSeries(records, window) {
   }
 
   records.forEach((record, idx) => {
+    const matrix = selectMatrixForSymbols(record, symbols);
     const priceIndex = priceOffset + idx;
     for (let i = 0; i < symbols.length; i += 1) {
       for (let j = i + 1; j < symbols.length; j += 1) {
         const key = `${symbols[i]}|${symbols[j]}`;
         const pair = pairs[key];
         pair.dates.push(record.date);
-        pair.correlation.push(record.matrix[i][j]);
+        const corrValue = matrix ? matrix[i][j] : null;
+        pair.correlation.push(Number.isFinite(corrValue) ? corrValue : null);
         const seriesA = state.priceSeries?.[symbols[i]] || [];
         const seriesB = state.priceSeries?.[symbols[j]] || [];
         const valueA = seriesA[priceIndex];

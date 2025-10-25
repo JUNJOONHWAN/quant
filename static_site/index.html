@@ -167,8 +167,8 @@
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>하위 지수 설명</h3>
     <ul>
-      <li><strong>주식-암호화폐</strong>: QQQ/SPY와 BTC 간 절댓값 상관계수 평균.</li>
-      <li><strong>전통자산</strong>: QQQ, SPY, TLT, GLD 간 절댓값 상관계수 평균.</li>
+      <li><strong>주식-암호화폐</strong>: IWM/SPY와 BTC 간 절댓값 상관계수 평균.</li>
+      <li><strong>전통자산</strong>: IWM, SPY, TLT, GLD 간 절댓값 상관계수 평균.</li>
       <li><strong>안전자산 결합력</strong>: 주식과 (TLT, GLD) 조합의 음의 상관관계를 0 이상으로 환산해 평균.</li>
     </ul>
   </section>
@@ -176,10 +176,10 @@
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>리스크 레짐 산출</h3>
     <p>
-      Classic 모드: QQQ–BTC 30일 롤링 상관(0.35 이상 가점, 0.50 이상 즉시 Risk‑On)과 안전·위험 자산 간 역상관(Safe‑NEG)을 조합한 단순 점수입니다. 상관이 −0.10 이하이거나 점수가 0.30 이하이면 Risk‑Off, 0.60 이상이면 Risk‑On, 그 외는 Neutral입니다.
+      Classic 모드: IWM–BTC 30일 롤링 상관(0.35 이상 가점, 0.50 이상 즉시 Risk‑On)과 안전·위험 자산 간 역상관(Safe‑NEG)을 조합한 단순 점수입니다. 상관이 −0.10 이하이거나 점수가 0.30 이하이면 Risk‑Off, 0.60 이상이면 Risk‑On, 그 외는 Neutral입니다.
     </p>
     <p>
-      Enhanced 모드: Classic 점수에 (1) QQQ·BTC 10일 공동 모멘텀, (2) QQQ·SPY·BTC 5일 상승비중(리스크 폭), (3) 흡수비·Safe‑NEG·안정성 기울기를 묶은 “위험 가드”를 추가합니다. Risk‑On은 점수 ≥0.63·상관 ≥0.35·모멘텀 필터 통과·위험가드 &lt; 0.9일 때만 허용되며, 위험가드가 0.8~0.9이면 Fragile로 표기합니다. 위험가드 ≥1, Safe‑NEG ≥0.6, 공동 모멘텀 ≤ −3% 중 하나라도 만족하면 Risk‑Off로 강등됩니다.
+      Enhanced 모드: Classic 점수에 (1) IWM·BTC 10일 공동 모멘텀, (2) IWM·SPY·BTC 5일 상승비중(리스크 폭), (3) 흡수비·Safe‑NEG·안정성 기울기를 묶은 “위험 가드”를 추가합니다. Risk‑On은 점수 ≥0.63·상관 ≥0.35·모멘텀 필터 통과·위험가드 &lt; 0.9일 때만 허용되며, 위험가드가 0.8~0.9이면 Fragile로 표기합니다. 위험가드 ≥1, Safe‑NEG ≥0.6, 공동 모멘텀 ≤ −3% 중 하나라도 만족하면 Risk‑Off로 강등됩니다.
     </p>
     <p>
       해석: 흡수비(시장 모드 집중도)가 높거나 안전자산으로의 강한 수급이 관측되면 상관이 높아도 “군집형” 랠리로 판단하여 레짐을 늦추고, 두 자산이 동시에 하락하는 고상관 구간은 즉시 Risk‑Off로 분류합니다.
@@ -188,7 +188,7 @@
   <section class="info-popover" id="info-backtest">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>레짐 백테스트</h3>
-    <p>전략: Risk‑On일 때만 기준 자산(기본 QQQ)을 보유, 그 외에는 현금(0%) 가정. 벤치마크는 동일 자산의 장기 보유입니다.</p>
+    <p>전략: Risk‑On일 때만 기준 자산(기본 QQQ, On 구간은 TQQQ 3배 추정)을 보유하고, 그 외에는 현금(0%)으로 가정합니다. 벤치마크는 동일 자산의 장기 보유입니다.</p>
     <p>지표: 누적 수익, 히트레이트(다음날·5일 수익 방향 적중률), 최대낙폭 등. 임계치는 과거 분포로 보정하는 것을 권장합니다.</p>
   </section>
   <section class="info-popover" id="info-pair">
