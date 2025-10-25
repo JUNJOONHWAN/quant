@@ -177,6 +177,19 @@ main {
   gap: 1.25rem;
 }
 
+.heatmap-slider {
+  margin-top: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  color: #f1f5f9;
+}
+
+.heatmap-slider input[type='range'] {
+  flex: 1;
+}
+
 .pair-chart-block h3 {
   margin: 0 0 0.5rem;
   font-size: 1rem;

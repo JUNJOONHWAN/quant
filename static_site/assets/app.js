@@ -200,6 +200,7 @@ const state = {
     valid: true,
   },
   riskMode: getInitialRiskMode(),
+  heatmapDate: null,
 };
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
@@ -455,6 +456,9 @@ function hydrateFromPrecomputed(data) {
 
   state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
   state.analysisDates = Array.isArray(data.analysisDates) ? data.analysisDates.slice() : [];
+  state.heatmapDate = state.analysisDates.length > 0
+    ? state.analysisDates[state.analysisDates.length - 1]
+    : null;
 
   const rawPriceSeries = data.priceSeries && typeof data.priceSeries === 'object' ? data.priceSeries : null;
   if (!rawPriceSeries || Object.keys(rawPriceSeries).length === 0) {
@@ -1704,19 +1708,64 @@ function renderHistory() {
 
 function renderHeatmap() {
   const element = document.getElementById('heatmap-chart');
+  const slider = document.getElementById('heatmap-slider');
+  const sliderLabel = document.getElementById('heatmap-slider-label');
   if (!element) {
     return;
   }
   const chart = charts.heatmap || echarts.init(element);
   charts.heatmap = chart;
 
-  const labels = SIGNAL.symbols.slice();
-  const matrix = computeHeatmapMatrix();
+  const metrics = state.metrics[state.window];
+  if (!metrics) {
+    chart.clear();
+    if (slider) slider.disabled = true;
+    if (sliderLabel) sliderLabel.textContent = '';
+    return;
+  }
+
+  const { records, empty } = getFilteredRecords(metrics);
+  if (empty) {
+    chart.clear();
+    if (slider) slider.disabled = true;
+    if (sliderLabel) sliderLabel.textContent = '데이터 없음';
+    return;
+  }
+
+  let targetIndex = records.length - 1;
+  if (state.heatmapDate) {
+    const matched = records.findIndex((rec) => rec.date === state.heatmapDate);
+    if (matched >= 0) {
+      targetIndex = matched;
+    }
+  }
+  const targetRecord = records[targetIndex] || records[records.length - 1];
+  state.heatmapDate = targetRecord.date;
+
+  if (slider) {
+    slider.min = 0;
+    slider.max = Math.max(records.length - 1, 0);
+    slider.value = targetIndex;
+    slider.disabled = records.length <= 1;
+    slider.oninput = (event) => {
+      const idx = Number(event.target.value);
+      const nextRecord = records[idx];
+      if (!nextRecord) return;
+      state.heatmapDate = nextRecord.date;
+      renderHeatmap();
+    };
+  }
+  if (sliderLabel) {
+    sliderLabel.textContent = `선택 일자: ${targetRecord.date}`;
+  }
+
+  const matrix = Array.isArray(targetRecord.matrix) ? targetRecord.matrix : null;
   if (!matrix) {
     chart.clear();
     return;
   }
 
+  const labels = SIGNAL.symbols.slice();
   const data = [];
   for (let i = 0; i < labels.length; i += 1) {
     for (let j = 0; j < labels.length; j += 1) {
@@ -1729,7 +1778,7 @@ function renderHeatmap() {
   chart.setOption({
     tooltip: {
       position: 'top',
-      formatter: (params) => `${labels[params.data[1]]} / ${labels[params.data[0]]}: ${params.data[2]}`,
+      formatter: (params) => `${state.heatmapDate} · ${labels[params.data[1]]} / ${labels[params.data[0]]}: ${params.data[2]}`,
     },
     grid: {
       height: '80%',
@@ -1740,10 +1789,7 @@ function renderHeatmap() {
     visualMap: {
       min: -1,
       max: 1,
-      calculable: true,
-      orient: 'horizontal',
-      left: 'center',
-      bottom: 0,
+      show: false,
     },
     series: [{
       name: 'Correlation',
@@ -1758,51 +1804,6 @@ function renderHeatmap() {
       },
     }],
   });
-}
-
-function computeHeatmapMatrix() {
-  const symbols = SIGNAL.symbols;
-  const dates = Array.isArray(state.analysisDates) ? state.analysisDates : [];
-  const priceSeries = state.priceSeries || {};
-  if (dates.length === 0) {
-    return null;
-  }
-
-  const windowSize = Math.max(Number(state.window) || DEFAULT_WINDOW, 2);
-  if (dates.length < windowSize) {
-    return null;
-  }
-
-  const returnsMap = {};
-  for (let index = 0; index < symbols.length; index += 1) {
-    const symbol = symbols[index];
-    const prices = priceSeries[symbol];
-    if (!Array.isArray(prices) || prices.length !== dates.length) {
-      return null;
-    }
-    returnsMap[symbol] = toReturns(prices);
-  }
-
-  const endIndex = dates.length - 1;
-  const startIndex = Math.max(endIndex - windowSize + 1, 0);
-  const matrix = [];
-
-  for (let i = 0; i < symbols.length; i += 1) {
-    const row = [];
-    for (let j = 0; j < symbols.length; j += 1) {
-      if (i === j) {
-        row.push(1);
-      } else {
-        const sliceA = returnsMap[symbols[i]].slice(startIndex, endIndex + 1);
-        const sliceB = returnsMap[symbols[j]].slice(startIndex, endIndex + 1);
-        const value = corr(sliceA, sliceB);
-        row.push(Number.isFinite(value) ? value : null);
-      }
-    }
-    matrix.push(row);
-  }
-
-  return matrix;
 }
 
 function renderPair() {
