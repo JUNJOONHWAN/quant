@@ -5,7 +5,6 @@ const BANDS = { red: [0, 0.3], yellow: [0.3, 0.4], green: [0.4, 1.0] };
 const DEFAULT_PAIR = 'QQQ|BTC-USD';
 const MAX_STALE_DAYS = 7;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const MINIMUM_DATA_DATE = '2020-01-01';
 const ALPHA_RANGE_YEARS = 5;
 const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
 const ACTIOND_WAIT_MS = 5000;
@@ -197,8 +196,7 @@ async function loadFromYahoo() {
 }
 
 async function loadFromAlphaVantage(apiKey) {
-  const cutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
-  const effectiveCutoff = cutoff > MINIMUM_DATA_DATE ? MINIMUM_DATA_DATE : cutoff;
+  const effectiveCutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
   const assetSeries = [];
 
   for (let index = 0; index < ASSETS.length; index += 1) {
@@ -483,6 +481,10 @@ async function handleRefreshClick() {
 }
 
 async function maybeRefreshData() {
+  if (!isLocalhost()) {
+    return false;
+  }
+
   if (!state.alphaKey) {
     await hydrateAlphaKeyFromEnvironment();
   }
@@ -514,7 +516,8 @@ function evaluateRefreshNeeds() {
     || records[records.length - 1]?.date
     || null;
 
-  const needsRangeCoverage = !earliest || earliest > MINIMUM_DATA_DATE;
+  const requiredCutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
+  const needsRangeCoverage = !earliest || earliest > requiredCutoff;
   const needsFreshLatest = isLatestDateStale(latest);
 
   return {
