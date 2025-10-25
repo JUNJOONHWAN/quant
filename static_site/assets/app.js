@@ -1635,6 +1635,17 @@ function renderHistory() {
   if (!metrics) return;
 
   const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
+  const riskSeries = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, series)
+    : computeRiskSeriesClassic(metrics, series);
+  let markAreas = [];
+  if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
+    const segments = computeRegimeSegments(riskSeries.dates, riskSeries.state) || [];
+    markAreas = segments.map((seg) => [
+      { xAxis: seg.xAxis },
+      { xAxis: seg.xAxis2, itemStyle: seg.itemStyle, name: seg.name },
+    ]);
+  }
 
   if (typeof feedbackMessage === 'string') {
     setCustomRangeFeedback(feedbackMessage);
@@ -1663,6 +1674,11 @@ function renderHistory() {
         type: 'line',
         data: series.map((item) => item.stability),
         smooth: true,
+        markArea: markAreas.length > 0 ? {
+          silent: true,
+          itemStyle: { opacity: 1 },
+          data: markAreas,
+        } : undefined,
       },
       {
         name: 'Smoothed',
