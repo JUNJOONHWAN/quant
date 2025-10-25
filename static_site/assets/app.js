@@ -941,34 +941,45 @@ function renderBacktest() {
   const firstDate = filtered?.[0]?.date;
   let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
   if (baseIdx < 0) baseIdx = 0;
-  // Build returns aligned to records
-  const prices = state.priceSeries[symbol] || [];
   const dates = series.dates;
-  const pos = series.state.map((v) => (v > 0 ? 1 : 0));
-  const ret = [];
+  const prices = state.priceSeries[symbol] || [];
+  const qqqReturns = [];
+  const tqqqReturns = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
-    let r = 0;
+    let daily = 0;
     if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
-      r = prices[priceIndex] / prices[prevIndex] - 1;
+      daily = prices[priceIndex] / prices[prevIndex] - 1;
     }
-    ret.push(r);
+    qqqReturns.push(daily);
+    tqqqReturns.push(leveragedReturn(daily, 3));
   }
+
+  const laggedState = series.state.map((value, idx) => {
+    if (idx === 0) return 0;
+    return series.state[idx - 1] || 0;
+  });
+  const stratReturns = laggedState.map((regime, idx) => {
+    if (regime > 0) return tqqqReturns[idx];
+    if (regime < 0) return 0; // cash
+    return qqqReturns[idx]; // neutral holds QQQ
+  });
 
   // Equity curves
   const eqStrat = [];
   const eqBH = [];
   let s = 1;
   let b = 1;
-  for (let i = 0; i < ret.length; i += 1) {
-    s *= 1 + ret[i] * pos[i];
-    b *= 1 + ret[i];
+  for (let i = 0; i < stratReturns.length; i += 1) {
+    s *= 1 + (stratReturns[i] || 0);
+    b *= 1 + (qqqReturns[i] || 0);
     eqStrat.push(Number(s.toFixed(6)));
     eqBH.push(Number(b.toFixed(6)));
   }
 
   // Hit rates (1d and 5d)
+  const ret = qqqReturns;
   const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
   const state1 = series.state.slice(0, series.state.length - 1);
   const hr1 = computeHitRate(state1, fwd1);
@@ -1009,8 +1020,8 @@ function renderBacktest() {
   });
 
   if (stats) {
-    const total = ret.length;
-    const out = `히트율(1일): ${(hr1 * 100).toFixed(1)}% · 히트율(5일): ${(hr5 * 100).toFixed(1)}% · 전략 누적 ${(pct(eqStrat[eqStrat.length - 1] - 1))} · 벤치마크 누적 ${pct(eqBH[eqBH.length - 1] - 1)}`;
+    const configNote = '포지션: On=TQQQ · Neutral=QQQ · Off=현금 (1일 지연)';
+    const out = `히트율(1일): ${(hr1 * 100).toFixed(1)}% · 히트율(5일): ${(hr5 * 100).toFixed(1)}% · 전략 누적 ${(pct(eqStrat[eqStrat.length - 1] - 1))} · 벤치마크 누적 ${pct(eqBH[eqBH.length - 1] - 1)} · ${configNote}`;
     stats.textContent = out;
   }
 }
@@ -1240,6 +1251,13 @@ function averageFinite(...values) {
   const finite = values.filter((value) => Number.isFinite(value));
   if (finite.length === 0) return null;
   return finite.reduce((acc, value) => acc + value, 0) / finite.length;
+}
+
+function leveragedReturn(baseReturn, leverage = 3) {
+  if (!Number.isFinite(baseReturn)) return 0;
+  const levered = leverage * baseReturn;
+  // Prevent daily drop worse than -100% to avoid negative equity
+  return Math.max(-0.99, levered);
 }
 
 async function maybeAutoRefreshAfterLoad() {
