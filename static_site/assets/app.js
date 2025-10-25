@@ -816,18 +816,17 @@ function renderAll() {
 
 // --- Risk regime configs ---
 const RISK_BREADTH_SYMBOLS = SIGNAL.breadth;
-const ENHANCED_LOOKBACKS = { momentum: 12, breadth: 5 };
+const ENHANCED_LOOKBACKS = { momentum: 10, breadth: 5 };
 const RISK_CFG_CLASSIC = {
-  // corr-heavy classic with direction guard
-  weights: { sc: 0.75, safe: 0.10, dir: 0.15 },
+  // original corr-heavy classic
+  weights: { sc: 0.85, safe: 0.15 },
   thresholds: {
-    scoreOn: 0.62,
+    scoreOn: 0.60,
     scoreOff: 0.30,
     corrOn: 0.50,   // corr-dominant gate
     corrMinOn: 0.20,
-    corrOff: -0.05,
+    corrOff: -0.10,
   },
-  directionLookback: 12,
   colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
   pairKey: SIGNAL.pairKey,
 };
@@ -1140,42 +1139,22 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   const dates = allDates.slice(baseIdx, baseIdx + length);
   const scCorr = pair.correlation.slice(baseIdx, baseIdx + length);
   const safeNeg = metrics.records.slice(baseIdx, baseIdx + length).map((r) => safeNumber(r.sub?.safeNegative));
-  const windowOffset = Math.max(1, Number(state.window) - 1);
-  const prices = state.priceSeries || {};
-  const stockSeries = prices[SIGNAL.primaryStock] || [];
-  const btcSeries = prices['BTC-USD'] || [];
-  const dirLookback = Math.max(1, Number(RISK_CFG_CLASSIC.directionLookback) || 1);
-  const dirMomentum = scCorr.map((_, idx) => {
-    const priceIndex = windowOffset + baseIdx + idx;
-    if (priceIndex < dirLookback) {
-      return null;
-    }
-    const stockRet = rollingReturnFromSeries(stockSeries, priceIndex, dirLookback);
-    const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, dirLookback);
-    return averageFinite(stockRet, btcRet);
-  });
 
   const w = RISK_CFG_CLASSIC.weights;
   const th = RISK_CFG_CLASSIC.thresholds;
   const score = scCorr.map((c, i) => {
     const scPos = Math.max(0, Number(c));
-    const dir = dirMomentum[i] ?? 0;
-    const dirBoost = clamp01((dir + 0.01) / 0.05);
-    const safeEff = dir >= 0 ? safeNeg[i] : Math.min(safeNeg[i], 0.2);
-    const dirWeight = w.dir ?? 0;
-    const total = (w.sc || 0) * scPos + (w.safe || 0) * safeEff + dirWeight * dirBoost;
-    return clamp01(total);
+    return Math.max(0, Math.min(1, w.sc * scPos + w.safe * safeNeg[i]));
   });
   const state = scCorr.map((c, i) => {
     const s = score[i];
-    const dir = dirMomentum[i] ?? 0;
     // Corr-dominant gate
-    if (c >= th.corrOn && dir >= -0.005) return 1;
-    if (c <= th.corrOff || s <= th.scoreOff || dir <= -0.02) return -1;
-    if (s >= th.scoreOn && c >= th.corrMinOn && dir >= -0.01) return 1;
+    if (c >= th.corrOn) return 1;
+    if (c <= th.corrOff || s <= th.scoreOff) return -1;
+    if (s >= th.scoreOn && c >= th.corrMinOn) return 1;
     return 0;
   });
-  return { dates, score, state, scCorr, safeNeg, dirMomentum };
+  return { dates, score, state, scCorr, safeNeg };
 }
 
 // Enhanced: classic + momentum, breadth, and absorption/stability guards
