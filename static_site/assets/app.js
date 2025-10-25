@@ -985,12 +985,8 @@ function renderPair() {
   });
 }
 
-function computeAlphaCutoffDate(years) {
-  const cutoff = new Date();
-  cutoff.setUTCDate(cutoff.getUTCDate() + 1);
-  cutoff.setUTCFullYear(cutoff.getUTCFullYear() - years);
-  const computed = cutoff.toISOString().slice(0, 10);
-  return computed > MINIMUM_ALPHA_CUTOFF ? computed : MINIMUM_ALPHA_CUTOFF;
+function computeAlphaCutoffDate() {
+  return MINIMUM_ALPHA_CUTOFF;
 }
 
 async function fetchAlphaSeriesBrowser(asset, apiKey, cutoffDate) {
