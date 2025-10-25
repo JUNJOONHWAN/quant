@@ -36,10 +36,9 @@ jobs:
       - name: Generate dataset
         run: npm run generate:data
 
-      - name: Sanity check
+      - name: Sanity check (allow no_data placeholder)
         run: |
-          test -s static_site/data/precomputed.json || { echo "missing precomputed.json"; exit 1; }
-          echo "KEY_PRESENT=$([ -n "$ALPHAVANTAGE_API_KEY" ] && echo 1 || echo 0)"
+          node -e "const fs=require('fs');const p='static_site/data/precomputed.json';if(!fs.existsSync(p)){process.exit(1)};console.log('precomputed.json OK')"
 
       - uses: actions/configure-pages@v5
 

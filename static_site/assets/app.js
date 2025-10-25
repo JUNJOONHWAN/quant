@@ -10,6 +10,7 @@ const MINIMUM_ALPHA_CUTOFF = '2020-01-01';
 const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
 const ACTIOND_WAIT_MS = 5000;
 const ACTIOND_POLL_INTERVAL_MS = 75;
+const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 
 function resolveActiondEnvironment(name) {
   const globalCandidates = [
@@ -152,38 +153,20 @@ async function init() {
   state.metrics = {};
   await hydrateAlphaKeyFromEnvironment();
   try {
-    const precomputed = await fetchPrecomputed();
-    if (precomputed.status === 'ok') {
-      hydrateFromPrecomputed(precomputed.payload);
+    const precomputed = await loadPrecomputed();
+    if (!precomputed) {
       hideError();
-    } else if (precomputed.status === 'missing') {
-      const fallback = await fetchFallbackPrecomputed();
-      if (fallback.status === 'ok') {
-        hydrateFromPrecomputed(fallback.payload);
-        showNotice('사전 계산된 데이터를 찾지 못해 샘플 데이터를 표시합니다. 최신 지표를 보려면 GitHub Actions 배치를 확인해 주세요.');
-      } else if (isLocalhost()) {
-        await loadFromYahoo();
-        hideError();
-      } else {
-        throw new Error('PRECOMPUTED_DATA_UNAVAILABLE');
-      }
-    } else if (precomputed.status === 'error' && isLocalhost()) {
-      await loadFromYahoo();
-      hideError();
-    } else {
-      throw precomputed.error || new Error('PRECOMPUTED_DATA_UNAVAILABLE');
+      return;
     }
 
+    hydrateFromPrecomputed(precomputed);
+    hideError();
     populateControls();
     renderAll();
     await maybeAutoRefreshAfterLoad();
   } catch (error) {
     console.error(error);
-    if (error && error.message === 'PRECOMPUTED_DATA_UNAVAILABLE') {
-      showError('사전 계산된 데이터가 없습니다. README에 안내된 GitHub Actions 배치를 실행하거나 `npm run generate:data` 후 커밋해 주세요.');
-    } else {
-      showError('데이터를 불러오지 못했습니다. 네트워크 상태를 확인하거나 데이터를 다시 생성해 주세요.');
-    }
+    showError('데이터를 불러오지 못했습니다. 네트워크 상태를 확인하거나 데이터를 다시 생성해 주세요.');
   }
 }
 
@@ -246,37 +229,37 @@ function hydrateFromPrecomputed(data) {
   maybeAlignDatesToCurrent();
 }
 
-async function fetchPrecomputed() {
+async function loadPrecomputed() {
   try {
-    const response = await fetch('./data/precomputed.json', { cache: 'no-store' });
-    if (response.status === 404) {
-      return { status: 'missing' };
+    const res = await fetch('./data/precomputed.json', { cache: 'no-cache' });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
     }
-    if (!response.ok) {
-      return { status: 'error', error: new Error(`precomputed fetch failed: ${response.status}`) };
+    const json = await res.json();
+    if (json && json.status === 'no_data') {
+      showEmptyState();
+      return null;
     }
-    const payload = await response.json();
-    return { status: 'ok', payload };
+    return json;
   } catch (error) {
-    return { status: 'error', error };
-  }
-}
-
-async function fetchFallbackPrecomputed() {
-  try {
-    const response = await fetch('./data/precomputed-sample.json', { cache: 'no-store' });
-    if (!response.ok) {
-      return { status: 'error', error: new Error(`fallback fetch failed: ${response.status}`) };
+    if (IS_LOCAL) {
+      try {
+        const fallback = await fetch('./data/precomputed-sample.json', { cache: 'no-cache' });
+        if (fallback.ok) {
+          return await fallback.json();
+        }
+      } catch (fallbackError) {
+        console.warn('Failed to load sample dataset', fallbackError);
+      }
     }
-    const payload = await response.json();
-    return { status: 'ok', payload };
-  } catch (error) {
-    return { status: 'error', error };
+    console.warn('Failed to load precomputed dataset', error);
+    showEmptyState();
+    return null;
   }
 }
 
 function isLocalhost() {
-  return ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+  return IS_LOCAL;
 }
 
 function populateControls() {
@@ -1317,6 +1300,24 @@ function setGaugePanelFeedback(message) {
   }
 
   helper.textContent = message;
+}
+
+function showEmptyState(
+  msg = '실제 데이터가 없습니다.',
+  sub = 'API 생성 실패 또는 제한. 다음 스케줄 실행 후 자동 갱신됩니다.',
+) {
+  const existing = document.querySelector('.empty-state-banner');
+  if (existing) {
+    existing.querySelector('.empty-state-primary').textContent = msg;
+    existing.querySelector('.empty-state-secondary').textContent = sub;
+    return;
+  }
+
+  const div = document.createElement('div');
+  div.className = 'empty-state-banner';
+  div.style.cssText = 'padding:12px;border:1px solid #ddd;border-radius:8px;margin:12px;background:#fffbe6;';
+  div.innerHTML = `<strong class="empty-state-primary">${msg}</strong><div class="empty-state-secondary" style="margin-top:6px">${sub}</div>`;
+  document.body.prepend(div);
 }
 
 function showError(message) {
