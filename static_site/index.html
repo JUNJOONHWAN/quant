@@ -128,6 +128,7 @@
     <section class="panel">
       <div class="panel-header">
         <h2>자산 상관관계 히트맵</h2>
+        <button type="button" class="info" data-target="info-heatmap">ⓘ</button>
       </div>
       <div id="heatmap-chart" class="chart"></div>
       <div class="heatmap-slider">
@@ -159,48 +160,62 @@
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>시장 안정성 지수</h3>
     <p>
-      정의: 자산 간 상관계수의 절댓값을 가중 평균(주식–채권 가중↑)한 값입니다. 0은 분산(비동행), 1은 완전 동행을 의미합니다.
+      정의: IWM·SPY·TLT·GLD·BTC 간 상관계수의 절댓값을 주식/채권 가중으로 묶은 0~1 지수입니다. 0은 서로 다른 방향, 1은 완전 동조를 의미합니다.
     </p>
     <p>
-      해석: 위기 구간에서 상관이 전반적으로 상승하는 경향(“상관이 1로 수렴”)이 있습니다. 절댓값 상관이 높고 첫 고유값(시장 모드) 지배가 커질수록
-      분산 효과가 약해져 ‘Risk-Off’ 환경에 가까워집니다.
+      활용: <strong>0.40 이상 + 단기 모멘텀 ▲</strong>이면 ‘광범위 위험 랠리’ 신호로 보고, <strong>0.40 이상 + 모멘텀 ▼</strong>이면 ‘안정된 하락(군집형 리스크)’로 표시하여 Guard를 반드시 확인합니다.
+      2025-10-13 이후처럼 스태빌리티가 급등했는데도 레짐이 Risk-Off라면 “방향성 미확인” 단계이니 히트맵·모멘텀을 함께 모니터링하세요.
     </p>
     <p>
-      눈금: 빨강(0–0.3), 노랑(0.3–0.4), 초록(0.4–1.0)은 동일 구간 대비 상대적 해석을 돕는 범례입니다.
+      범례: 빨강(0–0.3)은 분산 장세, 노랑(0.3–0.4)은 과도기, 초록(0.4–1.0)은 한 방향으로 묶인 장세입니다. 초록이어도 흡수비(mm) ≥ 0.90이면 Guard가 긴장 상태일 수 있습니다.
     </p>
   </section>
   <section class="info-popover" id="info-sub">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>하위 지수 설명</h3>
     <ul>
-      <li><strong>주식-암호화폐</strong>: IWM/SPY와 BTC 간 절댓값 상관계수 평균.</li>
-      <li><strong>전통자산</strong>: IWM, SPY, TLT, GLD 간 절댓값 상관계수 평균.</li>
-      <li><strong>안전자산 결합력</strong>: 주식과 (TLT, GLD) 조합의 음의 상관관계를 0 이상으로 환산해 평균.</li>
+      <li><strong>주식-암호화폐</strong>: IWM·SPY 대비 BTC 절댓값 상관. 0.5 이상이면 소형주·크립토 랠리가 동시 진행되는 구간(예: 1/10~1/24, 10/24)이라 Classic 점수가 급등합니다.</li>
+      <li><strong>전통자산</strong>: IWM·SPY·TLT·GLD 내부 상관. 0.6 이상으로 뭉치면 “금리/실적 이벤트” 영향이 커졌다는 뜻이니 흡수비와 함께 Guard를 확인해 False Risk-On을 걸러냅니다.</li>
+      <li><strong>안전자산 결합력 (Safe-NEG)</strong>: 주식 ↔ (TLT, GLD) 음의 상관을 0~1로 환산. 0.6 이상이면 안전자산 약세 → 위험선호로 읽지만, 금리 쇼크처럼 주식도 함께 하락하면 오히려 경고 신호일 수 있으니 반드시 모멘텀을 함께 봅니다.</li>
     </ul>
   </section>
   <section class="info-popover" id="info-risk">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>리스크 레짐 산출</h3>
     <p>
-      Classic 모드: IWM–BTC 30일 롤링 상관(0.35 이상 가점, 0.50 이상 즉시 Risk‑On)과 안전·위험 자산 간 역상관(Safe‑NEG)을 조합한 단순 점수입니다. 상관이 −0.10 이하이거나 점수가 0.30 이하이면 Risk‑Off, 0.60 이상이면 Risk‑On, 그 외는 Neutral입니다.
+      Classic: IWM–BTC 30일 상관 70%와 Safe‑NEG 30%를 조합한 점수입니다. corr ≥ 0.50 또는 점수 ≥ 0.65면 Risk‑On, corr ≤ −0.05 또는 점수 ≤ 0.30이면 Risk‑Off입니다. 두 자산이 모두 하락하는 고상관 구간은 Safe‑NEG와 Score 조건을 통과하지 않으면 On으로 전환하지 않습니다.
     </p>
     <p>
-      Enhanced 모드: Classic 점수에 (1) IWM·BTC 10일 공동 모멘텀, (2) IWM·SPY·BTC 5일 상승비중(리스크 폭), (3) 흡수비·Safe‑NEG·안정성 기울기를 묶은 “위험 가드”를 추가합니다. Risk‑On은 점수 ≥0.63·상관 ≥0.35·모멘텀 필터 통과·위험가드 &lt; 0.9일 때만 허용되며, 위험가드가 0.8~0.9이면 Fragile로 표기합니다. 위험가드 ≥1, Safe‑NEG ≥0.6, 공동 모멘텀 ≤ −3% 중 하나라도 만족하면 Risk‑Off로 강등됩니다.
+      Enhanced: Classic 점수에 10일 공동 모멘텀, IWM·SPY·BTC 5일 리스크 폭, 흡수비/안정성 기반 guardScore를 더해 “확신된” On만 통과시킵니다. blended ≥ 0.60, corr ≥ 0.33, momentum ≥ 0.35, guard &lt; 0.9, combo > −0.5%를 동시에 만족해야 합니다.
     </p>
     <p>
-      해석: 흡수비(시장 모드 집중도)가 높거나 안전자산으로의 강한 수급이 관측되면 상관이 높아도 “군집형” 랠리로 판단하여 레짐을 늦추고, 두 자산이 동시에 하락하는 고상관 구간은 즉시 Risk‑Off로 분류합니다.
+      활용 팁: <strong>강력 Risk-On</strong>은 (1) corr ≥ 0.5, (2) comboMomentum ≥ +1.5%, (3) guard < 0.7이 동시에 잡힐 때이며 2025-10-24가 대표 사례입니다. 스태빌리티·상관이 높아도 guard ≥ 0.9 또는 combo ≤ 0%라면 “안정된 하락”으로 보고 On 진입을 유보하세요.
     </p>
   </section>
   <section class="info-popover" id="info-backtest">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>레짐 백테스트</h3>
-    <p>전략: Risk‑On일 때만 기준 자산(기본 QQQ, On 구간은 TQQQ 3배 추정)을 보유하고, 그 외에는 현금(0%)으로 가정합니다. 벤치마크는 동일 자산의 장기 보유입니다.</p>
-    <p>지표: 누적 수익, 히트레이트(다음날·5일 수익 방향 적중률), 최대낙폭 등. 임계치는 과거 분포로 보정하는 것을 권장합니다.</p>
+    <p>전략: 신호는 IWM·SPY·TLT·GLD·BTC에서 만들지만, 트레이드는 QQQ 계열로 평가합니다. Risk‑On=레버리지 ETF(TNA/TQQQ 등), Neutral=기준 ETF(IWM/QQQ), Off=현금(0%). 체결은 1일 지연을 가정합니다.</p>
+    <p>읽는 법: 배경 색 띠는 레짐(온·오프·뉴트럴)과 동기화됩니다. 히트율(1일/5일)은 “레짐과 같은 방향으로 수익이 났는가”를 뜻하며 60% 이상이면 모멘텀을 잘 포착한 것입니다. Guard가 높아 On 진입을 건너뛰면 벤치마크 대비 언더퍼폼 구간이 생기므로 파라미터 재점검 포인트로 활용하세요.</p>
   </section>
   <section class="info-popover" id="info-pair">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>자산 쌍 상세</h3>
-    <p>상단 그래프는 선택한 두 자산의 일별 가격을 좌·우축으로 비교합니다. 하단 그래프는 롤링 상관계수(좌측 축)와 첫 번째 자산의 가격(우측 축) 추이를 함께 보여줍니다.</p>
+    <p>상단 그래프는 선택한 두 자산의 일별 가격을 좌·우축으로 비교합니다. 하단 그래프는 롤링 상관계수(좌측 축)와 첫 번째 자산의 가격(우측 축)을 겹쳐 “가격 급락 + 상관 급등” 같은 Classic 민감 구간을 복기할 수 있도록 했습니다.</p>
+    <p>팁: IWM|BTC 상관이 0.5 근처인데 가격이 동시에 하락하면 Safe‑NEG·모멘텀이 방어 역할을 하는지 확인하세요. 반대로 가격·상관이 동시에 상승하고 흡수비가 0.8 미만이면 10/24처럼 강한 Risk‑On 후보일 수 있습니다.</p>
+  </section>
+  <section class="info-popover" id="info-heatmap">
+    <button type="button" class="popover-close" aria-label="닫기">×</button>
+    <h3>상관 히트맵 &amp; 슬라이더</h3>
+    <p>
+      색상은 −1(청록)~+1(빨강)로 정규화됩니다. 2~3월처럼 전 종목이 빨갛게 채워지면 “모든 자산이 한 요인에 묶인” 구간으로, 스태빌리티·흡수비도 함께 치솟아 Guard가 Risk-Off를 고집할 수 있습니다.
+    </p>
+    <p>
+      하단 슬라이더는 동일 창(window) 내 일자들을 순회합니다. 연속으로 빨강이 이어지는데 모멘텀·Guard가 풀리지 않으면 ‘안정된 하락’일 가능성이 높고, 빨강 속에서 BTC 행/열만 먼저 파랗게 풀리면 소형주 대비 크립토 디커플링 신호입니다.
+    </p>
+    <p>
+      팁: 히트맵이 초록/청록으로 분산되기 시작하면 레짐 전환 후보이므로 같은 날짜의 레짐 타임라인·백테스트 위치를 눌러 가격곡선 변곡과 연결해서 보세요.
+    </p>
   </section>
 
   <footer>
