@@ -408,6 +408,38 @@ function hydrateFromPrecomputed(data) {
       const numericWindow = Number(windowSize);
       state.metrics[numericWindow] = metrics;
     });
+  } else {
+    // Fallback: compute metrics in-browser from provided priceSeries/analysisDates
+    try {
+      const symbols = ASSETS.map((a) => a.symbol);
+      const dates = Array.isArray(state.analysisDates) ? state.analysisDates.slice() : [];
+      // Build returns like metrics.computeReturns would: dates sliced by 1
+      const returnsBySymbol = {};
+      symbols.forEach((sym) => {
+        const prices = Array.isArray(priceSeries?.[sym]) ? priceSeries[sym] : [];
+        const arr = [];
+        for (let i = 1; i < prices.length; i += 1) {
+          const prev = prices[i - 1];
+          const cur = prices[i];
+          arr.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? Math.log(cur / prev) : 0);
+        }
+        returnsBySymbol[sym] = arr;
+      });
+      const returns = {
+        dates: dates.slice(1),
+        returns: returnsBySymbol,
+        normalizedPrices: state.normalizedPrices,
+        priceSeries: state.priceSeries,
+      };
+      const aligned = {
+        dates: dates,
+        prices: state.priceSeries,
+        categories: Object.fromEntries(ASSETS.map((a) => [a.symbol, a.category])),
+      };
+      computeAllMetrics(returns, aligned);
+    } catch (err) {
+      console.warn('Fallback metric computation failed', err);
+    }
   }
   refreshPairSeriesFromPrices();
   maybeAlignDatesToCurrent();
@@ -898,10 +930,22 @@ function renderBacktest() {
     xAxis: { type: 'category', data: dates },
     yAxis: { type: 'value', scale: true },
     series: [
-      { name: '전략', type: 'line', data: eqStrat, smooth: true },
+      {
+        name: '전략',
+        type: 'line',
+        data: eqStrat,
+        smooth: true,
+        markArea: {
+          silent: true,
+          itemStyle: { opacity: 1 },
+          data: computeRegimeSegments(dates, series.state).map((a) => [
+            { xAxis: a.xAxis },
+            { xAxis: a.xAxis2, itemStyle: a.itemStyle, name: a.name },
+          ]),
+        },
+      },
       { name: '벤치마크', type: 'line', data: eqBH, smooth: true },
     ],
-    markArea: { silent: true, itemStyle: { opacity: 1 }, data: computeRegimeSegments(dates, series.state).map((a) => [{ xAxis: a.xAxis }, { xAxis: a.xAxis2, itemStyle: a.itemStyle, name: a.name }]) },
   });
 
   if (stats) {
