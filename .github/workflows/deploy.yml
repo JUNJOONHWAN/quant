@@ -36,6 +36,13 @@ jobs:
       - name: Generate dataset
         run: npm run generate:data
 
+      - name: Set BUILD_ID
+        run: echo "BUILD_ID=$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Update version manifest
+        run: |
+          node -e "const fs=require('fs');const path='static_site/data/version.json';const build=process.env.BUILD_ID||'';let data={};if(fs.existsSync(path)){try{data=JSON.parse(fs.readFileSync(path,'utf8'));}catch(error){console.warn('Failed to parse existing version.json, resetting.',error);data={};}}if(build){data.build=build;}const precomputed='static_site/data/precomputed.json';if(fs.existsSync(precomputed)){data.data='precomputed.json';}fs.mkdirSync('static_site/data',{recursive:true});fs.writeFileSync(path,JSON.stringify(data,null,2));"
+
       - name: Sanity check (allow no_data placeholder)
         run: |
           node -e "const fs=require('fs');const p='static_site/data/precomputed.json';if(!fs.existsSync(p)){process.exit(1)};console.log('precomputed.json OK')"

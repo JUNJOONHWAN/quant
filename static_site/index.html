@@ -5,10 +5,7 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>시장 안정성 대시보드</title>
-  <link rel="stylesheet" href="assets/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-  <script src="assets/metrics.js"></script>
-  <script defer src="assets/app.js"></script>
 </head>
 <body>
   <header>
@@ -136,5 +133,57 @@
   <footer>
     <p>데이터 출처: Alpha Vantage 일별 엔드포인트(비상업적 이용). 투자 조언이 아니며 정확성을 보장하지 않습니다.</p>
   </footer>
+
+  <script>
+    (async function loadAssets() {
+      const now = Date.now();
+      let versionData = null;
+
+      try {
+        const response = await fetch(`./data/version.json?ts=${now}`, { cache: 'no-store' });
+        if (response.ok) {
+          versionData = await response.json();
+        }
+      } catch (error) {
+        console.warn('버전 정보를 불러오지 못했습니다.', error);
+      }
+
+      const buildId = versionData?.build || `${now}`;
+      const cacheTag = encodeURIComponent(buildId);
+      const dataPath = versionData?.data ? `./data/${versionData.data}` : './data/precomputed.json';
+
+      window.__BUILD_INFO__ = {
+        buildId,
+        cacheTag: buildId,
+        dataPath,
+        version: versionData || null,
+      };
+
+      const appendStylesheet = (href) => {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = `${href}?v=${cacheTag}`;
+        document.head.appendChild(link);
+      };
+
+      appendStylesheet('./assets/styles.css');
+
+      const loadScript = (src) =>
+        new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = `${src}?v=${cacheTag}`;
+          script.onload = resolve;
+          script.onerror = (event) => reject(event?.error || new Error(`Failed to load ${src}`));
+          document.head.appendChild(script);
+        });
+
+      try {
+        await loadScript('./assets/metrics.js');
+        await loadScript('./assets/app.js');
+      } catch (error) {
+        console.error('필수 스크립트를 불러오지 못했습니다.', error);
+      }
+    })();
+  </script>
 </body>
 </html>
