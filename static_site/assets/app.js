@@ -9,31 +9,6 @@ const MINIMUM_DATA_DATE = '2020-01-01';
 const ALPHA_RANGE_YEARS = 5;
 const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
 
-const STORAGE_KEYS = {
-  alphaKey: 'market-stability.alpha-key',
-};
-
-function loadStoredAlphaKey() {
-  try {
-    return localStorage.getItem(STORAGE_KEYS.alphaKey) || '';
-  } catch (error) {
-    console.warn('Alpha key storage unavailable', error);
-    return '';
-  }
-}
-
-function storeAlphaKey(value) {
-  try {
-    if (!value) {
-      localStorage.removeItem(STORAGE_KEYS.alphaKey);
-    } else {
-      localStorage.setItem(STORAGE_KEYS.alphaKey, value);
-    }
-  } catch (error) {
-    console.warn('Failed to persist Alpha Vantage key', error);
-  }
-}
-
 function resolveActiondEnvironment(name) {
   const globalCandidates = [
     window.__ACTIOND_ENV__,
@@ -83,22 +58,15 @@ async function fetchActiondSecret(name) {
 }
 
 async function hydrateAlphaKeyFromEnvironment() {
-  if (state.alphaKey) {
-    state.alphaKeySource = 'storage';
-    return;
-  }
-
   const direct = resolveActiondEnvironment('ALPHAVANTAGE_API_KEY');
   if (direct) {
     state.alphaKey = direct;
-    state.alphaKeySource = 'environment';
     return;
   }
 
   const fetched = await fetchActiondSecret('ALPHAVANTAGE_API_KEY');
   if (fetched) {
     state.alphaKey = fetched;
-    state.alphaKeySource = 'environment';
   }
 }
 
@@ -110,8 +78,6 @@ const ASSETS = [
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
 
-const storedAlphaKey = loadStoredAlphaKey();
-
 const state = {
   window: DEFAULT_WINDOW,
   range: 180,
@@ -120,9 +86,9 @@ const state = {
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
-  alphaKey: storedAlphaKey,
-  alphaKeySource: storedAlphaKey ? 'storage' : 'unknown',
+  alphaKey: '',
   refreshing: false,
+  autoRefreshAttempted: false,
   customRange: {
     start: null,
     end: null,
@@ -173,6 +139,7 @@ async function init() {
 
     populateControls();
     renderAll();
+    await maybeAutoRefreshAfterLoad();
   } catch (error) {
     console.error(error);
     if (error && error.message === 'PRECOMPUTED_DATA_UNAVAILABLE') {
@@ -333,31 +300,11 @@ function populateControls() {
   }
 
   const refreshButton = document.getElementById('refresh-button');
-  const alphaKeyInput = document.getElementById('alpha-key');
   const startInput = document.getElementById('custom-start');
   const endInput = document.getElementById('custom-end');
 
   const firstDate = state.analysisDates?.[0] || '';
   const lastDate = state.analysisDates?.[state.analysisDates.length - 1] || '';
-
-  if (alphaKeyInput) {
-    if (state.alphaKeySource === 'environment') {
-      alphaKeyInput.value = state.alphaKey || '';
-      alphaKeyInput.disabled = true;
-      alphaKeyInput.title = 'GitHub 환경 구성을 통해 제공된 키를 사용합니다.';
-      alphaKeyInput.classList.add('readonly');
-    } else {
-      alphaKeyInput.value = state.alphaKey || '';
-      if (!alphaKeyInput.dataset.bound) {
-        alphaKeyInput.addEventListener('input', (event) => {
-          state.alphaKey = event.target.value.trim();
-          state.alphaKeySource = state.alphaKey ? 'manual' : 'unknown';
-          storeAlphaKey(state.alphaKey);
-        });
-        alphaKeyInput.dataset.bound = 'true';
-      }
-    }
-  }
 
   if (startInput) {
     startInput.min = firstDate;
@@ -435,6 +382,40 @@ function renderAll() {
   renderPair();
 }
 
+async function maybeAutoRefreshAfterLoad() {
+  if (state.autoRefreshAttempted || state.refreshing) {
+    return;
+  }
+
+  state.autoRefreshAttempted = true;
+  const refreshButton = document.getElementById('refresh-button');
+  const originalLabel = refreshButton ? refreshButton.textContent : '';
+  const { shouldFetch: willFetch } = evaluateRefreshNeeds();
+
+  if (refreshButton && willFetch) {
+    refreshButton.disabled = true;
+    refreshButton.textContent = '갱신 중...';
+  }
+
+  try {
+    if (willFetch) {
+      state.refreshing = true;
+    }
+    const fetched = await maybeRefreshData();
+    if (fetched) {
+      renderAll();
+    }
+  } catch (error) {
+    console.error('자동 리프레시 실패', error);
+  } finally {
+    if (refreshButton && willFetch) {
+      refreshButton.disabled = false;
+      refreshButton.textContent = originalLabel || '리프레시';
+    }
+    state.refreshing = false;
+  }
+}
+
 async function handleRefreshClick() {
   const refreshButton = document.getElementById('refresh-button');
   if (state.refreshing) {
@@ -467,6 +448,28 @@ async function handleRefreshClick() {
 }
 
 async function maybeRefreshData() {
+  if (!state.alphaKey) {
+    await hydrateAlphaKeyFromEnvironment();
+  }
+
+  const { shouldFetch } = evaluateRefreshNeeds();
+
+  if (!shouldFetch) {
+    return false;
+  }
+
+  if (!state.alphaKey) {
+    showNotice('Alpha Vantage API 키를 찾을 수 없어 자동 갱신을 건너뜁니다. GitHub Secrets 또는 환경 변수 ALPHAVANTAGE_API_KEY를 설정해 주세요.');
+    return false;
+  }
+
+  showNotice('Alpha Vantage에서 최신 데이터를 불러오는 중입니다...');
+  await loadFromAlphaVantage(state.alphaKey);
+  hideError();
+  return true;
+}
+
+function evaluateRefreshNeeds() {
   const metrics = state.metrics[state.window];
   const records = metrics?.records || [];
   const earliest = state.analysisDates?.[0]
@@ -478,21 +481,15 @@ async function maybeRefreshData() {
 
   const needsRangeCoverage = !earliest || earliest > MINIMUM_DATA_DATE;
   const needsFreshLatest = isLatestDateStale(latest);
-  const shouldFetch = needsRangeCoverage || needsFreshLatest || !metrics;
 
-  if (!shouldFetch) {
-    return false;
-  }
-
-  if (!state.alphaKey) {
-    showNotice('Alpha Vantage API 키를 입력하면 최신 데이터를 불러올 수 있습니다.');
-    return false;
-  }
-
-  showNotice('Alpha Vantage에서 최신 데이터를 불러오는 중입니다...');
-  await loadFromAlphaVantage(state.alphaKey);
-  hideError();
-  return true;
+  return {
+    metrics,
+    earliest,
+    latest,
+    needsRangeCoverage,
+    needsFreshLatest,
+    shouldFetch: needsRangeCoverage || needsFreshLatest || !metrics,
+  };
 }
 
 function updateMeta() {
