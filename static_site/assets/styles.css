@@ -133,6 +133,11 @@ input[type='password'] {
   color: inherit;
 }
 
+.controls input.readonly {
+  cursor: not-allowed;
+  background: rgba(30, 41, 59, 0.45);
+}
+
 input[type='date']::-webkit-calendar-picker-indicator {
   filter: invert(1);
 }

@@ -34,6 +34,74 @@ function storeAlphaKey(value) {
   }
 }
 
+function resolveActiondEnvironment(name) {
+  const globalCandidates = [
+    window.__ACTIOND_ENV__,
+    window.ACTIOND_ENV,
+    window.actiond?.env,
+    window.actiond?.secrets,
+    window.actiond,
+    window.__ENV__,
+    window.env,
+    window.process?.env,
+  ];
+
+  for (let index = 0; index < globalCandidates.length; index += 1) {
+    const candidate = globalCandidates[index];
+    if (candidate && typeof candidate === 'object' && candidate[name]) {
+      return candidate[name];
+    }
+  }
+
+  return '';
+}
+
+async function fetchActiondSecret(name) {
+  const actiond = window.actiond;
+  if (!actiond || typeof actiond !== 'object') {
+    return '';
+  }
+
+  const methodNames = ['getSecret', 'getEnv', 'get'];
+  for (let index = 0; index < methodNames.length; index += 1) {
+    const methodName = methodNames[index];
+    const method = actiond[methodName];
+    if (typeof method !== 'function') {
+      continue; // eslint-disable-line no-continue
+    }
+    try {
+      const value = await method.call(actiond, name);
+      if (value) {
+        return value;
+      }
+    } catch (error) {
+      console.warn(`Failed to read ${name} via actiond.${methodName}`, error);
+    }
+  }
+
+  return '';
+}
+
+async function hydrateAlphaKeyFromEnvironment() {
+  if (state.alphaKey) {
+    state.alphaKeySource = 'storage';
+    return;
+  }
+
+  const direct = resolveActiondEnvironment('ALPHAVANTAGE_API_KEY');
+  if (direct) {
+    state.alphaKey = direct;
+    state.alphaKeySource = 'environment';
+    return;
+  }
+
+  const fetched = await fetchActiondSecret('ALPHAVANTAGE_API_KEY');
+  if (fetched) {
+    state.alphaKey = fetched;
+    state.alphaKeySource = 'environment';
+  }
+}
+
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
@@ -41,6 +109,8 @@ const ASSETS = [
   { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY_ADJUSTED' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
 ];
+
+const storedAlphaKey = loadStoredAlphaKey();
 
 const state = {
   window: DEFAULT_WINDOW,
@@ -50,7 +120,8 @@ const state = {
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
-  alphaKey: loadStoredAlphaKey(),
+  alphaKey: storedAlphaKey,
+  alphaKeySource: storedAlphaKey ? 'storage' : 'unknown',
   refreshing: false,
   customRange: {
     start: null,
@@ -76,6 +147,7 @@ document.addEventListener('DOMContentLoaded', init);
 async function init() {
   showError('데이터를 불러오는 중입니다...');
   state.metrics = {};
+  await hydrateAlphaKeyFromEnvironment();
   try {
     const precomputed = await fetchPrecomputed();
     if (precomputed.status === 'ok') {
@@ -269,13 +341,21 @@ function populateControls() {
   const lastDate = state.analysisDates?.[state.analysisDates.length - 1] || '';
 
   if (alphaKeyInput) {
-    alphaKeyInput.value = state.alphaKey || '';
-    if (!alphaKeyInput.dataset.bound) {
-      alphaKeyInput.addEventListener('input', (event) => {
-        state.alphaKey = event.target.value.trim();
-        storeAlphaKey(state.alphaKey);
-      });
-      alphaKeyInput.dataset.bound = 'true';
+    if (state.alphaKeySource === 'environment') {
+      alphaKeyInput.value = state.alphaKey || '';
+      alphaKeyInput.disabled = true;
+      alphaKeyInput.title = 'GitHub 환경 구성을 통해 제공된 키를 사용합니다.';
+      alphaKeyInput.classList.add('readonly');
+    } else {
+      alphaKeyInput.value = state.alphaKey || '';
+      if (!alphaKeyInput.dataset.bound) {
+        alphaKeyInput.addEventListener('input', (event) => {
+          state.alphaKey = event.target.value.trim();
+          state.alphaKeySource = state.alphaKey ? 'manual' : 'unknown';
+          storeAlphaKey(state.alphaKey);
+        });
+        alphaKeyInput.dataset.bound = 'true';
+      }
     }
   }
 
