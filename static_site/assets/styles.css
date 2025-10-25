@@ -172,6 +172,18 @@ main {
   height: 340px;
 }
 
+.pair-charts {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.pair-chart-block h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
 #stability-gauge {
   height: 360px;
 }

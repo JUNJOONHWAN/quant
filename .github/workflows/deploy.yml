@@ -30,7 +30,7 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      - run: npm install --no-audit --no-fund
+      - run: npm ci
 
       - name: Generate dataset
         run: npm run generate:data

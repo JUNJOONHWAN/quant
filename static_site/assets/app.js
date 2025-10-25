@@ -6,6 +6,7 @@ const DEFAULT_PAIR = 'QQQ|BTC-USD';
 const MAX_STALE_DAYS = 7;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ALPHA_RANGE_YEARS = 5;
+const MINIMUM_ALPHA_CUTOFF = '2020-01-01';
 const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
 const ACTIOND_WAIT_MS = 5000;
 const ACTIOND_POLL_INTERVAL_MS = 75;
@@ -812,9 +813,16 @@ function renderHeatmap() {
 }
 
 function renderPair() {
-  const element = document.getElementById('pair-chart');
-  const chart = charts.pair || echarts.init(element);
-  charts.pair = chart;
+  const priceElement = document.getElementById('pair-price-chart');
+  const correlationElement = document.getElementById('pair-correlation-chart');
+  if (!priceElement || !correlationElement) {
+    return;
+  }
+
+  const priceChart = charts.pairPrice || echarts.init(priceElement);
+  const correlationChart = charts.pairCorrelation || echarts.init(correlationElement);
+  charts.pairPrice = priceChart;
+  charts.pairCorrelation = correlationChart;
 
   const pairSelect = document.getElementById('pair-select');
   if (pairSelect) {
@@ -827,13 +835,27 @@ function renderPair() {
   }
 
   const pair = state.pair || pairSelect?.options[0]?.value;
-  if (!pair) return;
+  if (!pair) {
+    priceChart.clear();
+    correlationChart.clear();
+    return;
+  }
 
   const [assetA, assetB] = pair.split('|');
   const metrics = state.metrics[state.window];
-  if (!metrics) return;
+  if (!metrics) {
+    priceChart.clear();
+    correlationChart.clear();
+    return;
+  }
+
   const pairSeries = metrics.pairs[pair];
-  if (!pairSeries) return;
+  if (!pairSeries) {
+    priceChart.clear();
+    correlationChart.clear();
+    return;
+  }
+
   const customRange = state.customRange || { start: null, end: null, valid: true };
   const startTime = parseDateSafe(customRange.start);
   const endTime = parseDateSafe(customRange.end);
@@ -857,7 +879,8 @@ function renderPair() {
   }
 
   if (indices.length === 0) {
-    chart.clear();
+    priceChart.clear();
+    correlationChart.clear();
     return;
   }
 
@@ -868,12 +891,16 @@ function renderPair() {
     priceB: indices.map((index) => pairSeries.priceB[index]),
   };
 
-  chart.setOption({
+  const assetALabel = `${assetA} 가격`;
+  const assetBLabel = `${assetB} 가격`;
+  const correlationLabel = '롤링 상관계수';
+
+  priceChart.setOption({
     tooltip: {
       trigger: 'axis',
     },
     legend: {
-      data: [`${assetA} 가격지수`, `${assetB} 가격지수`, '롤링 상관계수'],
+      data: [assetALabel, assetBLabel],
     },
     xAxis: [{
       type: 'category',
@@ -882,37 +909,77 @@ function renderPair() {
     }],
     yAxis: [
       {
-        type: 'log',
-        name: '가격지수 (로그)',
+        type: 'value',
+        name: assetALabel,
         position: 'left',
+        scale: true,
       },
+      {
+        type: 'value',
+        name: assetBLabel,
+        position: 'right',
+        scale: true,
+      },
+    ],
+    series: [
+      {
+        name: assetALabel,
+        type: 'line',
+        data: sliced.priceA,
+        smooth: true,
+        yAxisIndex: 0,
+      },
+      {
+        name: assetBLabel,
+        type: 'line',
+        data: sliced.priceB,
+        smooth: true,
+        yAxisIndex: 1,
+      },
+    ],
+  });
+
+  correlationChart.setOption({
+    tooltip: {
+      trigger: 'axis',
+    },
+    legend: {
+      data: [correlationLabel, assetALabel],
+    },
+    xAxis: [{
+      type: 'category',
+      data: sliced.dates,
+      axisPointer: { type: 'shadow' },
+    }],
+    yAxis: [
       {
         type: 'value',
         name: '상관계수',
         min: -1,
         max: 1,
+        position: 'left',
+      },
+      {
+        type: 'value',
+        name: assetALabel,
         position: 'right',
+        scale: true,
       },
     ],
     series: [
       {
-        name: `${assetA} 가격지수`,
+        name: correlationLabel,
+        type: 'line',
+        data: sliced.correlation,
+        smooth: true,
+        yAxisIndex: 0,
+      },
+      {
+        name: assetALabel,
         type: 'line',
         data: sliced.priceA,
         smooth: true,
-      },
-      {
-        name: `${assetB} 가격지수`,
-        type: 'line',
-        data: sliced.priceB,
-        smooth: true,
-      },
-      {
-        name: '롤링 상관계수',
-        type: 'line',
         yAxisIndex: 1,
-        data: sliced.correlation,
-        smooth: true,
       },
     ],
   });
@@ -922,7 +989,8 @@ function computeAlphaCutoffDate(years) {
   const cutoff = new Date();
   cutoff.setUTCDate(cutoff.getUTCDate() + 1);
   cutoff.setUTCFullYear(cutoff.getUTCFullYear() - years);
-  return cutoff.toISOString().slice(0, 10);
+  const computed = cutoff.toISOString().slice(0, 10);
+  return computed > MINIMUM_ALPHA_CUTOFF ? computed : MINIMUM_ALPHA_CUTOFF;
 }
 
 async function fetchAlphaSeriesBrowser(asset, apiKey, cutoffDate) {

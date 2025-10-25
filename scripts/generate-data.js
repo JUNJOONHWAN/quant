@@ -31,6 +31,7 @@ const ASSETS = [
 
 const WINDOWS = [20, 30, 60];
 const RANGE_YEARS = 5;
+const MINIMUM_CUTOFF_DATE = '2020-01-01';
 const ONE_MINUTE = 60 * 1000;
 
 async function main() {
@@ -74,7 +75,8 @@ function computeCutoffDate(years) {
   const cutoff = new Date();
   cutoff.setUTCDate(cutoff.getUTCDate() + 1); // ensure today included
   cutoff.setUTCFullYear(cutoff.getUTCFullYear() - years);
-  return cutoff.toISOString().slice(0, 10);
+  const computed = cutoff.toISOString().slice(0, 10);
+  return computed > MINIMUM_CUTOFF_DATE ? computed : MINIMUM_CUTOFF_DATE;
 }
 
 async function fetchAlphaSeries(asset, cutoffDate) {

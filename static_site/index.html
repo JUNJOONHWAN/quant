@@ -103,7 +103,16 @@
         <h2>자산 쌍 상세</h2>
         <button type="button" class="info" data-target="info-pair">ⓘ</button>
       </div>
-      <div id="pair-chart" class="chart"></div>
+      <div class="pair-charts">
+        <div class="pair-chart-block">
+          <h3>가격 비교</h3>
+          <div id="pair-price-chart" class="chart"></div>
+        </div>
+        <div class="pair-chart-block">
+          <h3>상관도 &amp; 기준 자산</h3>
+          <div id="pair-correlation-chart" class="chart"></div>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -121,7 +130,7 @@
   </section>
   <section class="info-popover" id="info-pair">
     <h3>자산 쌍 상세</h3>
-    <p>선택한 자산 쌍의 일별 가격(좌측 축)과 롤링 상관계수(우측 축)를 동시에 보여줍니다. 상관계수가 1에 가까울수록 두 자산이 같은 방향으로 움직이며, -1에 가까울수록 반대 방향으로 움직입니다.</p>
+    <p>상단 그래프는 선택한 두 자산의 일별 가격을 좌·우축으로 비교합니다. 하단 그래프는 롤링 상관계수(좌측 축)와 첫 번째 자산의 가격(우측 축) 추이를 함께 보여줍니다.</p>
   </section>
 
   <footer>
