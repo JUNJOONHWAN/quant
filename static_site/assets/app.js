@@ -465,17 +465,10 @@ async function loadData() {
       : 'precomputed.json';
   const cacheSeed =
     manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
-  let targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
-  let response = await fetch(targetUrl, { cache: 'no-store' });
+  const targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
+  const response = await fetch(targetUrl, { cache: 'no-store' });
   if (!response.ok) {
-    // Fallback to sample if available
-    dataFile = 'precomputed-sample.json';
-    targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
-    response = await fetch(targetUrl, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    setDataInfo('실제 데이터가 없어 샘플 데이터로 표시합니다.');
+    throw new Error(`HTTP ${response.status}`);
   }
 
   const text = await response.text();
@@ -496,8 +489,8 @@ async function loadPrecomputed() {
     setDataInfo('데이터 크기를 계산 중입니다...');
     const { json, byteLength } = await loadData();
     if (json && json.status === 'no_data') {
-      setDataInfo('실제 데이터가 없어 샘플/플레이스홀더를 표시합니다.', 'notice');
-      showEmptyState('실제 데이터가 없습니다.', 'Actions가 아직 자료를 생성하지 못했습니다. 스케줄 실행 후 자동 갱신됩니다.');
+      setDataInfo('데이터 없음', 'error');
+      showEmptyState('데이터 없음', 'precomputed.json이 no_data 상태입니다. Actions 데이터 생성 성공 후 다시 배포해 주세요.');
       return null;
     }
     if (!Array.isArray(json.analysisDates) || json.analysisDates.length === 0) {
