@@ -13,6 +13,7 @@ const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 const DEFAULT_DATA_PATH = './data/precomputed.json';
 const RISK_MODE_STORAGE_KEY = 'risk-mode.v1';
+const CLASSIC_STOCK_MOMENTUM_LOOKBACK = 10;
 
 let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
@@ -1139,6 +1140,16 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   const dates = allDates.slice(baseIdx, baseIdx + length);
   const scCorr = pair.correlation.slice(baseIdx, baseIdx + length);
   const safeNeg = metrics.records.slice(baseIdx, baseIdx + length).map((r) => safeNumber(r.sub?.safeNegative));
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const prices = state.priceSeries || {};
+  const stockSeries = prices[SIGNAL.primaryStock] || [];
+  const stockMomentum = scCorr.map((_, idx) => {
+    const priceIndex = windowOffset + baseIdx + idx;
+    if (priceIndex >= stockSeries.length) return null;
+    const lookback = Math.max(1, CLASSIC_STOCK_MOMENTUM_LOOKBACK);
+    if (priceIndex - lookback < 0) return null;
+    return rollingReturnFromSeries(stockSeries, priceIndex, lookback);
+  });
 
   const w = RISK_CFG_CLASSIC.weights;
   const th = RISK_CFG_CLASSIC.thresholds;
@@ -1148,13 +1159,14 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   });
   const state = scCorr.map((c, i) => {
     const s = score[i];
+    const momentum = stockMomentum[i] ?? 0;
     // Corr-dominant gate
-    if (c >= th.corrOn) return 1;
-    if (c <= th.corrOff || s <= th.scoreOff) return -1;
-    if (s >= th.scoreOn && c >= th.corrMinOn) return 1;
+    if (c >= th.corrOn && momentum >= -0.005) return 1;
+    if (c <= th.corrOff || s <= th.scoreOff || momentum <= -0.02) return -1;
+    if (s >= th.scoreOn && c >= th.corrMinOn && momentum >= -0.01) return 1;
     return 0;
   });
-  return { dates, score, state, scCorr, safeNeg };
+  return { dates, score, state, scCorr, safeNeg, stockMomentum };
 }
 
 // Enhanced: classic + momentum, breadth, and absorption/stability guards
