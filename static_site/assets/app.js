@@ -123,6 +123,7 @@ const state = {
   alphaKey: storedAlphaKey,
   alphaKeySource: storedAlphaKey ? 'storage' : 'unknown',
   refreshing: false,
+  autoRefreshAttempted: false,
   customRange: {
     start: null,
     end: null,
@@ -173,6 +174,7 @@ async function init() {
 
     populateControls();
     renderAll();
+    await maybeAutoRefreshAfterLoad();
   } catch (error) {
     console.error(error);
     if (error && error.message === 'PRECOMPUTED_DATA_UNAVAILABLE') {
@@ -433,6 +435,45 @@ function renderAll() {
   renderHistory();
   renderHeatmap();
   renderPair();
+}
+
+async function maybeAutoRefreshAfterLoad() {
+  if (state.autoRefreshAttempted || state.refreshing) {
+    return;
+  }
+
+  const metrics = state.metrics[state.window];
+  const latestRecord = metrics?.records?.[metrics.records.length - 1];
+  const latestDate = latestRecord?.date || null;
+
+  if (!isLatestDateStale(latestDate)) {
+    return;
+  }
+
+  state.autoRefreshAttempted = true;
+  const refreshButton = document.getElementById('refresh-button');
+  const originalLabel = refreshButton ? refreshButton.textContent : '';
+
+  if (refreshButton) {
+    refreshButton.disabled = true;
+    refreshButton.textContent = '갱신 중...';
+  }
+
+  try {
+    state.refreshing = true;
+    const fetched = await maybeRefreshData();
+    if (fetched) {
+      renderAll();
+    }
+  } catch (error) {
+    console.error('자동 리프레시 실패', error);
+  } finally {
+    state.refreshing = false;
+    if (refreshButton) {
+      refreshButton.disabled = false;
+      refreshButton.textContent = originalLabel || '리프레시';
+    }
+  }
 }
 
 async function handleRefreshClick() {
