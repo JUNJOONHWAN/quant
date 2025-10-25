@@ -31,7 +31,7 @@ const ASSETS = [
 const WINDOWS = [20, 30, 60];
 const RANGE_YEARS = 5;
 const MINIMUM_CUTOFF_DATE = '2020-01-01';
-const ONE_MINUTE = 60 * 1000;
+const REQUEST_DELAY_MS = 15000;
 
 async function main() {
   if (typeof fetch !== 'function') {
@@ -57,7 +57,7 @@ async function main() {
 
       if (index < ASSETS.length - 1) {
         console.log('Waiting to respect Alpha Vantage rate limits...');
-        await delay(ONE_MINUTE / 5 + 1000); // ~13 seconds between calls (5/min limit)
+        await delay(REQUEST_DELAY_MS);
       }
     }
 
@@ -83,33 +83,53 @@ async function fetchAlphaSeries(asset, cutoffDate) {
 }
 
 async function fetchEquity(asset, cutoffDate) {
-  const url = new URL('https://www.alphavantage.co/query');
-  url.searchParams.set('function', 'TIME_SERIES_DAILY_ADJUSTED');
-  url.searchParams.set('symbol', asset.symbol);
-  url.searchParams.set('outputsize', 'full');
-  url.searchParams.set('apikey', API_KEY);
+  const adjustedUrl = buildAlphaUrl({
+    function: 'TIME_SERIES_DAILY_ADJUSTED',
+    symbol: asset.symbol,
+    outputsize: 'full',
+  });
 
-  const json = await fetchJson(url);
-  const series = json['Time Series (Daily)'];
+  let json = await fetchJson(adjustedUrl);
+  let series = extractEquitySeries(json);
+
+  if (!series && isPremiumNotice(json)) {
+    const fallbackUrl = buildAlphaUrl({
+      function: 'TIME_SERIES_DAILY',
+      symbol: asset.symbol,
+      outputsize: 'full',
+    });
+    json = await fetchJson(fallbackUrl);
+    series = extractEquitySeries(json);
+  }
+
   if (!series) {
     throw buildAlphaError(json, asset.symbol);
   }
-  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value['5. adjusted close'] || value['4. close']));
+
+  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value['5. adjusted close'] ?? value['4. close']));
 }
 
 async function fetchDigital(asset, cutoffDate) {
-  const url = new URL('https://www.alphavantage.co/query');
-  url.searchParams.set('function', 'DIGITAL_CURRENCY_DAILY');
-  url.searchParams.set('symbol', asset.symbol.split('-')[0]);
-  url.searchParams.set('market', 'USD');
-  url.searchParams.set('apikey', API_KEY);
+  const { base, market } = parseCryptoSymbol(asset.symbol);
+  const url = buildAlphaUrl({
+    function: 'DIGITAL_CURRENCY_DAILY',
+    symbol: base,
+    market,
+  });
 
   const json = await fetchJson(url);
   const series = json['Time Series (Digital Currency Daily)'];
   if (!series) {
     throw buildAlphaError(json, asset.symbol);
   }
-  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value['4a. close (USD)'] || value['4b. close (USD)']));
+  const closeKey = `4a. close (${market})`;
+  const secondaryCloseKey = `4b. close (${market})`;
+  return normalizeSeries(
+    asset,
+    series,
+    cutoffDate,
+    (value) => Number(value[closeKey] ?? value[secondaryCloseKey]),
+  );
 }
 
 async function fetchJson(url) {
@@ -152,6 +172,30 @@ function normalizeSeries(asset, rawSeries, cutoffDate, extractClose) {
     dates: filteredDates,
     prices,
   };
+}
+
+function buildAlphaUrl(params) {
+  const url = new URL('https://www.alphavantage.co/query');
+  Object.entries(params).forEach(([key, value]) => {
+    url.searchParams.set(key, value);
+  });
+  url.searchParams.set('apikey', API_KEY);
+  return url;
+}
+
+function extractEquitySeries(payload) {
+  return payload?.['Time Series (Daily) (Adjusted)']
+    || payload?.['Time Series (Daily)'];
+}
+
+function isPremiumNotice(payload) {
+  const info = payload?.Information;
+  return typeof info === 'string' && info.includes('premium endpoint');
+}
+
+function parseCryptoSymbol(symbol) {
+  const [base, quote = 'USD'] = symbol.split('-');
+  return { base, market: quote };
 }
 
 function buildOutput(aligned, returns) {
