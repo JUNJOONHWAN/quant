@@ -256,6 +256,23 @@ button.info {
   margin-top: 0;
 }
 
+.info-popover .popover-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 41, 59, 0.7);
+  color: #e2e8f0;
+  cursor: pointer;
+}
+
+.info-popover .popover-close:hover {
+  background: rgba(51, 65, 85, 0.9);
+}
+
 footer {
   margin-top: 2rem;
   text-align: center;

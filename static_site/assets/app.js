@@ -639,11 +639,49 @@ function populateControls() {
     if (!button.dataset.bound) {
       button.addEventListener('click', () => {
         const target = document.getElementById(button.dataset.target);
-        target.classList.toggle('visible');
+        if (!target) return;
+        // Hide others first
+        document.querySelectorAll('.info-popover.visible').forEach((el) => el.classList.remove('visible'));
+        target.classList.add('visible');
       });
       button.dataset.bound = 'true';
     }
   });
+
+  // Bind close buttons
+  document.querySelectorAll('.info-popover .popover-close').forEach((btn) => {
+    if (!btn.dataset.bound) {
+      btn.addEventListener('click', () => {
+        const container = btn.closest('.info-popover');
+        if (container) container.classList.remove('visible');
+      });
+      btn.dataset.bound = 'true';
+    }
+  });
+
+  // Close on outside click
+  if (!document.body.dataset.popoverOutsideBound) {
+    document.addEventListener('click', (event) => {
+      const open = document.querySelector('.info-popover.visible');
+      if (!open) return;
+      const isToggleBtn = event.target.closest('button.info');
+      const inside = event.target.closest('.info-popover');
+      if (!inside && !isToggleBtn) {
+        open.classList.remove('visible');
+      }
+    });
+    document.body.dataset.popoverOutsideBound = 'true';
+  }
+
+  // Close on Escape
+  if (!document.body.dataset.popoverEscBound) {
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        document.querySelectorAll('.info-popover.visible').forEach((el) => el.classList.remove('visible'));
+      }
+    });
+    document.body.dataset.popoverEscBound = 'true';
+  }
 }
 
 function renderAll() {
