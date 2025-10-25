@@ -816,16 +816,17 @@ function renderAll() {
 
 // --- Risk regime configs ---
 const RISK_BREADTH_SYMBOLS = SIGNAL.breadth;
-const ENHANCED_LOOKBACKS = { momentum: 10, breadth: 5 };
+const CLASSIC_DIRECTION_LOOKBACK = 12;
+const ENHANCED_LOOKBACKS = { momentum: 12, breadth: 5 };
 const RISK_CFG_CLASSIC = {
-  // corr-heavy classic
-  weights: { sc: 0.85, safe: 0.15 },
+  // corr-heavy classic with direction guard
+  weights: { sc: 0.75, safe: 0.10, dir: 0.15 },
   thresholds: {
-    scoreOn: 0.60,
+    scoreOn: 0.62,
     scoreOff: 0.30,
     corrOn: 0.50,   // corr-dominant gate
     corrMinOn: 0.20,
-    corrOff: -0.10,
+    corrOff: -0.05,
   },
   colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171', onFragile: '#86efac' },
   pairKey: SIGNAL.pairKey,
@@ -1139,22 +1140,38 @@ function computeRiskSeriesClassic(metrics, recordsOverride) {
   const dates = allDates.slice(baseIdx, baseIdx + length);
   const scCorr = pair.correlation.slice(baseIdx, baseIdx + length);
   const safeNeg = metrics.records.slice(baseIdx, baseIdx + length).map((r) => safeNumber(r.sub?.safeNegative));
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const prices = state.priceSeries || {};
+  const stockSeries = prices[SIGNAL.primaryStock] || [];
+  const btcSeries = prices['BTC-USD'] || [];
+  const dirMomentum = scCorr.map((_, idx) => {
+    const priceIndex = windowOffset + baseIdx + idx;
+    const stockRet = rollingReturnFromSeries(stockSeries, priceIndex, CLASSIC_DIRECTION_LOOKBACK);
+    const btcRet = rollingReturnFromSeries(btcSeries, priceIndex, CLASSIC_DIRECTION_LOOKBACK);
+    return averageFinite(stockRet, btcRet);
+  });
 
   const w = RISK_CFG_CLASSIC.weights;
   const th = RISK_CFG_CLASSIC.thresholds;
   const score = scCorr.map((c, i) => {
     const scPos = Math.max(0, Number(c));
-    return Math.max(0, Math.min(1, w.sc * scPos + w.safe * safeNeg[i]));
+    const dir = dirMomentum[i] ?? 0;
+    const dirBoost = clamp01((dir + 0.01) / 0.05);
+    const safeEff = dir >= 0 ? safeNeg[i] : Math.min(safeNeg[i], 0.2);
+    const dirWeight = w.dir ?? 0;
+    const total = (w.sc || 0) * scPos + (w.safe || 0) * safeEff + dirWeight * dirBoost;
+    return clamp01(total);
   });
   const state = scCorr.map((c, i) => {
     const s = score[i];
+    const dir = dirMomentum[i] ?? 0;
     // Corr-dominant gate
-    if (c >= th.corrOn) return 1;
-    if (c <= th.corrOff || s <= th.scoreOff) return -1;
-    if (s >= th.scoreOn && c >= th.corrMinOn) return 1;
+    if (c >= th.corrOn && dir >= -0.005) return 1;
+    if (c <= th.corrOff || s <= th.scoreOff || dir <= -0.02) return -1;
+    if (s >= th.scoreOn && c >= th.corrMinOn && dir >= -0.01) return 1;
     return 0;
   });
-  return { dates, score, state, scCorr, safeNeg };
+  return { dates, score, state, scCorr, safeNeg, dirMomentum };
 }
 
 // Enhanced: classic + momentum, breadth, and absorption/stability guards
@@ -1200,37 +1217,37 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
     breadth[i] = computeRiskBreadth(priceIndex, ENHANCED_LOOKBACKS.breadth);
     stabilitySeries[i] = rec?.stability ?? null;
 
-    const corrScore = clamp01((classic.scCorr[i] - 0.15) / 0.55);
-    const momentumScore = clamp01(((comboMomentum[i] ?? 0) + 0.02) / 0.08);
-    const breadthScore = clamp01(breadth[i] ?? 0);
-    const stabilityRelief = clamp01(1 - normalizeRangeSafe(mm[i], 0.78, 0.94));
-    const blendedScore = 0.45 * corrScore + 0.30 * momentumScore + 0.15 * breadthScore + 0.10 * stabilityRelief;
-    riskScore[i] = Number(blendedScore.toFixed(6));
+  const corrScore = clamp01((classic.scCorr[i] - 0.15) / 0.55);
+  const momentumScore = clamp01(((comboMomentum[i] ?? 0) + 0.015) / 0.06);
+  const breadthScore = clamp01(breadth[i] ?? 0);
+  const stabilityRelief = clamp01(1 - normalizeRangeSafe(mm[i], 0.78, 0.94));
+  const blendedScore = 0.35 * corrScore + 0.40 * momentumScore + 0.15 * breadthScore + 0.10 * stabilityRelief;
+  riskScore[i] = Number(blendedScore.toFixed(6));
 
-    const safePenalty = normalizeRangeSafe(classic.safeNeg[i], 0.35, 0.60);
-    const mmPenalty = normalizeRangeSafe(mm[i], 0.82, 0.95);
-    const deltaPenalty = normalizeRangeSafe(Math.max(0, rec?.delta ?? 0), 0.02, 0.06);
-    const guardScore = 0.6 * mmPenalty + 0.25 * safePenalty + 0.15 * deltaPenalty;
+  const safePenalty = normalizeRangeSafe(classic.safeNeg[i], 0.35, 0.60);
+  const mmPenalty = normalizeRangeSafe(mm[i], 0.85, 0.97);
+  const deltaPenalty = normalizeRangeSafe(Math.max(0, -(rec?.delta ?? 0)), 0.015, 0.05);
+  const guardScore = 0.5 * mmPenalty + 0.2 * safePenalty + 0.3 * deltaPenalty;
     guard[i] = Number(guardScore.toFixed(6));
 
     const combo = comboMomentum[i] ?? 0;
     if (
-      blendedScore >= 0.63 &&
-      classic.scCorr[i] >= 0.35 &&
-      momentumScore >= 0.4 &&
+      blendedScore >= 0.60 &&
+      classic.scCorr[i] >= 0.33 &&
+      momentumScore >= 0.35 &&
       guardScore < 0.9 &&
-      combo > -0.01
+      combo > -0.005
     ) {
       classic.state[i] = 1;
       if (guardScore >= 0.55) {
         fragile[i] = true;
       }
     } else if (
-      blendedScore <= 0.32 ||
-      classic.scCorr[i] <= 0 ||
+      blendedScore <= 0.30 ||
       combo <= -0.03 ||
-      (Number.isFinite(mm[i]) && mm[i] >= 0.95) ||
-      classic.safeNeg[i] >= 0.6 ||
+      classic.scCorr[i] <= 0 ||
+      (Number.isFinite(mm[i]) && mm[i] >= 0.96) ||
+      (classic.safeNeg[i] >= 0.65 && combo <= 0) ||
       guardScore >= 1
     ) {
       classic.state[i] = -1;
