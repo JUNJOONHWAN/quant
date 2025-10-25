@@ -8,15 +8,26 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const MINIMUM_DATA_DATE = '2020-01-01';
 const ALPHA_RANGE_YEARS = 5;
 const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
+const ACTIOND_WAIT_MS = 5000;
+const ACTIOND_POLL_INTERVAL_MS = 75;
 
 function resolveActiondEnvironment(name) {
   const globalCandidates = [
     window.__ACTIOND_ENV__,
+    window.__ACTIOND_ENV,
+    window.__ACTIOND_SECRETS__,
+    window.__ACTIOND_SECRETS,
+    window.__ACTIOND_VARS__,
+    window.__ACTIONS_RUNTIME_CONFIG__?.env,
+    window.__ACTIONS_RUNTIME_CONFIG__?.secrets,
     window.ACTIOND_ENV,
     window.actiond?.env,
     window.actiond?.secrets,
     window.actiond,
     window.__ENV__,
+    window.__ENV,
+    window.__APP_ENV__,
+    window.__RUNTIME_ENV__,
     window.env,
     window.process?.env,
   ];
@@ -32,8 +43,8 @@ function resolveActiondEnvironment(name) {
 }
 
 async function fetchActiondSecret(name) {
-  const actiond = window.actiond;
-  if (!actiond || typeof actiond !== 'object') {
+  const actiond = await ensureActiondReady();
+  if (!actiond) {
     return '';
   }
 
@@ -55,6 +66,30 @@ async function fetchActiondSecret(name) {
   }
 
   return '';
+}
+
+async function ensureActiondReady() {
+  const deadline = Date.now() + ACTIOND_WAIT_MS;
+  let candidate = window.actiond;
+
+  while ((!candidate || typeof candidate !== 'object') && Date.now() < deadline) {
+    await delay(ACTIOND_POLL_INTERVAL_MS);
+    candidate = window.actiond;
+  }
+
+  if (!candidate || typeof candidate !== 'object') {
+    return null;
+  }
+
+  if (typeof candidate.ready === 'function') {
+    try {
+      await candidate.ready();
+    } catch (error) {
+      console.warn('actiond.ready() rejected', error);
+    }
+  }
+
+  return candidate;
 }
 
 async function hydrateAlphaKeyFromEnvironment() {
@@ -459,7 +494,7 @@ async function maybeRefreshData() {
   }
 
   if (!state.alphaKey) {
-    showNotice('Alpha Vantage API 키를 찾을 수 없어 자동 갱신을 건너뜁니다. GitHub Secrets 또는 환경 변수 ALPHAVANTAGE_API_KEY를 설정해 주세요.');
+    showNotice('Alpha Vantage API 키를 찾을 수 없어 자동 갱신을 건너뜁니다. GitHub Actions/Pages Secrets 또는 환경 변수 ALPHAVANTAGE_API_KEY를 설정해 주세요.');
     return false;
   }
 
