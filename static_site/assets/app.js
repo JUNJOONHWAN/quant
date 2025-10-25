@@ -11,6 +11,11 @@ const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
 const ACTIOND_WAIT_MS = 5000;
 const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+const DEFAULT_DATA_PATH = './data/precomputed.json';
+
+let datasetPath = DEFAULT_DATA_PATH;
+let cacheTagRaw = null;
+let versionManifest = null;
 
 function resolveActiondEnvironment(name) {
   const globalCandidates = [
@@ -134,6 +139,93 @@ const state = {
   },
 };
 
+function normalizeDatasetPath(candidate) {
+  if (!candidate || typeof candidate !== 'string') {
+    return DEFAULT_DATA_PATH;
+  }
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return DEFAULT_DATA_PATH;
+  }
+  if (trimmed.startsWith('./') || trimmed.startsWith('../') || trimmed.startsWith('/')) {
+    return trimmed;
+  }
+  return `./data/${trimmed}`;
+}
+
+function applyBuildInfo(info) {
+  if (!info || typeof info !== 'object') {
+    return;
+  }
+
+  if (typeof info.buildId === 'string' && info.buildId.trim()) {
+    cacheTagRaw = info.buildId.trim();
+  } else if (typeof info.build === 'string' && info.build.trim()) {
+    cacheTagRaw = info.build.trim();
+  } else if (typeof info.cacheTag === 'string' && info.cacheTag.trim()) {
+    cacheTagRaw = info.cacheTag.trim();
+  }
+
+  if (typeof info.dataPath === 'string' && info.dataPath.trim()) {
+    datasetPath = normalizeDatasetPath(info.dataPath);
+  } else if (typeof info.data === 'string' && info.data.trim()) {
+    datasetPath = normalizeDatasetPath(info.data);
+  }
+
+  if (info.version && typeof info.version === 'object' && info.version !== info) {
+    versionManifest = info.version;
+    applyBuildInfo(info.version);
+  }
+}
+
+async function fetchVersionManifest() {
+  try {
+    const response = await fetch(`./data/version.json?ts=${Date.now()}`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const json = await response.json();
+    versionManifest = json;
+    return json;
+  } catch (error) {
+    console.warn('버전 매니페스트를 불러오지 못했습니다.', error);
+    return null;
+  }
+}
+
+async function ensureBuildInfo() {
+  if (!cacheTagRaw || !datasetPath) {
+    if (window.__BUILD_INFO__) {
+      applyBuildInfo(window.__BUILD_INFO__);
+    }
+
+    if (!cacheTagRaw || !datasetPath) {
+      const manifest = await fetchVersionManifest();
+      if (manifest) {
+        applyBuildInfo(manifest);
+      }
+    }
+  }
+
+  if (!cacheTagRaw) {
+    cacheTagRaw = `${Date.now()}`;
+  }
+  if (!datasetPath) {
+    datasetPath = DEFAULT_DATA_PATH;
+  }
+}
+
+function getCacheBuster() {
+  if (!cacheTagRaw) {
+    cacheTagRaw = `${Date.now()}`;
+  }
+  return encodeURIComponent(cacheTagRaw);
+}
+
+function getDatasetPath() {
+  return datasetPath || DEFAULT_DATA_PATH;
+}
+
 const charts = {};
 
 const {
@@ -152,6 +244,7 @@ async function init() {
   showError('데이터를 불러오는 중입니다...');
   state.metrics = {};
   await hydrateAlphaKeyFromEnvironment();
+  await ensureBuildInfo();
   try {
     const precomputed = await loadPrecomputed();
     if (!precomputed) {
@@ -231,7 +324,8 @@ function hydrateFromPrecomputed(data) {
 
 async function loadPrecomputed() {
   try {
-    const res = await fetch('./data/precomputed.json', { cache: 'no-cache' });
+    const targetUrl = `${getDatasetPath()}?v=${getCacheBuster()}`;
+    const res = await fetch(targetUrl, { cache: 'no-store' });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
@@ -244,7 +338,7 @@ async function loadPrecomputed() {
   } catch (error) {
     if (IS_LOCAL) {
       try {
-        const fallback = await fetch('./data/precomputed-sample.json', { cache: 'no-cache' });
+        const fallback = await fetch('./data/precomputed-sample.json', { cache: 'no-store' });
         if (fallback.ok) {
           return await fallback.json();
         }
