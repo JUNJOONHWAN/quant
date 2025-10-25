@@ -46,6 +46,7 @@
   function computeReturns(aligned) {
     const analysisDates = aligned.dates.slice(1);
     const normalizedPrices = {};
+    const priceSeries = {};
     const returns = {};
 
     Object.entries(aligned.prices).forEach(([symbol, prices]) => {
@@ -54,21 +55,25 @@
       }
       const assetReturns = [];
       const normalized = [];
+      const actualPrices = [];
       const base = prices[1];
       for (let i = 1; i < prices.length; i += 1) {
         const current = prices[i];
         const previous = prices[i - 1];
         assetReturns.push(Math.log(current / previous));
         normalized.push(current / base);
+        actualPrices.push(current);
       }
       returns[symbol] = assetReturns;
       normalizedPrices[symbol] = normalized;
+      priceSeries[symbol] = actualPrices;
     });
 
     return {
       dates: analysisDates,
       returns,
       normalizedPrices,
+      priceSeries,
     };
   }
 

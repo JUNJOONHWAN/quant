@@ -118,6 +118,8 @@ const state = {
   range: 180,
   metrics: {},
   normalizedPrices: {},
+  priceSeries: {},
+  priceSeriesSource: 'normalized',
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
@@ -192,6 +194,8 @@ async function loadFromYahoo() {
   state.analysisDates = returns.dates;
   state.generatedAt = new Date();
   state.normalizedPrices = returns.normalizedPrices;
+  state.priceSeries = returns.priceSeries;
+  state.priceSeriesSource = 'actual';
   computeAllMetrics(returns, aligned);
   maybeAlignDatesToCurrent();
 }
@@ -214,6 +218,8 @@ async function loadFromAlphaVantage(apiKey) {
   state.analysisDates = returns.dates;
   state.generatedAt = new Date();
   state.normalizedPrices = returns.normalizedPrices;
+  state.priceSeries = returns.priceSeries;
+  state.priceSeriesSource = 'actual';
   computeAllMetrics(returns, aligned);
 }
 
@@ -221,11 +227,22 @@ function hydrateFromPrecomputed(data) {
   state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
   state.analysisDates = data.analysisDates || [];
   state.normalizedPrices = data.normalizedPrices || {};
+  const declaredSource = data.priceSeriesSource === 'actual' ? 'actual' : 'normalized';
+  if (data.priceSeries && Object.keys(data.priceSeries).length > 0) {
+    state.priceSeries = data.priceSeries;
+    state.priceSeriesSource = declaredSource;
+  } else {
+    state.priceSeries = Object.fromEntries(
+      Object.entries(state.normalizedPrices).map(([symbol, values]) => [symbol, Array.isArray(values) ? values.slice() : []]),
+    );
+    state.priceSeriesSource = 'normalized';
+  }
   state.metrics = {};
   Object.entries(data.windows).forEach(([windowSize, metrics]) => {
     const numericWindow = Number(windowSize);
     state.metrics[numericWindow] = metrics;
   });
+  refreshPairSeriesFromPrices();
   maybeAlignDatesToCurrent();
 }
 
@@ -891,8 +908,9 @@ function renderPair() {
     priceB: indices.map((index) => pairSeries.priceB[index]),
   };
 
-  const assetALabel = `${assetA} 가격`;
-  const assetBLabel = `${assetB} 가격`;
+  const priceLabel = state.priceSeriesSource === 'actual' ? '가격' : '정규화된 가격';
+  const assetALabel = `${assetA} ${priceLabel}`;
+  const assetBLabel = `${assetB} ${priceLabel}`;
   const correlationLabel = '롤링 상관계수';
 
   priceChart.setOption({
@@ -1184,6 +1202,20 @@ function computeWindowMetrics(window, returns, aligned) {
   };
 }
 
+function refreshPairSeriesFromPrices() {
+  if (!state.priceSeries || Object.keys(state.priceSeries).length === 0) {
+    return;
+  }
+
+  Object.entries(state.metrics || {}).forEach(([windowSize, metrics]) => {
+    const numericWindow = Number(windowSize);
+    if (!metrics || !Array.isArray(metrics.records)) {
+      return;
+    }
+    metrics.pairs = buildPairSeries(metrics.records, numericWindow);
+  });
+}
+
 function buildPairSeries(records, window) {
   const pairs = {};
   const symbols = ASSETS.map((asset) => asset.symbol);
@@ -1209,8 +1241,12 @@ function buildPairSeries(records, window) {
         const pair = pairs[key];
         pair.dates.push(record.date);
         pair.correlation.push(record.matrix[i][j]);
-        pair.priceA.push(state.normalizedPrices[symbols[i]][priceIndex]);
-        pair.priceB.push(state.normalizedPrices[symbols[j]][priceIndex]);
+        const seriesA = state.priceSeries?.[symbols[i]] || state.normalizedPrices?.[symbols[i]] || [];
+        const seriesB = state.priceSeries?.[symbols[j]] || state.normalizedPrices?.[symbols[j]] || [];
+        const valueA = seriesA[priceIndex];
+        const valueB = seriesB[priceIndex];
+        pair.priceA.push(Number.isFinite(valueA) ? valueA : null);
+        pair.priceB.push(Number.isFinite(valueB) ? valueB : null);
       }
     }
   });
