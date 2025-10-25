@@ -262,6 +262,7 @@ const {
   mean,
   toReturns,
   corr,
+  topEigenvalue,
 } = window.MarketMetrics;
 
 // Ensure init runs even when this script is loaded after DOMContentLoaded
@@ -622,9 +623,160 @@ function renderAll() {
   updateMeta();
   renderGauge();
   renderSubGauges();
+  renderRisk();
   renderHistory();
   renderHeatmap();
   renderPair();
+}
+
+// --- Risk regime: score + timeline ---
+const RISK_CFG = {
+  weights: { sc: 0.7, safe: 0.3 },
+  thresholds: { on: 0.6, off: 0.3, scMinOn: 0.2, scMaxOff: -0.1 },
+  colors: { on: '#22c55e', neutral: '#facc15', off: '#f87171' },
+  pairKey: 'QQQ|BTC-USD',
+};
+
+function computeRiskSeries(metrics) {
+  if (!metrics || !Array.isArray(metrics.records)) return null;
+  const pair = (metrics.pairs && metrics.pairs[RISK_CFG.pairKey]) || null;
+  if (!pair || !Array.isArray(pair.correlation)) return null;
+
+  const dates = metrics.records.map((r) => r.date);
+  const scCorr = pair.correlation.slice(); // signed correlation [-1..1]
+  const safeNeg = metrics.records.map((r) => safeNumber(r.sub?.safeNegative)); // [0..1]
+
+  const weights = RISK_CFG.weights;
+  const th = RISK_CFG.thresholds;
+
+  const score = scCorr.map((c, i) => {
+    const scPos = Math.max(0, Number(c));
+    const s = weights.sc * scPos + weights.safe * safeNeg[i];
+    return Math.max(0, Math.min(1, s));
+  });
+
+  const state = scCorr.map((c, i) => {
+    const s = score[i];
+    if (s >= th.on && c >= th.scMinOn) return 1; // Risk-On
+    if (s <= th.off || c <= th.scMaxOff) return -1; // Risk-Off
+    return 0; // Neutral
+  });
+
+  return { dates, score, state, scCorr, safeNeg };
+}
+
+function renderRisk() {
+  const metrics = state.metrics[state.window];
+  const elementGauge = document.getElementById('risk-score-gauge');
+  const elementTimeline = document.getElementById('risk-timeline');
+  if (!metrics || (!elementGauge && !elementTimeline)) return;
+
+  const series = computeRiskSeriesMulti(metrics);
+  if (!series) {
+    if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
+    if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
+    return;
+  }
+
+  const latestIdx = series.score.length - 1;
+  const latestScore = series.score[latestIdx] || 0;
+  const latestState = series.state[latestIdx] || 0;
+  const stateLabel = latestState > 0 ? 'Risk-On' : latestState < 0 ? 'Risk-Off' : 'Neutral';
+  const stateColor = latestState > 0 ? RISK_CFG.colors.on : latestState < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+
+  if (elementGauge) {
+    const gauge = charts.riskGauge || echarts.init(elementGauge);
+    charts.riskGauge = gauge;
+    gauge.setOption({
+      series: [{
+        type: 'gauge',
+        startAngle: 210,
+        endAngle: -30,
+        min: 0,
+        max: 1,
+        axisLine: { lineStyle: { width: 16, color: [[1, stateColor]] } },
+        pointer: { length: '65%', width: 4 },
+        detail: {
+          formatter: () => `${stateLabel}  \n${latestScore.toFixed(3)}`,
+          fontSize: 14,
+          offsetCenter: [0, '60%'],
+        },
+        data: [{ value: latestScore }],
+      }],
+    });
+  }
+
+  if (elementTimeline) {
+    const chart = charts.riskTimeline || echarts.init(elementTimeline);
+    charts.riskTimeline = chart;
+    const values = series.state.map((x) => (x === 0 ? 0.1 : x)); // small neutral height
+    chart.setOption({
+      tooltip: { trigger: 'axis', formatter: (p) => {
+        const idx = p?.[0]?.dataIndex ?? 0;
+        const state = series.state[idx];
+        const label = state > 0 ? 'Risk-On' : state < 0 ? 'Risk-Off' : 'Neutral';
+        const sc = series.scCorr[idx];
+        const sn = series.safeNeg[idx];
+        return `${series.dates[idx]}<br/>${label}<br/>QQQ↔BTC corr: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}`;
+      } },
+      xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
+      yAxis: { type: 'value', min: -1, max: 1, show: false },
+      series: [{
+        type: 'bar',
+        data: values,
+        barWidth: '90%',
+        itemStyle: {
+          color: (params) => {
+            const v = series.state[params.dataIndex];
+            return v > 0 ? RISK_CFG.colors.on : v < 0 ? RISK_CFG.colors.off : RISK_CFG.colors.neutral;
+          },
+        },
+      }],
+    });
+  }
+}
+
+function computeRiskSeriesMulti(metrics) {
+  if (!metrics || !Array.isArray(metrics.records)) return null;
+  const symbols = ASSETS.map((a) => a.symbol);
+  const categories = {};
+  ASSETS.forEach((a) => { categories[a.symbol] = a.category; });
+  const risk = symbols.filter((s) => ['stock', 'crypto'].includes(categories[s]));
+  const safe = symbols.filter((s) => ['bond', 'gold'].includes(categories[s]));
+
+  const dates = [];
+  const scSigned = []; // signed mean correlation among risk assets
+  const mm = [];       // market mode = top eigenvalue share
+  const allAbs = [];   // average absolute correlation across all pairs
+
+  metrics.records.forEach((rec) => {
+    const matrix = rec.matrix;
+    if (!Array.isArray(matrix)) return;
+    dates.push(rec.date);
+    // mean signed correlation among risk assets
+    scSigned.push(averagePairs(matrix, symbols, risk, risk, (x) => x, true));
+    // average absolute correlation across all assets
+    allAbs.push(averagePairs(matrix, symbols, symbols, symbols, Math.abs, true));
+    // market mode via top eigenvalue ratio
+    const lambda1 = topEigenvalue(matrix) || 0;
+    mm.push(lambda1 / symbols.length);
+  });
+
+  // risk-on score: emphasize positive co-movement of risk assets and penalize high market-mode herding
+  const score = scSigned.map((sc, i) => {
+    const scPos = Math.max(0, sc);           // [-1,1] -> [0,1] for positive only
+    const mmPenalty = 1 - Math.min(1, Math.max(0, mm[i])); // [0,1] -> [1,0]
+    return Math.max(0, Math.min(1, 0.7 * scPos + 0.3 * mmPenalty));
+  });
+
+  // Discrete regime
+  const state = score.map((s, i) => {
+    if (s >= 0.6 && scSigned[i] >= 0.2 && mm[i] <= 0.7) return 1; // Risk-On
+    if (s <= 0.3 || scSigned[i] <= -0.1 || mm[i] >= 0.75 || allAbs[i] >= 0.75) return -1; // Risk-Off
+    return 0; // Neutral
+  });
+
+  return { dates, score, state, scCorr: scSigned, safeNeg: metrics.records.map((r) => r.sub?.safeNegative ?? 0) };
 }
 
 async function maybeAutoRefreshAfterLoad() {

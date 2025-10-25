@@ -5,7 +5,10 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>시장 안정성 대시보드</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="./assets/styles.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script defer src="./assets/metrics.js"></script>
+  <script defer src="./assets/app.js"></script>
 </head>
 <body>
   <div id="data-info" class="notice hidden" role="status"></div>
@@ -48,6 +51,22 @@
     <p id="custom-range-feedback" class="controls-helper"></p>
   </section>
   <main>
+    <section class="panel" id="risk-panel">
+      <div class="panel-header">
+        <h2>리스크 레짐</h2>
+        <button type="button" class="info" data-target="info-risk">ⓘ</button>
+      </div>
+      <div class="sub-gauges">
+        <div class="sub-gauge">
+          <h3>Risk-on 점수</h3>
+          <div id="risk-score-gauge" class="chart"></div>
+        </div>
+        <div class="sub-gauge">
+          <h3>레짐 타임라인</h3>
+          <div id="risk-timeline" class="chart risk-timeline"></div>
+        </div>
+      </div>
+    </section>
     <section class="panel" id="gauge-panel">
       <div class="panel-header">
         <h2>시장 안정성 게이지</h2>
@@ -126,6 +145,10 @@
       <li><strong>안전자산 결합력</strong>: 주식과 (TLT, GLD) 조합의 음의 상관관계를 0 이상으로 환산해 평균.</li>
     </ul>
   </section>
+  <section class="info-popover" id="info-risk">
+    <h3>리스크 레짐 산출</h3>
+    <p>QQQ와 BTC의 상관관계(양의 값 선호)와 주식 vs (채권·금)의 음의 상관관계(음수일수록 가점)를 결합해 0~1 범위의 Risk-on 점수를 계산합니다. 점수와 임계치에 따라 On / Neutral / Off를 분류합니다.</p>
+  </section>
   <section class="info-popover" id="info-pair">
     <h3>자산 쌍 상세</h3>
     <p>상단 그래프는 선택한 두 자산의 일별 가격을 좌·우축으로 비교합니다. 하단 그래프는 롤링 상관계수(좌측 축)와 첫 번째 자산의 가격(우측 축) 추이를 함께 보여줍니다.</p>
@@ -135,56 +158,5 @@
     <p>데이터 출처: Alpha Vantage 일별 엔드포인트(비상업적 이용). 투자 조언이 아니며 정확성을 보장하지 않습니다.</p>
   </footer>
 
-  <script>
-    (async function loadAssets() {
-      const now = Date.now();
-      let versionData = null;
-
-      try {
-        const response = await fetch(`./data/version.json?ts=${now}`, { cache: 'no-store' });
-        if (response.ok) {
-          versionData = await response.json();
-        }
-      } catch (error) {
-        console.warn('버전 정보를 불러오지 못했습니다.', error);
-      }
-
-      const buildId = versionData?.build || `${now}`;
-      const cacheTag = encodeURIComponent(buildId);
-      const dataPath = versionData?.data ? `./data/${versionData.data}` : './data/precomputed.json';
-
-      window.__BUILD_INFO__ = {
-        buildId,
-        cacheTag: buildId,
-        dataPath,
-        version: versionData || null,
-      };
-
-      const appendStylesheet = (href) => {
-        const link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = `${href}?v=${cacheTag}`;
-        document.head.appendChild(link);
-      };
-
-      appendStylesheet('./assets/styles.css');
-
-      const loadScript = (src) =>
-        new Promise((resolve, reject) => {
-          const script = document.createElement('script');
-          script.src = `${src}?v=${cacheTag}`;
-          script.onload = resolve;
-          script.onerror = (event) => reject(event?.error || new Error(`Failed to load ${src}`));
-          document.head.appendChild(script);
-        });
-
-      try {
-        await loadScript('./assets/metrics.js');
-        await loadScript('./assets/app.js');
-      } catch (error) {
-        console.error('필수 스크립트를 불러오지 못했습니다.', error);
-      }
-    })();
-  </script>
 </body>
 </html>

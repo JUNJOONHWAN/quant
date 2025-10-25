@@ -244,6 +244,49 @@
     return sum / values.length;
   }
 
+  // Power iteration for the top eigenvalue of a symmetric matrix
+  function topEigenvalue(matrix, maxIter = 100, tol = 1e-8) {
+    if (!Array.isArray(matrix) || matrix.length === 0) return 0;
+    const n = matrix.length;
+    // Initialize vector with equal weights
+    let v = new Array(n).fill(1 / Math.sqrt(n));
+    let lambda = 0;
+
+    for (let iter = 0; iter < maxIter; iter += 1) {
+      // w = A * v
+      const w = new Array(n).fill(0);
+      for (let i = 0; i < n; i += 1) {
+        let sum = 0;
+        const row = matrix[i];
+        for (let j = 0; j < n; j += 1) {
+          sum += row[j] * v[j];
+        }
+        w[i] = sum;
+      }
+
+      // Rayleigh quotient as eigenvalue estimate
+      const num = v.reduce((acc, vi, i) => acc + vi * w[i], 0);
+      const den = v.reduce((acc, vi) => acc + vi * vi, 0) || 1;
+      const nextLambda = num / den;
+
+      // Normalize w to get next vector
+      const norm = Math.sqrt(w.reduce((acc, wi) => acc + wi * wi, 0)) || 1;
+      const nextV = w.map((wi) => wi / norm);
+
+      // Convergence check
+      let diff = 0;
+      for (let i = 0; i < n; i += 1) {
+        const d = nextV[i] - v[i];
+        diff += d * d;
+      }
+      v = nextV;
+      lambda = nextLambda;
+      if (diff < tol * tol) break;
+    }
+
+    return lambda;
+  }
+
   function pairWeight(symbolA, symbolB, categories) {
     const categoryA = categories[symbolA];
     const categoryB = categories[symbolB];
@@ -270,5 +313,6 @@
     corr,
     mean,
     pairWeight,
+    topEigenvalue,
   };
 });
