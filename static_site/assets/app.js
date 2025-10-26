@@ -1432,6 +1432,7 @@ function buildTextReportPayload() {
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
     `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`,
+    '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다.',
     '',
     '[범위 요약]',
     `- 표본 구간: ${first?.date || 'N/A'} ~ ${latest?.date || 'N/A'} (${records.length}일)`,
@@ -1535,7 +1536,7 @@ function buildSubIndexSection(records) {
 }
 
 function buildRiskScoreSection(riskSeries) {
-  const lines = ['[3. 리스크온 점수]'];
+  const lines = ['[3. 리스크온 점수]','- 결합 강도, Safe-NEG(안전자산 역동), 모멘텀, 리스크 폭, Guard(흡수비·안정성) 등을 결합한 실제 행동 신호입니다. 결합 강도만으로 On/Off가 결정되지 않습니다.'];
   if (
     !riskSeries ||
     !Array.isArray(riskSeries.dates) ||
@@ -1970,36 +1971,40 @@ function renderGauge() {
   }
 
   chart.setOption({
-    series: [{
-      type: 'gauge',
-      startAngle: 210,
-      endAngle: -30,
-      min: 0,
-      max: 1,
-      splitNumber: 10,
-      axisLine: {
-        lineStyle: {
-          width: 20,
-          color: [
-            [BANDS.red[1], '#f87171'],
-            [BANDS.yellow[1], '#facc15'],
-            [BANDS.green[1], '#4ade80'],
-          ],
+      series: [{
+        type: 'gauge',
+        startAngle: 210,
+        endAngle: -30,
+        min: 0,
+        max: 1,
+        splitNumber: 10,
+        axisLine: {
+          lineStyle: {
+            width: 20,
+            color: [
+              [BANDS.red[1], '#f87171'],
+              [BANDS.yellow[1], '#facc15'],
+              [BANDS.green[1], '#4ade80'],
+            ],
+          },
         },
-      },
-      pointer: {
-        length: '70%',
-        width: 6,
-      },
+        pointer: {
+          length: '70%',
+          width: 6,
+        },
         detail: {
           formatter: () => `결합 강도: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
-        fontSize: 16,
-        offsetCenter: [0, '65%'],
-      },
-      data: [{ value: safeNumber(latest.stability) }],
-    }],
-  });
-}
+          fontSize: 16,
+          color: '#fcd34d',
+          backgroundColor: 'rgba(15,23,42,0.35)',
+          padding: 8,
+          borderRadius: 8,
+          offsetCenter: [0, '65%'],
+        },
+        data: [{ value: safeNumber(latest.stability) }],
+      }],
+    });
+  }
 
 function renderSubGauges() {
   const metrics = state.metrics[state.window];
