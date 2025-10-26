@@ -94,6 +94,24 @@ npm test
 
 Running the suite is a quick way to verify that correlation, EMA, and weighting logic behave as expected when you make code changes.
 
+## Historical cache (2017+)
+
+Alpha Vantage pulls now focus on 2024-and-newer samples to stay within the provider's quota, while everything before 2024 is sourced
+from a local JSON cache. Generate or refresh that cache before running the Node-based precomputation:
+
+1. Install the Python dependency once: `python3 -m pip install yfinance`.
+2. Download the long history (2017-01-01 → today) and write `static_site/data/historical_prices.json`:
+
+   ```bash
+   python scripts/fetch_long_history.py --force
+   ```
+
+3. Run `npm run generate:data` as usual. The script automatically splices the cached data (pre-2024) with the freshly downloaded
+   Alpha Vantage rows (2024+).
+
+If the cache is missing, the generator logs a warning and emits only the recent window, so keep the JSON in source control whenever
+possible to guarantee reproducible full-history datasets.
+
 ## Data notice
 
 The published numbers are derived from Alpha Vantage daily endpoints and are intended for informational purposes only. Accuracy and

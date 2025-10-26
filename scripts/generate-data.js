@@ -19,6 +19,7 @@ const {
 const API_KEY = process.env.ALPHAVANTAGE_API_KEY;
 const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
 const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
+const HISTORICAL_PATH = path.join(DATA_DIR, 'historical_prices.json');
 
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
@@ -35,7 +36,8 @@ const SIGNAL = {
 
 const WINDOWS = [20, 30, 60];
 const RANGE_YEARS = 5;
-const MINIMUM_CUTOFF_DATE = '2020-01-01';
+const REMOTE_CUTOFF_DATE = '2024-01-01';
+const MINIMUM_CUTOFF_DATE = REMOTE_CUTOFF_DATE;
 const REQUEST_DELAY_MS = 15000;
 
 async function main() {
@@ -51,6 +53,7 @@ async function main() {
   }
 
   try {
+    const historical = await readHistoricalSeries();
     const assetSeries = [];
     const cutoffDate = computeCutoffDate(RANGE_YEARS);
 
@@ -67,7 +70,8 @@ async function main() {
       }
     }
 
-    const aligned = alignSeries(assetSeries);
+    const mergedSeries = mergeSeriesWithHistory(assetSeries, historical, REMOTE_CUTOFF_DATE);
+    const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
     const output = buildOutput(aligned, returns);
     await writeOutput(output);
@@ -342,6 +346,140 @@ function buildAlphaError(payload, symbol) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readHistoricalSeries() {
+  try {
+    const raw = await fs.readFile(HISTORICAL_PATH, 'utf8');
+    const json = JSON.parse(raw);
+    const assets = Array.isArray(json?.assets) ? json.assets : [];
+    const map = new Map();
+    assets.forEach((asset) => {
+      if (!asset || typeof asset.symbol !== 'string') {
+        return;
+      }
+      const dates = Array.isArray(asset.dates) ? asset.dates : [];
+      const prices = Array.isArray(asset.prices) ? asset.prices : [];
+      if (dates.length === 0 || dates.length !== prices.length) {
+        return;
+      }
+      map.set(asset.symbol, {
+        symbol: asset.symbol,
+        label: asset.label,
+        category: asset.category,
+        dates,
+        prices,
+      });
+    });
+
+    if (map.size === 0) {
+      console.warn(`[generate-data] ${HISTORICAL_PATH} contained no usable assets.`);
+      return null;
+    }
+
+    console.log(`[generate-data] loaded historical cache (${map.size} assets) from ${HISTORICAL_PATH}`);
+    return {
+      map,
+      startDate: json.startDate,
+      endDate: json.endDate,
+      generatedAt: json.generatedAt,
+    };
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      console.warn(`[generate-data] ${HISTORICAL_PATH} not found; continuing without cached history.`);
+      return null;
+    }
+    console.warn(`[generate-data] failed to read ${HISTORICAL_PATH}: ${error?.message || error}`);
+    return null;
+  }
+}
+
+function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
+  if (!historical || !(historical.map instanceof Map)) {
+    return latestSeries;
+  }
+
+  const cutoff = cutoffDate || REMOTE_CUTOFF_DATE;
+  const merged = latestSeries.map((series) => {
+    const history = historical.map.get(series.symbol);
+    if (!history) {
+      const filtered = trimSeries(series, (date) => !cutoff || date >= cutoff);
+      if (filtered.dates.length === series.dates.length) {
+        return series;
+      }
+      return {
+        ...series,
+        dates: filtered.dates,
+        prices: filtered.prices,
+      };
+    }
+    const before = trimSeries(history, (date) => !cutoff || date < cutoff);
+    const after = trimSeries(series, (date) => !cutoff || date >= cutoff);
+    if (before.dates.length === 0) {
+      return { ...series, dates: after.dates, prices: after.prices };
+    }
+    if (after.dates.length === 0) {
+      return { ...series, dates: before.dates, prices: before.prices };
+    }
+    console.log(`[generate-data] ${series.symbol}: prepended ${before.dates.length} cached rows before ${cutoff}`);
+    return {
+      ...series,
+      dates: before.dates.concat(after.dates),
+      prices: before.prices.concat(after.prices),
+    };
+  });
+
+  historical.map.forEach((history, symbol) => {
+    if (merged.some((entry) => entry.symbol === symbol)) {
+      return;
+    }
+    console.warn(`[generate-data] missing live data for ${symbol}; using cached history only.`);
+    merged.push({
+      symbol,
+      label: history.label || findAssetLabel(symbol),
+      category: history.category || findAssetCategory(symbol),
+      dates: history.dates.slice(),
+      prices: history.prices.slice(),
+    });
+  });
+
+  return merged;
+}
+
+function trimSeries(series, predicate) {
+  const dates = [];
+  const prices = [];
+  if (!series) {
+    return { dates, prices };
+  }
+
+  const length = Math.min(
+    Array.isArray(series.dates) ? series.dates.length : 0,
+    Array.isArray(series.prices) ? series.prices.length : 0,
+  );
+
+  for (let index = 0; index < length; index += 1) {
+    const date = series.dates[index];
+    const price = series.prices[index];
+    if (typeof date !== 'string' || !Number.isFinite(price)) {
+      continue;
+    }
+    if (!predicate(date)) {
+      continue;
+    }
+    dates.push(date);
+    prices.push(price);
+  }
+
+  return { dates, prices };
+}
+
+function findAssetLabel(symbol) {
+  return ASSETS.find((asset) => asset.symbol === symbol)?.label || symbol;
+}
+
+function findAssetCategory(symbol) {
+  return ASSETS.find((asset) => asset.symbol === symbol)?.category || 'unknown';
 }
 
 async function emitNoDataPlaceholder() {
