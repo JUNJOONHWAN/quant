@@ -1438,7 +1438,7 @@ function buildTextReportPayload() {
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
     `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`,
-    '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다.',
+    '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',
     `- 표본 구간: ${first?.date || 'N/A'} ~ ${latest?.date || 'N/A'} (${records.length}일)`,
@@ -1498,7 +1498,7 @@ function buildMethodologySection() {
   return [
     '[0. 산출 로직 및 근거]',
     `- Stability Index = Σ w(i,j)·|corr(i,j)| ÷ Σ w(i,j), 대상 자산: ${assetList}, 주식-채권 쌍에 더 큰 가중을 적용합니다.`,
-    '- 하위 지수: (a) 주식-암호화폐 = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산 = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG = max(0, -corr(주식, TLT/GLD)) 평균.',
+    '- 하위 지수: (a) 주식-암호화폐(+) = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산(+) = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG(-) = max(0, -corr(주식, TLT/GLD)) 평균.',
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
@@ -1537,7 +1537,7 @@ function buildSubIndexSection(records) {
     formatNumberOrNA(rec.sub?.traditional),
     formatNumberOrNA(rec.sub?.safeNegative),
   ]);
-  lines.push(...formatTable(['날짜', '주식-암호화폐', '전통자산', 'Safe-NEG'], tableRows));
+  lines.push(...formatTable(['날짜', '주식-암호화폐(+)', '전통자산(+)', 'Safe-NEG(-)'], tableRows));
   return lines;
 }
 
@@ -2104,9 +2104,9 @@ function renderHistory() {
   const stabilityValues = series.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
   const smoothedValues = series.map((item) => (Number.isFinite(item.smoothed) ? item.smoothed : null));
   const subConfigs = [
-    { key: 'stockCrypto', label: '주식-암호화폐', color: '#f97316' },
-    { key: 'traditional', label: '전통자산', color: '#38bdf8' },
-    { key: 'safeNegative', label: '안전자산 결합력', color: '#a855f7' },
+    { key: 'stockCrypto', label: '주식-암호화폐 (+)', color: '#f97316' },
+    { key: 'traditional', label: '전통자산 (+)', color: '#38bdf8' },
+    { key: 'safeNegative', label: '안전자산 결합력 (-)', color: '#a855f7' },
   ];
   const legendNames = ['결합 강도', '결합 강도 (EMA)', ...subConfigs.map((item) => item.label)];
   const legendSelected = { '결합 강도': true, '결합 강도 (EMA)': true };

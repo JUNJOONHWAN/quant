@@ -82,7 +82,7 @@
         <h2>자산 결합 강도</h2>
         <button type="button" class="info" data-target="info-stability">ⓘ</button>
       </div>
-      <p class="panel-context">결합 강도는 시장 동조화 정도(맥락 지표)만 알려주며, 실제 Risk-On/Off 결정은 아래 레짐 점수가 담당합니다.</p>
+      <p class="panel-context">결합 강도는 시장 동조화 정도(맥락 지표)만 알려주며, 실제 Risk-On/Off 결정은 아래 레짐 점수가 담당합니다. 값이 높다면 자금이 한 방향으로 쏠렸다는 뜻이니 Guard·히트맵과 함께 해석하세요.</p>
       <div id="stability-gauge" class="chart"></div>
       <ul class="legend">
         <li><span class="legend-box red"></span>분산/결합 약함 (0.0 - 0.3)</li>
@@ -98,15 +98,15 @@
       </div>
       <div class="sub-gauges">
         <div class="sub-gauge">
-          <h3>주식-암호화폐</h3>
+          <h3>주식-암호화폐 (+)</h3>
           <div id="stock-crypto-gauge" class="chart"></div>
         </div>
         <div class="sub-gauge">
-          <h3>전통자산</h3>
+          <h3>전통자산 (+)</h3>
           <div id="traditional-gauge" class="chart"></div>
         </div>
         <div class="sub-gauge">
-          <h3>안전자산 결합력</h3>
+          <h3>안전자산 결합력 (-)</h3>
           <div id="safe-neg-gauge" class="chart"></div>
         </div>
       </div>
@@ -176,9 +176,9 @@
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>하위 지수 설명</h3>
     <ul>
-      <li><strong>주식-암호화폐</strong>: IWM·SPY 대비 BTC 절댓값 상관. 0.5 이상이면 소형주·크립토 랠리가 동시 진행되는 구간(예: 1/10~1/24, 10/24)이라 Classic 점수가 급등합니다.</li>
-      <li><strong>전통자산</strong>: IWM·SPY·TLT·GLD 내부 상관. 0.6 이상으로 뭉치면 “금리/실적 이벤트” 영향이 커졌다는 뜻이니 흡수비와 함께 Guard를 확인해 False Risk-On을 걸러냅니다.</li>
-      <li><strong>안전자산 결합력 (Safe-NEG)</strong>: 주식 ↔ (TLT, GLD) 음의 상관을 0~1로 환산. 0.6 이상이면 안전자산 약세 → 위험선호로 읽지만, 금리 쇼크처럼 주식도 함께 하락하면 오히려 경고 신호일 수 있으니 반드시 모멘텀을 함께 봅니다.</li>
+      <li><strong>주식-암호화폐 (+)</strong>: IWM·SPY 대비 BTC 절댓값 상관. 0.5 이상이면 소형주·크립토 랠리가 동시 진행되는 구간(예: 1/10~1/24, 10/24)이라 Classic 점수가 급등합니다.</li>
+      <li><strong>전통자산 (+)</strong>: IWM·SPY·TLT·GLD 내부 상관. 0.6 이상으로 뭉치면 “금리/실적 이벤트” 영향이 커졌다는 뜻이니 흡수비와 함께 Guard를 확인해 False Risk-On을 걸러냅니다.</li>
+      <li><strong>안전자산 결합력 (-)</strong>: 주식 ↔ (TLT, GLD) 음의 상관을 0~1로 환산. 0.6 이상이면 안전자산 약세 → 위험선호로 읽지만, 금리 쇼크처럼 주식도 함께 하락하면 오히려 경고 신호일 수 있으니 반드시 모멘텀을 함께 봅니다.</li>
     </ul>
   </section>
   <section class="info-popover" id="info-risk">
