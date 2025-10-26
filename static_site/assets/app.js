@@ -904,6 +904,10 @@ function renderRisk() {
         detail: {
           formatter: () => `${stateLabel}  \n${latestScore.toFixed(3)}`,
           fontSize: 14,
+          color: '#e0e7ff',
+          backgroundColor: 'rgba(15,23,42,0.45)',
+          padding: 6,
+          borderRadius: 6,
           offsetCenter: [0, '60%'],
         },
         data: [{ value: latestScore }],
@@ -1995,8 +1999,8 @@ function renderGauge() {
         detail: {
           formatter: () => `결합 강도: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
           fontSize: 16,
-          color: '#fcd34d',
-          backgroundColor: 'rgba(15,23,42,0.35)',
+          color: '#e0e7ff',
+          backgroundColor: 'rgba(15,23,42,0.45)',
           padding: 8,
           borderRadius: 8,
           offsetCenter: [0, '65%'],

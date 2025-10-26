@@ -15,7 +15,6 @@
   <header>
     <h1>자산 결합 강도 (시장 안정성 지수)</h1>
     <p class="subtitle">자산 상관관계를 활용한 일별 시장 안정성 모니터링</p>
-    <p class="context-note">결합 강도는 “시장 전체가 얼마나 한 방향으로 묶여 있는지”만 알려주는 맥락 지표이며, 실제 Risk-On/Off 결정은 모멘텀·Guard·Safe-NEG가 포함된 레짐 점수가 담당합니다.</p>
     <div class="update-info">
       <span id="last-updated"></span>
       <span id="generated-at"></span>
@@ -83,6 +82,7 @@
         <h2>자산 결합 강도</h2>
         <button type="button" class="info" data-target="info-stability">ⓘ</button>
       </div>
+      <p class="panel-context">결합 강도는 시장 동조화 정도(맥락 지표)만 알려주며, 실제 Risk-On/Off 결정은 아래 레짐 점수가 담당합니다.</p>
       <div id="stability-gauge" class="chart"></div>
       <ul class="legend">
         <li><span class="legend-box red"></span>분산/결합 약함 (0.0 - 0.3)</li>
