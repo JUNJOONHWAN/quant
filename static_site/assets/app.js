@@ -694,6 +694,7 @@ function populateControls() {
 
 
   const refreshButton = document.getElementById('refresh-button');
+  const downloadButton = document.getElementById('download-report');
   const startInput = document.getElementById('custom-start');
   const endInput = document.getElementById('custom-end');
 
@@ -710,6 +711,14 @@ function populateControls() {
     endInput.min = firstDate;
     endInput.max = lastDate;
     endInput.value = state.customRange.end || '';
+  }
+
+  if (downloadButton) {
+    downloadButton.disabled = !canBuildTextReport();
+    if (!downloadButton.dataset.bound) {
+      downloadButton.addEventListener('click', handleDownloadReport);
+      downloadButton.dataset.bound = 'true';
+    }
   }
 
   const handleCustomRangeChange = () => {
@@ -816,6 +825,7 @@ function renderAll() {
   renderBacktest();
   renderHeatmap();
   renderPair();
+  updateDownloadButtonState();
 }
 
 // --- Risk regime configs ---
@@ -1382,6 +1392,169 @@ async function handleRefreshClick() {
     }
     state.refreshing = false;
   }
+}
+
+function handleDownloadReport(event) {
+  if (event) {
+    event.preventDefault();
+  }
+  try {
+    const payload = buildTextReportPayload();
+    triggerTextDownload(payload.text, payload.filename);
+  } catch (error) {
+    console.error('리포트 다운로드 실패', error);
+    showError('리포트를 생성하지 못했습니다. 화면 데이터가 충분한지 확인한 뒤 다시 시도해 주세요.');
+  }
+}
+
+function buildTextReportPayload() {
+  const metrics = state.metrics[state.window];
+  if (!metrics) {
+    throw new Error('metrics-unavailable');
+  }
+  const { records, empty, rangeLabel } = getFilteredRecords(metrics);
+  if (empty || !Array.isArray(records) || records.length === 0) {
+    throw new Error('records-unavailable');
+  }
+  const latest = records[records.length - 1];
+  if (!latest) {
+    throw new Error('latest-record-missing');
+  }
+  const first = records[0];
+  const generatedAt = state.generatedAt instanceof Date ? state.generatedAt : new Date();
+  const rangeText = rangeLabel || `${state.range}일`;
+  const riskSeries = state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, records)
+    : computeRiskSeriesClassic(metrics, records);
+  const lines = [];
+  lines.push('시장 안정성 TXT 리포트');
+  lines.push('================================');
+  lines.push(`생성 시각: ${formatDateTimeLocal(generatedAt)}`);
+  lines.push(`데이터 기준일: ${latest.date || 'N/A'}`);
+  lines.push(`윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`);
+  lines.push('');
+  lines.push('[범위 요약]');
+  lines.push(`- 표본 구간: ${first?.date || 'N/A'} ~ ${latest?.date || 'N/A'} (${records.length}일)`);
+  lines.push(`- 사용자 선택: ${state.customRange?.start || '시작 미지정'} ~ ${state.customRange?.end || '종료 미지정'}`);
+  lines.push('');
+  lines.push('[시장 안정성]');
+  lines.push(`- Stability: ${formatNumberOrNA(latest.stability)}`);
+  lines.push(`- Smoothed (EMA10): ${formatNumberOrNA(latest.smoothed)}`);
+  lines.push(`- Delta (3일-10일): ${formatSignedNumber(latest.delta)}`);
+  lines.push(`- 180일 평균: ${formatNumberOrNA(metrics.average180)}`);
+  lines.push('');
+  lines.push('[하위 지수]');
+  lines.push(`- 주식-암호화폐: ${formatNumberOrNA(latest.sub?.stockCrypto)}`);
+  lines.push(`- 전통자산: ${formatNumberOrNA(latest.sub?.traditional)}`);
+  lines.push(`- 안전자산 결합력(Safe-NEG): ${formatNumberOrNA(latest.sub?.safeNegative)}`);
+  lines.push('');
+  lines.push('[리스크 레짐]');
+  if (riskSeries && riskSeries.state && riskSeries.state.length > 0) {
+    const idx = riskSeries.state.length - 1;
+    const regimeValue = riskSeries.state[idx] || 0;
+    const regimeLabel = regimeValue > 0 ? 'Risk-On' : regimeValue < 0 ? 'Risk-Off' : 'Neutral';
+    const fragileLabel = riskSeries.fragile?.[idx] ? ' (Fragile)' : '';
+    const scoreValue = state.riskMode === 'enhanced'
+      ? riskSeries.riskScore?.[idx]
+      : riskSeries.score?.[idx];
+    lines.push(`- 상태: ${regimeLabel}${fragileLabel}`);
+    lines.push(`- 점수: ${formatNumberOrNA(scoreValue)}`);
+    lines.push(`- ${formatRiskPairLabel()}: ${formatNumberOrNA(riskSeries.scCorr?.[idx])}`);
+    lines.push(`- Safe-NEG: ${formatNumberOrNA(riskSeries.safeNeg?.[idx])}`);
+    if (state.riskMode === 'enhanced') {
+      lines.push(`- Guard: ${formatNumberOrNA(riskSeries.guard?.[idx])}`);
+      lines.push(`- Absorption Ratio: ${formatNumberOrNA(riskSeries.mm?.[idx])}`);
+      lines.push(`- 10일 공동 모멘텀: ${formatSignedPercent(riskSeries.comboMomentum?.[idx])}`);
+      lines.push(`- 5일 리스크 폭: ${formatPercentOrNA(riskSeries.breadth?.[idx])}`);
+    }
+  } else {
+    lines.push('- 레짐 정보를 계산하지 못했습니다.');
+  }
+
+  const filename = buildReportFilename(latest?.date, generatedAt);
+  return {
+    text: lines.join('\n'),
+    filename,
+  };
+}
+
+function triggerTextDownload(text, filename) {
+  if (!text) {
+    throw new Error('empty-text');
+  }
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename || 'stability-report.txt';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function buildReportFilename(latestDate, generatedAt) {
+  const stampFromLatest = typeof latestDate === 'string'
+    ? latestDate.replace(/[^0-9]/g, '')
+    : '';
+  const fallbackStamp = formatDateToken(generatedAt || new Date());
+  const safeStamp = stampFromLatest && stampFromLatest.length >= 8 ? stampFromLatest.slice(0, 8) : fallbackStamp;
+  return `stability-report-${safeStamp}.txt`;
+}
+
+function formatNumberOrNA(value, digits = 3) {
+  if (!Number.isFinite(value)) return 'N/A';
+  return Number(value).toFixed(digits);
+}
+
+function formatSignedNumber(value, digits = 3) {
+  if (!Number.isFinite(value)) return 'N/A';
+  const fixed = Number(value).toFixed(digits);
+  return value > 0 ? `+${fixed}` : fixed;
+}
+
+function formatPercentOrNA(value, digits = 0) {
+  if (!Number.isFinite(value)) return 'N/A';
+  return `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatSignedPercent(value, digits = 1) {
+  if (!Number.isFinite(value)) return 'N/A';
+  const fixed = (value * 100).toFixed(digits);
+  return value > 0 ? `+${fixed}%` : `${fixed}%`;
+}
+
+function formatDateTimeLocal(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!date || Number.isNaN(date.getTime())) return '알 수 없음';
+  return date.toLocaleString(undefined, { hour12: false });
+}
+
+function formatDateToken(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!date || Number.isNaN(date.getTime())) return 'latest';
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}
+
+function canBuildTextReport() {
+  try {
+    const metrics = state.metrics[state.window];
+    if (!metrics) return false;
+    const { records, empty } = getFilteredRecords(metrics);
+    if (empty || !Array.isArray(records) || records.length === 0) return false;
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function updateDownloadButtonState() {
+  const button = document.getElementById('download-report');
+  if (!button) return;
+  button.disabled = !canBuildTextReport();
 }
 
 async function maybeRefreshData() {
