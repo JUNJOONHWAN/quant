@@ -13,6 +13,8 @@ const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 const DEFAULT_DATA_PATH = './data/precomputed.json';
 const RISK_MODE_STORAGE_KEY = 'risk-mode.v1';
+const TEXT_PRIMARY = '#f8fafc';
+const TEXT_AXIS = '#cbd5ff';
 
 let datasetPath = DEFAULT_DATA_PATH;
 let cacheTagRaw = null;
@@ -904,7 +906,7 @@ function renderRisk() {
         detail: {
           formatter: () => `${stateLabel}  \n${latestScore.toFixed(3)}`,
           fontSize: 14,
-          color: '#e0e7ff',
+          color: TEXT_PRIMARY,
           backgroundColor: 'rgba(15,23,42,0.45)',
           padding: 6,
           borderRadius: 6,
@@ -946,7 +948,7 @@ function renderRisk() {
         const corrLabel = formatRiskPairLabel();
         return `${series.dates[idx]}<br/>${label}<br/>${corrLabel}: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${extras}`;
       } },
-      xAxis: { type: 'category', data: series.dates, axisLabel: { show: true } },
+    xAxis: { type: 'category', data: series.dates, axisLabel: { show: true, color: TEXT_AXIS } },
       yAxis: { type: 'value', min: -1, max: 1, show: false },
       series: [{
         type: 'bar',
@@ -1070,8 +1072,8 @@ function renderBacktest() {
   chart.setOption({
     legend: { data: ['전략', '벤치마크'] },
     tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: dates },
-    yAxis: { type: 'value', scale: true },
+    xAxis: { type: 'category', data: dates, axisLabel: { color: TEXT_AXIS } },
+    yAxis: { type: 'value', scale: true, axisLabel: { color: TEXT_AXIS } },
     series: [
       {
         name: '전략',
@@ -1999,7 +2001,7 @@ function renderGauge() {
         detail: {
           formatter: () => `결합 강도: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
           fontSize: 16,
-          color: '#e0e7ff',
+          color: TEXT_PRIMARY,
           backgroundColor: 'rgba(15,23,42,0.45)',
           padding: 8,
           borderRadius: 8,
@@ -2059,6 +2061,7 @@ function renderSubGauges() {
         detail: {
           formatter: (value) => safeNumber(value).toFixed(3),
           fontSize: 14,
+          color: TEXT_PRIMARY,
           offsetCenter: [0, '60%'],
         },
         data: [{ value: gaugeValue }],
@@ -2152,11 +2155,13 @@ function renderHistory() {
     xAxis: {
       type: 'category',
       data: dates,
+      axisLabel: { color: TEXT_AXIS },
     },
     yAxis: {
       type: 'value',
       min: 0,
       max: 1,
+      axisLabel: { color: TEXT_AXIS },
     },
     series: [
       {
@@ -2260,8 +2265,8 @@ function renderHeatmap() {
       height: '80%',
       top: '10%',
     },
-    xAxis: { type: 'category', data: labels },
-    yAxis: { type: 'category', data: labels },
+    xAxis: { type: 'category', data: labels, axisLabel: { color: TEXT_AXIS } },
+    yAxis: { type: 'category', data: labels, axisLabel: { color: TEXT_AXIS } },
     visualMap: {
       min: -1,
       max: 1,
@@ -2430,6 +2435,7 @@ function renderPriceChart(chart, dates, priceA, priceB, assetALabel, assetBLabel
         type: 'category',
         data: dates,
         axisPointer: { type: 'shadow' },
+        axisLabel: { color: TEXT_AXIS },
       },
     ],
     yAxis: [
@@ -2438,12 +2444,14 @@ function renderPriceChart(chart, dates, priceA, priceB, assetALabel, assetBLabel
         name: assetALabel,
         position: 'left',
         scale: true,
+        axisLabel: { color: TEXT_AXIS },
       },
       {
         type: 'value',
         name: assetBLabel,
         position: 'right',
         scale: true,
+        axisLabel: { color: TEXT_AXIS },
       },
     ],
     series: [
@@ -2482,6 +2490,7 @@ function renderCorrelationChart(chart, dates, correlationValues, priceA, correla
         type: 'category',
         data: dates,
         axisPointer: { type: 'shadow' },
+        axisLabel: { color: TEXT_AXIS },
       },
     ],
     yAxis: [
@@ -2491,12 +2500,14 @@ function renderCorrelationChart(chart, dates, correlationValues, priceA, correla
         min: -1,
         max: 1,
         position: 'left',
+        axisLabel: { color: TEXT_AXIS },
       },
       {
         type: 'value',
         name: assetALabel,
         position: 'right',
         scale: true,
+        axisLabel: { color: TEXT_AXIS },
       },
     ],
     series: [
