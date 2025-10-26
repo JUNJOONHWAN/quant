@@ -1426,54 +1426,38 @@ function buildTextReportPayload() {
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
     : computeRiskSeriesClassic(metrics, records);
-  const lines = [];
-  lines.push('시장 안정성 TXT 리포트');
-  lines.push('================================');
-  lines.push(`생성 시각: ${formatDateTimeLocal(generatedAt)}`);
-  lines.push(`데이터 기준일: ${latest.date || 'N/A'}`);
-  lines.push(`윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`);
-  lines.push('');
-  lines.push('[범위 요약]');
-  lines.push(`- 표본 구간: ${first?.date || 'N/A'} ~ ${latest?.date || 'N/A'} (${records.length}일)`);
-  lines.push(`- 사용자 선택: ${state.customRange?.start || '시작 미지정'} ~ ${state.customRange?.end || '종료 미지정'}`);
-  lines.push('');
-  lines.push('[시장 안정성]');
-  lines.push(`- Stability: ${formatNumberOrNA(latest.stability)}`);
-  lines.push(`- Smoothed (EMA10): ${formatNumberOrNA(latest.smoothed)}`);
-  lines.push(`- Delta (3일-10일): ${formatSignedNumber(latest.delta)}`);
-  lines.push(`- 180일 평균: ${formatNumberOrNA(metrics.average180)}`);
-  lines.push('');
-  lines.push('[하위 지수]');
-  lines.push(`- 주식-암호화폐: ${formatNumberOrNA(latest.sub?.stockCrypto)}`);
-  lines.push(`- 전통자산: ${formatNumberOrNA(latest.sub?.traditional)}`);
-  lines.push(`- 안전자산 결합력(Safe-NEG): ${formatNumberOrNA(latest.sub?.safeNegative)}`);
-  lines.push('');
-  lines.push('[리스크 레짐]');
-  if (riskSeries && riskSeries.state && riskSeries.state.length > 0) {
-    const idx = riskSeries.state.length - 1;
-    const regimeValue = riskSeries.state[idx] || 0;
-    const regimeLabel = regimeValue > 0 ? 'Risk-On' : regimeValue < 0 ? 'Risk-Off' : 'Neutral';
-    const fragileLabel = riskSeries.fragile?.[idx] ? ' (Fragile)' : '';
-    const scoreValue = state.riskMode === 'enhanced'
-      ? riskSeries.riskScore?.[idx]
-      : riskSeries.score?.[idx];
-    lines.push(`- 상태: ${regimeLabel}${fragileLabel}`);
-    lines.push(`- 점수: ${formatNumberOrNA(scoreValue)}`);
-    lines.push(`- ${formatRiskPairLabel()}: ${formatNumberOrNA(riskSeries.scCorr?.[idx])}`);
-    lines.push(`- Safe-NEG: ${formatNumberOrNA(riskSeries.safeNeg?.[idx])}`);
-    if (state.riskMode === 'enhanced') {
-      lines.push(`- Guard: ${formatNumberOrNA(riskSeries.guard?.[idx])}`);
-      lines.push(`- Absorption Ratio: ${formatNumberOrNA(riskSeries.mm?.[idx])}`);
-      lines.push(`- 10일 공동 모멘텀: ${formatSignedPercent(riskSeries.comboMomentum?.[idx])}`);
-      lines.push(`- 5일 리스크 폭: ${formatPercentOrNA(riskSeries.breadth?.[idx])}`);
-    }
-  } else {
-    lines.push('- 레짐 정보를 계산하지 못했습니다.');
-  }
+  const headerLines = [
+    '시장 안정성 TXT 리포트',
+    '================================',
+    `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
+    `데이터 기준일: ${latest.date || 'N/A'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`,
+    '',
+    '[범위 요약]',
+    `- 표본 구간: ${first?.date || 'N/A'} ~ ${latest?.date || 'N/A'} (${records.length}일)`,
+    `- 사용자 선택: ${state.customRange?.start || '시작 미지정'} ~ ${state.customRange?.end || '종료 미지정'}`,
+  ];
+
+  const bodySections = [
+    buildMethodologySection(),
+    buildStabilitySection(records, metrics, rangeText),
+    buildSubIndexSection(records),
+    buildRiskScoreSection(riskSeries),
+    buildRegimeTimelineSection(riskSeries),
+    buildPriceSection(records),
+    buildHeatmapSection(metrics),
+    buildPairSection(),
+  ].filter((section) => Array.isArray(section) && section.length > 0);
+
+  const text = [
+    ...headerLines,
+    '',
+    ...bodySections.flatMap((section, index) => (index === bodySections.length - 1 ? section : [...section, ''])),
+  ].join('\n');
 
   const filename = buildReportFilename(latest?.date, generatedAt);
   return {
-    text: lines.join('\n'),
+    text,
     filename,
   };
 }
@@ -1500,6 +1484,277 @@ function buildReportFilename(latestDate, generatedAt) {
   const fallbackStamp = formatDateToken(generatedAt || new Date());
   const safeStamp = stampFromLatest && stampFromLatest.length >= 8 ? stampFromLatest.slice(0, 8) : fallbackStamp;
   return `stability-report-${safeStamp}.txt`;
+}
+
+function buildMethodologySection() {
+  const assetList = SIGNAL.symbols.join(', ');
+  return [
+    '[0. 산출 로직 및 근거]',
+    `- Stability Index = Σ w(i,j)·|corr(i,j)| ÷ Σ w(i,j), 대상 자산: ${assetList}, 주식-채권 쌍에 더 큰 가중을 적용합니다.`,
+    '- 하위 지수: (a) 주식-암호화폐 = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산 = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG = max(0, -corr(주식, TLT/GLD)) 평균.',
+    '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
+    '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
+    `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
+    `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
+  ];
+}
+
+function buildStabilitySection(records, metrics, rangeText) {
+  const lines = ['[1. 시장 안정성 (Stability Index)]'];
+  if (!Array.isArray(records) || records.length === 0) {
+    lines.push('- 데이터가 없습니다.');
+    return lines;
+  }
+  const latest = records[records.length - 1];
+  lines.push(`- 최신 Stability: ${formatNumberOrNA(latest.stability)} | Smoothed(EMA10): ${formatNumberOrNA(latest.smoothed)} | Delta(3-10): ${formatSignedNumber(latest.delta)}`);
+  lines.push(`- 180일 평균: ${formatNumberOrNA(metrics?.average180)} | 관측 범위: ${records[0].date} ~ ${latest.date} (${rangeText})`);
+  const tableRows = records.map((rec) => [
+    rec.date,
+    formatNumberOrNA(rec.stability),
+    formatNumberOrNA(rec.smoothed),
+    formatSignedNumber(rec.delta),
+  ]);
+  lines.push(...formatTable(['날짜', 'Stability', 'Smoothed', 'Delta(3-10)'], tableRows));
+  return lines;
+}
+
+function buildSubIndexSection(records) {
+  const lines = ['[2. 하위 지수]'];
+  if (!Array.isArray(records) || records.length === 0) {
+    lines.push('- 데이터가 없습니다.');
+    return lines;
+  }
+  const tableRows = records.map((rec) => [
+    rec.date,
+    formatNumberOrNA(rec.sub?.stockCrypto),
+    formatNumberOrNA(rec.sub?.traditional),
+    formatNumberOrNA(rec.sub?.safeNegative),
+  ]);
+  lines.push(...formatTable(['날짜', '주식-암호화폐', '전통자산', 'Safe-NEG'], tableRows));
+  return lines;
+}
+
+function buildRiskScoreSection(riskSeries) {
+  const lines = ['[3. 리스크온 점수]'];
+  if (
+    !riskSeries ||
+    !Array.isArray(riskSeries.dates) ||
+    riskSeries.dates.length === 0 ||
+    !Array.isArray(riskSeries.state)
+  ) {
+    lines.push('- 레짐 데이터를 계산하지 못했습니다.');
+    return lines;
+  }
+  const enhanced = state.riskMode === 'enhanced';
+  const headers = enhanced
+    ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'Guard', 'Absorption', 'Combo(10일)', 'Breadth(5일)']
+    : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
+
+  const rows = riskSeries.dates.map((date, idx) => {
+    const label = formatRegimeLabel(riskSeries.state[idx], riskSeries.fragile?.[idx]);
+    if (enhanced) {
+      return [
+        date,
+        label,
+        formatNumberOrNA(riskSeries.riskScore?.[idx]),
+        formatNumberOrNA(riskSeries.scCorr?.[idx]),
+        formatNumberOrNA(riskSeries.safeNeg?.[idx]),
+        formatNumberOrNA(riskSeries.guard?.[idx]),
+        formatNumberOrNA(riskSeries.mm?.[idx]),
+        formatSignedPercent(riskSeries.comboMomentum?.[idx]),
+        formatPercentOrNA(riskSeries.breadth?.[idx]),
+      ];
+    }
+    return [
+      date,
+      label,
+      formatNumberOrNA(riskSeries.score?.[idx]),
+      formatNumberOrNA(riskSeries.scCorr?.[idx]),
+      formatNumberOrNA(riskSeries.safeNeg?.[idx]),
+    ];
+  });
+
+  lines.push(...formatTable(headers, rows));
+  return lines;
+}
+
+function buildRegimeTimelineSection(riskSeries) {
+  const lines = ['[4. 레짐 타임라인]'];
+  if (
+    !riskSeries ||
+    !Array.isArray(riskSeries.dates) ||
+    !Array.isArray(riskSeries.state) ||
+    riskSeries.dates.length === 0
+  ) {
+    lines.push('- 레짐 데이터를 계산하지 못했습니다.');
+    return lines;
+  }
+  const transitions = [];
+  let prev = null;
+  for (let i = 0; i < riskSeries.state.length; i += 1) {
+    const current = riskSeries.state[i];
+    if (prev === null || current !== prev) {
+      transitions.push(formatRegimeTransitionLine(riskSeries, i));
+      prev = current;
+    }
+  }
+  if (transitions.length === 0) {
+    lines.push('- 표시 범위 내 상태 변화가 없습니다.');
+  } else {
+    lines.push(...transitions);
+  }
+  return lines;
+}
+
+function buildPriceSection(records) {
+  const lines = ['[5. 지수 추이 (자산 가격)]'];
+  if (!Array.isArray(records) || records.length === 0) {
+    lines.push('- 데이터가 없습니다.');
+    return lines;
+  }
+  const signalSymbol = SIGNAL.primaryStock;
+  const benchmarkSymbol = SIGNAL.trade.baseSymbol;
+  lines.push(`- 대상: 신호 주지수 ${signalSymbol}, 벤치마크 ${benchmarkSymbol}`);
+  const rows = records.map((rec) => {
+    const date = rec.date;
+    const signalPrice = lookupPriceByDate(signalSymbol, date);
+    const benchmarkPrice = lookupPriceByDate(benchmarkSymbol, date);
+    const signalRet = computeDailyReturnForSymbol(signalSymbol, date);
+    const benchmarkRet = computeDailyReturnForSymbol(benchmarkSymbol, date);
+    return [
+      date,
+      formatNumberOrNA(signalPrice, 2),
+      formatSignedPercent(signalRet),
+      formatNumberOrNA(benchmarkPrice, 2),
+      formatSignedPercent(benchmarkRet),
+    ];
+  });
+  lines.push(...formatTable(
+    ['날짜', `${signalSymbol} 종가`, `${signalSymbol} 일간`, `${benchmarkSymbol} 종가`, `${benchmarkSymbol} 일간`],
+    rows,
+  ));
+  return lines;
+}
+
+function buildHeatmapSection(metrics) {
+  const lines = ['[6. 히트맵 매트릭스]'];
+  if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) {
+    lines.push('- 상관행렬 데이터를 찾지 못했습니다.');
+    return lines;
+  }
+  const targetDate = state.heatmapDate
+    || metrics.records[metrics.records.length - 1]?.date
+    || '';
+  const record = metrics.records.find((item) => item.date === targetDate)
+    || metrics.records[metrics.records.length - 1];
+  if (!record || !Array.isArray(record.matrix)) {
+    lines.push('- 상관행렬 데이터를 찾지 못했습니다.');
+    return lines;
+  }
+  const labels = SIGNAL.symbols.slice();
+  lines.push(`- 기준일: ${record.date}`);
+  const rows = labels.map((rowSymbol, rowIdx) => {
+    const rowValues = labels.map((_, colIdx) => {
+      const value = record.matrix?.[rowIdx]?.[colIdx];
+      return Number.isFinite(value) ? value.toFixed(3) : 'N/A';
+    });
+    return [rowSymbol, ...rowValues];
+  });
+  lines.push(...formatTable(['자산 \\ 자산', ...labels], rows));
+  return lines;
+}
+
+function buildPairSection() {
+  const lines = ['[7. 기준자산 상관도]'];
+  const pair = state.pair || DEFAULT_PAIR;
+  const [assetA, assetB] = pair.split('|');
+  lines.push(`- 선택한 페어: ${assetA} / ${assetB}`);
+  const pairSeries = computePairSeries(assetA, assetB);
+  if (!pairSeries) {
+    lines.push('- 페어 데이터를 계산하지 못했습니다.');
+    return lines;
+  }
+  const indices = computeVisibleIndices(pairSeries.dates);
+  if (!Array.isArray(indices) || indices.length === 0) {
+    lines.push('- 표시 구간에 해당하는 데이터가 없습니다.');
+    return lines;
+  }
+  const rows = indices.map((idx) => [
+    pairSeries.dates[idx],
+    formatNumberOrNA(pairSeries.priceA?.[idx], 2),
+    formatNumberOrNA(pairSeries.priceB?.[idx], 2),
+    formatNumberOrNA(pairSeries.correlation?.[idx]),
+  ]);
+  lines.push(...formatTable(
+    ['날짜', `${assetA} 가격`, `${assetB} 가격`, `${state.window}일 롤링 상관`],
+    rows,
+  ));
+  return lines;
+}
+
+function formatRegimeTransitionLine(riskSeries, idx) {
+  const label = formatRegimeLabel(riskSeries.state?.[idx], riskSeries.fragile?.[idx]);
+  const scoreValue = state.riskMode === 'enhanced'
+    ? formatNumberOrNA(riskSeries.riskScore?.[idx])
+    : formatNumberOrNA(riskSeries.score?.[idx]);
+  const corrValue = formatNumberOrNA(riskSeries.scCorr?.[idx]);
+  const safeValue = formatNumberOrNA(riskSeries.safeNeg?.[idx]);
+  let extras = '';
+  if (state.riskMode === 'enhanced') {
+    const guard = formatNumberOrNA(riskSeries.guard?.[idx]);
+    const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
+    const combo = formatSignedPercent(riskSeries.comboMomentum?.[idx]);
+    extras = `, Guard=${guard}, Absorption=${mm}, Combo=${combo}`;
+  }
+  return `- ${riskSeries.dates[idx]} · ${label} (Score=${scoreValue}, Corr=${corrValue}, Safe-NEG=${safeValue}${extras})`;
+}
+
+function formatRegimeLabel(value, fragile) {
+  if (value > 0) {
+    return fragile ? 'Risk-On (Fragile)' : 'Risk-On';
+  }
+  if (value < 0) {
+    return 'Risk-Off';
+  }
+  return fragile ? 'Neutral (Fragile)' : 'Neutral';
+}
+
+function formatTable(headers, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return ['(데이터 없음)'];
+  }
+  const safeHeaders = headers.map((header) => header || '');
+  const output = [];
+  output.push(safeHeaders.join('\t'));
+  rows.forEach((row) => {
+    const safeRow = (row || []).map((value) => (value == null ? '' : String(value)));
+    output.push(safeRow.join('\t'));
+  });
+  return output;
+}
+
+function lookupPriceByDate(symbol, date) {
+  if (!symbol || !date) return null;
+  const dates = state.analysisDates || [];
+  const idx = dates.indexOf(date);
+  if (idx < 0) return null;
+  const series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series)) return null;
+  const price = series[idx];
+  return Number.isFinite(price) ? price : null;
+}
+
+function computeDailyReturnForSymbol(symbol, date) {
+  if (!symbol || !date) return null;
+  const dates = state.analysisDates || [];
+  const idx = dates.indexOf(date);
+  if (idx <= 0) return null;
+  const series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series)) return null;
+  const current = series[idx];
+  const prev = series[idx - 1];
+  if (!Number.isFinite(current) || !Number.isFinite(prev) || prev === 0) return null;
+  return current / prev - 1;
 }
 
 function formatNumberOrNA(value, digits = 3) {
