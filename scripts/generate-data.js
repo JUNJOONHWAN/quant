@@ -413,15 +413,22 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
         prices: filtered.prices,
       };
     }
-    const before = trimSeries(history, (date) => !cutoff || date < cutoff);
     const after = trimSeries(series, (date) => !cutoff || date >= cutoff);
+    const firstAfterDate = after.dates[0];
+    const before = trimSeries(history, (date) => {
+      if (firstAfterDate) {
+        return date < firstAfterDate;
+      }
+      return !cutoff || date < cutoff;
+    });
     if (before.dates.length === 0) {
       return { ...series, dates: after.dates, prices: after.prices };
     }
     if (after.dates.length === 0) {
       return { ...series, dates: before.dates, prices: before.prices };
     }
-    console.log(`[generate-data] ${series.symbol}: prepended ${before.dates.length} cached rows before ${cutoff}`);
+    const boundary = firstAfterDate || cutoff || 'live-data';
+    console.log(`[generate-data] ${series.symbol}: prepended ${before.dates.length} cached rows before ${boundary}`);
     return {
       ...series,
       dates: before.dates.concat(after.dates),
