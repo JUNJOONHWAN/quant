@@ -1427,7 +1427,7 @@ function buildTextReportPayload() {
     ? computeRiskSeriesEnhanced(metrics, records)
     : computeRiskSeriesClassic(metrics, records);
   const headerLines = [
-    '시장 안정성 TXT 리포트',
+    '자산 결합 강도 TXT 리포트',
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
@@ -1500,7 +1500,7 @@ function buildMethodologySection() {
 }
 
 function buildStabilitySection(records, metrics, rangeText) {
-  const lines = ['[1. 시장 안정성 (Stability Index)]'];
+  const lines = ['[1. 자산 결합 강도 (Stability Index)]'];
   if (!Array.isArray(records) || records.length === 0) {
     lines.push('- 데이터가 없습니다.');
     return lines;
@@ -1991,8 +1991,8 @@ function renderGauge() {
         length: '70%',
         width: 6,
       },
-      detail: {
-        formatter: () => `지수: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
+        detail: {
+          formatter: () => `결합 강도: ${safeNumber(latest.stability).toFixed(3)}\n${averageLabel}: ${safeNumber(average180).toFixed(3)}\n추세(${rangeDescriptor}): ${delta >= 0 ? '▲' : '▼'} ${(Math.abs(delta)).toFixed(3)}`,
         fontSize: 16,
         offsetCenter: [0, '65%'],
       },
@@ -2096,8 +2096,8 @@ function renderHistory() {
     { key: 'traditional', label: '전통자산', color: '#38bdf8' },
     { key: 'safeNegative', label: '안전자산 결합력', color: '#a855f7' },
   ];
-  const legendNames = ['Stability', 'Smoothed', ...subConfigs.map((item) => item.label)];
-  const legendSelected = { Stability: true, Smoothed: true };
+  const legendNames = ['결합 강도', '결합 강도 (EMA)', ...subConfigs.map((item) => item.label)];
+  const legendSelected = { '결합 강도': true, '결합 강도 (EMA)': true };
   subConfigs.forEach((cfg) => {
     legendSelected[cfg.label] = false;
   });
@@ -2151,7 +2151,7 @@ function renderHistory() {
     },
     series: [
       {
-        name: 'Stability',
+        name: '결합 강도',
         type: 'line',
         data: stabilityValues,
         smooth: true,
@@ -2162,7 +2162,7 @@ function renderHistory() {
         } : undefined,
       },
       {
-        name: 'Smoothed',
+        name: '결합 강도 (EMA)',
         type: 'line',
         data: smoothedValues,
         smooth: true,

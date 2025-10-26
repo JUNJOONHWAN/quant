@@ -13,7 +13,7 @@
 <body>
   <div id="data-info" class="notice hidden" role="status"></div>
   <header>
-    <h1>시장 안정성 지수</h1>
+    <h1>자산 결합 강도 (시장 안정성 지수)</h1>
     <p class="subtitle">자산 상관관계를 활용한 일별 시장 안정성 모니터링</p>
     <div class="update-info">
       <span id="last-updated"></span>
@@ -78,14 +78,14 @@
     </section>
     <section class="panel" id="gauge-panel">
       <div class="panel-header">
-        <h2>시장 안정성 게이지</h2>
+        <h2>자산 결합 강도</h2>
         <button type="button" class="info" data-target="info-stability">ⓘ</button>
       </div>
       <div id="stability-gauge" class="chart"></div>
       <ul class="legend">
-        <li><span class="legend-box red"></span>불안정 (0.0 - 0.3)</li>
-        <li><span class="legend-box yellow"></span>중립 (0.3 - 0.4)</li>
-        <li><span class="legend-box green"></span>안정 (0.4 - 1.0)</li>
+        <li><span class="legend-box red"></span>분산/결합 약함 (0.0 - 0.3)</li>
+        <li><span class="legend-box yellow"></span>과도기 (0.3 - 0.4)</li>
+        <li><span class="legend-box green"></span>동조/결합 강함 (0.4 - 1.0)</li>
       </ul>
     </section>
 
@@ -159,16 +159,15 @@
 
   <section class="info-popover" id="info-stability">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
-    <h3>시장 안정성 지수</h3>
+    <h3>자산 결합 강도 (Stability Index)</h3>
     <p>
-      정의: IWM·SPY·TLT·GLD·BTC 간 상관계수의 절댓값을 주식/채권 가중으로 묶은 0~1 지수입니다. 0은 서로 다른 방향, 1은 완전 동조를 의미합니다.
+      정의: IWM·SPY·TLT·GLD·BTC 간 상관계수의 절댓값을 주식/채권 가중으로 묶은 0~1 지수로, 다섯 자산이 얼마나 강하게 결합되어 움직이는지 보여줍니다. 0은 흩어진 움직임, 1은 완전 동조입니다.
     </p>
     <p>
-      활용: <strong>0.40 이상 + 단기 모멘텀 ▲</strong>이면 ‘광범위 위험 랠리’ 신호로 보고, <strong>0.40 이상 + 모멘텀 ▼</strong>이면 ‘안정된 하락(군집형 리스크)’로 표시하여 Guard를 반드시 확인합니다.
-      2025-10-13 이후처럼 스태빌리티가 급등했는데도 레짐이 Risk-Off라면 “방향성 미확인” 단계이니 히트맵·모멘텀을 함께 모니터링하세요.
+      활용: <strong>0.40 이상 + 단기 모멘텀 ▲</strong>이면 ‘광범위 Risk-On(결합 강도 상승 속 상승)’이고, <strong>0.40 이상 + 모멘텀 ▼</strong>이면 ‘안정된 하락(결합 강하지만 가격 하락)’이므로 Guard·히트맵을 함께 봅니다. 2025-10-13 이후처럼 값이 급등했는데도 레짐이 Risk-Off라면 “방향성 미확인” 단계이니 Guard·모멘텀·히트맵을 병행 확인하세요.
     </p>
     <p>
-      범례: 빨강(0–0.3)은 분산 장세, 노랑(0.3–0.4)은 과도기, 초록(0.4–1.0)은 한 방향으로 묶인 장세입니다. 초록이어도 흡수비(mm) ≥ 0.90이면 Guard가 긴장 상태일 수 있습니다.
+      색상: 빨강(0–0.3)은 분산/결합 약함, 노랑(0.3–0.4)은 동조 전환 구간, 초록(0.4–1.0)은 결합 강함(위험/기회 집중)입니다. 초록이어도 흡수비(mm) ≥ 0.90이면 Guard가 긴장 상태일 수 있습니다.
     </p>
   </section>
   <section class="info-popover" id="info-sub">
