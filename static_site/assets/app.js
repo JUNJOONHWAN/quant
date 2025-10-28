@@ -173,7 +173,7 @@ function getInitialRiskMode() {
   }
   try {
     const saved = window.localStorage?.getItem(RISK_MODE_STORAGE_KEY);
-    if (saved === 'classic' || saved === 'enhanced') {
+    if (saved === 'classic' || saved === 'enhanced' || saved === 'ffl') {
       return saved;
     }
   } catch (error) {
@@ -205,7 +205,7 @@ const state = {
 };
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
-  const normalized = nextMode === 'enhanced' ? 'enhanced' : 'classic';
+  const normalized = nextMode === 'enhanced' ? 'enhanced' : nextMode === 'ffl' ? 'ffl' : 'classic';
   state.riskMode = normalized;
   if (persist) {
     try {
@@ -681,7 +681,14 @@ function populateControls() {
 
   const riskModeSelect = document.getElementById('risk-mode');
   if (riskModeSelect) {
-    const currentMode = state.riskMode === 'enhanced' ? 'enhanced' : 'classic';
+    if (!Array.from(riskModeSelect.options).some((option) => option.value === 'ffl')) {
+      const opt = document.createElement('option');
+      opt.value = 'ffl';
+      opt.textContent = 'FFL';
+      riskModeSelect.appendChild(opt);
+    }
+    const supportedModes = ['classic', 'enhanced', 'ffl'];
+    const currentMode = supportedModes.includes(state.riskMode) ? state.riskMode : 'classic';
     if (riskModeSelect.value !== currentMode) {
       riskModeSelect.value = currentMode;
     }
@@ -833,6 +840,23 @@ function renderAll() {
 // --- Risk regime configs ---
 const RISK_BREADTH_SYMBOLS = SIGNAL.breadth;
 const ENHANCED_LOOKBACKS = { momentum: 10, breadth: 5 };
+const CLUSTERS = { risk: ['IWM', 'SPY', 'BTC-USD'], safe: ['TLT', 'GLD'] };
+const RISK_CFG_FFL = {
+  lookbacks: { momentum: 10, vol: 20, breadth: 5 },
+  p: 1.5,
+  zSat: 2.0,
+  lambda: 0.25,
+  thresholds: {
+    jOn: +0.10,
+    jOff: -0.08,
+    scoreOn: 0.60,
+    scoreOff: 0.40,
+    breadthOn: 0.50,
+    mmFragile: 0.88,
+    mmOff: 0.96,
+  },
+  variant: 'enhanced', // swap to 'classic' for Classic-FFL
+};
 const RISK_CFG_CLASSIC = {
   // original corr-heavy classic with stronger safe-neg weighting
   weights: { sc: 0.70, safe: 0.30 },
@@ -876,7 +900,9 @@ function renderRisk() {
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
-    : computeRiskSeriesClassic(metrics, filteredRecords2);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(metrics, filteredRecords2)
+      : computeRiskSeriesClassic(metrics, filteredRecords2);
   if (!series) {
     if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
     if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
@@ -886,7 +912,7 @@ function renderRisk() {
   const latestIdx = series.score.length - 1;
   const latestScore = series.score[latestIdx] || 0;
   const latestState = series.state[latestIdx] || 0;
-  const palette = state.riskMode === 'enhanced' ? RISK_CFG_ENH.colors : RISK_CFG_CLASSIC.colors;
+  const palette = state.riskMode === 'classic' ? RISK_CFG_CLASSIC.colors : RISK_CFG_ENH.colors;
   const fragile = !!series.fragile?.[latestIdx];
   const stateLabel = latestState > 0 ? (fragile ? 'Risk-On (Fragile)' : 'Risk-On') : latestState < 0 ? 'Risk-Off' : 'Neutral';
   const stateColor = latestState > 0 ? (fragile ? (palette.onFragile || palette.on) : palette.on) : latestState < 0 ? palette.off : palette.neutral;
@@ -929,18 +955,39 @@ function renderRisk() {
         const sc = series.scCorr[idx];
         const sn = series.safeNeg[idx];
         let extras = '';
-        if (state.riskMode === 'enhanced') {
-          const mm = series.mm?.[idx];
-          const guardVal = series.guard?.[idx];
-          const combo = series.comboMomentum?.[idx];
-          const breadthVal = series.breadth?.[idx];
-          const scoreVal = series.riskScore?.[idx];
+        if (state.riskMode !== 'classic') {
           const parts = [];
-          if (Number.isFinite(scoreVal)) parts.push(`점수 ${scoreVal.toFixed(3)}`);
-          if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
-          if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
-          if (Number.isFinite(mm)) parts.push(`흡수비 ${mm.toFixed(3)}`);
-          if (Number.isFinite(guardVal)) parts.push(`위험가드 ${(guardVal * 100).toFixed(0)}%`);
+          const baseScore = state.riskMode === 'enhanced'
+            ? series.riskScore?.[idx]
+            : series.score?.[idx];
+          if (Number.isFinite(baseScore)) {
+            parts.push(`점수 ${Number(baseScore).toFixed(3)}`);
+          }
+          if (state.riskMode === 'enhanced') {
+            const mm = series.mm?.[idx];
+            const guardVal = series.guard?.[idx];
+            const combo = series.comboMomentum?.[idx];
+            const breadthVal = series.breadth?.[idx];
+            if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
+            if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+            if (Number.isFinite(mm)) parts.push(`흡수비 ${mm.toFixed(3)}`);
+            if (Number.isFinite(guardVal)) parts.push(`위험가드 ${(guardVal * 100).toFixed(0)}%`);
+          } else if (state.riskMode === 'ffl') {
+            const fluxVal = series.fflFlux?.[idx];
+            const fintVal = series.fluxIntensity?.[idx];
+            const farVal = series.far?.[idx];
+            const mm = series.mm?.[idx];
+            const guardVal = series.guard?.[idx];
+            const combo = series.comboMomentum?.[idx];
+            const breadthVal = series.breadth?.[idx];
+            if (Number.isFinite(fluxVal)) parts.push(`J_norm ${fluxVal.toFixed(3)}`);
+            if (Number.isFinite(fintVal)) parts.push(`FINT ${fintVal.toFixed(3)}`);
+            if (Number.isFinite(farVal)) parts.push(`FAR ${farVal.toFixed(3)}`);
+            if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
+            if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
+            if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
+            if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+          }
           if (parts.length > 0) {
             extras = `<br/>${parts.join(' · ')}`;
           }
@@ -1006,7 +1053,9 @@ function renderBacktest() {
 
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : computeRiskSeriesClassic(metrics, filtered);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(metrics, filtered)
+      : computeRiskSeriesClassic(metrics, filtered);
   if (!series) return;
 
   const symbol = baseSymbol;
@@ -1125,7 +1174,9 @@ function renderAlerts() {
   if (empty) { box.innerHTML = ''; return; }
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : computeRiskSeriesClassic(metrics, filtered);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(metrics, filtered)
+      : computeRiskSeriesClassic(metrics, filtered);
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -1276,6 +1327,170 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
   };
 }
 
+function computeRiskSeriesFFL(metrics, recordsOverride) {
+  if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) {
+    return null;
+  }
+
+  const labels = SIGNAL.symbols;
+  const indexMap = {};
+  labels.forEach((symbol, idx) => { indexMap[symbol] = idx; });
+
+  const allRecords = metrics.records;
+  const primaryRecords = Array.isArray(recordsOverride) && recordsOverride.length > 0 ? recordsOverride : null;
+  const firstDate = primaryRecords?.[0]?.date ?? allRecords[0]?.date;
+  let baseIdx = allRecords.findIndex((record) => record.date === firstDate);
+  if (baseIdx < 0) baseIdx = 0;
+
+  const length = primaryRecords ? primaryRecords.length : allRecords.length - baseIdx;
+  if (length <= 0) return null;
+
+  const slice = allRecords.slice(baseIdx, baseIdx + length);
+  const dates = slice.map((record) => record.date);
+  const pairSeries = metrics.pairs?.[SIGNAL.pairKey] || null;
+  const scCorr = pairSeries?.correlation?.slice(baseIdx, baseIdx + length) || new Array(length).fill(null);
+  const safeNeg = slice.map((record) => safeNumber(record.sub?.safeNegative));
+
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const prices = state.priceSeries || {};
+
+  const score = new Array(length).fill(null);
+  const stateArr = new Array(length).fill(0);
+  const fragile = new Array(length).fill(false);
+  const guard = new Array(length).fill(null);
+  const mm = new Array(length).fill(null);
+  const jFlux = new Array(length).fill(null);
+  const fIntensity = new Array(length).fill(null);
+  const comboMomentum = new Array(length).fill(null);
+  const breadth = new Array(length).fill(null);
+  const far = new Array(length).fill(null);
+
+  for (let i = 0; i < length; i += 1) {
+    const record = allRecords[baseIdx + i];
+    const matrix = record?.matrix;
+    if (Array.isArray(matrix) && matrix.length > 0) {
+      const lambda1 = topEigenvalue(matrix) || 0;
+      mm[i] = lambda1 / (matrix.length || 1);
+    }
+
+    const priceIndex = baseIdx + i + windowOffset;
+    const zr = {};
+    labels.forEach((symbol) => {
+      zr[symbol] = zMomentumFromSeries(
+        prices[symbol],
+        priceIndex,
+        RISK_CFG_FFL.lookbacks.momentum,
+        RISK_CFG_FFL.lookbacks.vol,
+        RISK_CFG_FFL.zSat,
+      );
+    });
+
+    let weightSum = 0;
+    let fluxSum = 0;
+    let absSum = 0;
+    CLUSTERS.safe.forEach((safeSymbol) => {
+      const safeIdx = indexMap[safeSymbol];
+      if (!Number.isInteger(safeIdx)) return;
+      CLUSTERS.risk.forEach((riskSymbol) => {
+        const riskIdx = indexMap[riskSymbol];
+        if (!Number.isInteger(riskIdx)) return;
+        const coefficient = Array.isArray(matrix) ? matrix?.[safeIdx]?.[riskIdx] : null;
+        const weight = Math.pow(Math.max(0, Number(coefficient) || 0), RISK_CFG_FFL.p);
+        if (!Number.isFinite(weight) || weight <= 0) {
+          return;
+        }
+        const safeZ = Number.isFinite(zr[safeSymbol]) ? zr[safeSymbol] : 0;
+        const riskZ = Number.isFinite(zr[riskSymbol]) ? zr[riskSymbol] : 0;
+        const diff = safeZ - riskZ;
+        weightSum += weight;
+        fluxSum += weight * diff;
+        absSum += weight * Math.abs(diff);
+      });
+    });
+
+    const Jbar = weightSum > 0 ? fluxSum / weightSum : 0;
+    const Jnorm = Math.tanh(Jbar / RISK_CFG_FFL.lambda);
+    const fluxVal = Number.isFinite(Jnorm) ? Jnorm : null;
+    jFlux[i] = fluxVal;
+    const intensityVal = weightSum > 0 ? absSum / weightSum : null;
+    fIntensity[i] = Number.isFinite(intensityVal) ? intensityVal : null;
+
+    const riskZValues = CLUSTERS.risk
+      .map((symbol) => zr[symbol])
+      .filter((value) => Number.isFinite(value));
+    comboMomentum[i] = riskZValues.length > 0
+      ? riskZValues.reduce((acc, value) => acc + value, 0) / riskZValues.length
+      : null;
+    breadth[i] = riskZValues.length > 0
+      ? riskZValues.filter((value) => value > 0).length / riskZValues.length
+      : null;
+
+    const safePen = normalizeRangeSafe(safeNeg[i], 0.35, 0.60);
+    const mmPen = normalizeRangeSafe(mm[i], 0.85, 0.97);
+    const deltaPen = normalizeRangeSafe(Math.max(0, -(record?.delta ?? 0)), 0.015, 0.05);
+    const guardVal = 0.5 * mmPen + 0.2 * safePen + 0.3 * deltaPen;
+    guard[i] = Number.isFinite(guardVal) ? Number(guardVal.toFixed(6)) : null;
+
+    const sFFL = fluxVal == null ? null : 0.5 * (1 + fluxVal);
+    const scoreVal = Number.isFinite(sFFL) ? sFFL : null;
+    score[i] = scoreVal == null ? null : Number(scoreVal.toFixed(6));
+
+    const thresholds = RISK_CFG_FFL.thresholds;
+    const mmValue = mm[i] ?? 0;
+    const comboValue = comboMomentum[i] ?? null;
+    if (RISK_CFG_FFL.variant === 'classic') {
+      if ((fluxVal ?? 0) >= thresholds.jOn && mmValue < thresholds.mmOff) {
+        stateArr[i] = 1;
+        fragile[i] = mmValue >= thresholds.mmFragile;
+      } else if ((fluxVal ?? 0) <= thresholds.jOff || mmValue >= thresholds.mmOff) {
+        stateArr[i] = -1;
+      } else {
+        stateArr[i] = 0;
+        fragile[i] = mmValue >= thresholds.mmFragile;
+      }
+    } else {
+      const on = (scoreVal ?? 0) >= thresholds.scoreOn &&
+        (fluxVal ?? 0) >= thresholds.jOn &&
+        (comboValue ?? 0) > -0.005 &&
+        (breadth[i] ?? 0) >= thresholds.breadthOn &&
+        guardVal < 0.90;
+      const off = (scoreVal ?? 0) <= thresholds.scoreOff ||
+        (fluxVal ?? 0) <= thresholds.jOff ||
+        (comboValue ?? 0) <= -0.03 ||
+        mmValue >= thresholds.mmOff ||
+        guardVal >= 1.0;
+      if (on) {
+        stateArr[i] = 1;
+        fragile[i] = guardVal >= 0.55;
+      } else if (off) {
+        stateArr[i] = -1;
+      } else {
+        stateArr[i] = 0;
+        fragile[i] = guardVal >= 0.80 && (fluxVal ?? 0) >= 0 && (comboValue ?? 0) >= -0.02;
+      }
+    }
+
+    far[i] = Number.isFinite(fluxVal) ? Math.abs(fluxVal) / (mmValue + 1e-9) : null;
+  }
+
+  return {
+    dates,
+    score,
+    riskScore: score,
+    state: stateArr,
+    fragile,
+    guard,
+    mm,
+    far,
+    fflFlux: jFlux,
+    fluxIntensity: fIntensity,
+    comboMomentum,
+    breadth,
+    scCorr,
+    safeNeg,
+  };
+}
+
 function rollingReturnFromSeries(series, index, lookback) {
   if (!Array.isArray(series) || !Number.isInteger(index) || !Number.isInteger(lookback) || lookback <= 0) {
     return null;
@@ -1289,6 +1504,51 @@ function rollingReturnFromSeries(series, index, lookback) {
     return null;
   }
   return end / start - 1;
+}
+
+function rollingStdFromSeries(series, index, lookback) {
+  if (!Array.isArray(series) || !Number.isInteger(index) || !Number.isInteger(lookback) || lookback < 2) {
+    return null;
+  }
+  if (index >= series.length || index - lookback < 0) {
+    return null;
+  }
+  const start = Math.max(0, index - lookback);
+  const windowReturns = [];
+  for (let i = start + 1; i <= index; i += 1) {
+    const prev = series[i - 1];
+    const cur = series[i];
+    if (!Number.isFinite(prev) || !Number.isFinite(cur) || prev === 0) {
+      continue; // eslint-disable-line no-continue
+    }
+    windowReturns.push(cur / prev - 1);
+  }
+  if (windowReturns.length < 2) {
+    return null;
+  }
+  const meanReturn = windowReturns.reduce((acc, value) => acc + value, 0) / windowReturns.length;
+  const variance = windowReturns.reduce((acc, value) => acc + ((value - meanReturn) ** 2), 0) / (windowReturns.length - 1);
+  return Math.sqrt(Math.max(variance, 0));
+}
+
+function zMomentumFromSeries(series, index, k, v, zSat = 2.0) {
+  if (!Array.isArray(series) || !Number.isInteger(index) || !Number.isInteger(k) || !Number.isInteger(v)) {
+    return null;
+  }
+  if (k <= 0 || v <= 1 || index >= series.length || index - k < 0) {
+    return null;
+  }
+  const base = series[index - k];
+  const latest = series[index];
+  if (!Number.isFinite(base) || !Number.isFinite(latest) || base === 0) {
+    return null;
+  }
+  const momentum = latest / base - 1;
+  const std = rollingStdFromSeries(series, index, v);
+  if (!Number.isFinite(momentum) || !Number.isFinite(std) || std === 0) {
+    return null;
+  }
+  return Math.tanh((momentum / std) / zSat);
 }
 
 function computeRiskBreadth(priceIndex, lookback) {
@@ -1431,13 +1691,15 @@ function buildTextReportPayload() {
   const rangeText = rangeLabel || `${state.range}일`;
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
-    : computeRiskSeriesClassic(metrics, records);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(metrics, records)
+      : computeRiskSeriesClassic(metrics, records);
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
-    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : 'Classic'}`,
     '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',
@@ -1501,6 +1763,7 @@ function buildMethodologySection() {
     '- 하위 지수: (a) 주식-암호화폐(+) = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산(+) = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG(-) = max(0, -corr(주식, TLT/GLD)) 평균.',
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
+    '- FFL Mode = Safe↔Risk 클러스터 플럭스(J_norm)와 Flux Intensity·FAR·Guard를 결합한 레짐입니다. J_norm ≥ 0.10 & Score ≥ 0.60 등 필터를 통과해야 Risk-On이 유지되며 Absorption ≥ 0.96 또는 Guard ≥ 1.00이면 강제 Off가 발생합니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
   ];
@@ -1552,20 +1815,40 @@ function buildRiskScoreSection(riskSeries) {
     lines.push('- 레짐 데이터를 계산하지 못했습니다.');
     return lines;
   }
-  const enhanced = state.riskMode === 'enhanced';
-  const headers = enhanced
+  const mode = state.riskMode;
+  const isEnhanced = mode === 'enhanced';
+  const isFFL = mode === 'ffl';
+  const headers = isEnhanced
     ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'Guard', 'Absorption', 'Combo(10일)', 'Breadth(5일)']
-    : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
+    : isFFL
+      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
+      : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
 
   const rows = riskSeries.dates.map((date, idx) => {
     const label = formatRegimeLabel(riskSeries.state[idx], riskSeries.fragile?.[idx]);
-    if (enhanced) {
+    if (isEnhanced) {
       return [
         date,
         label,
         formatNumberOrNA(riskSeries.riskScore?.[idx]),
         formatNumberOrNA(riskSeries.scCorr?.[idx]),
         formatNumberOrNA(riskSeries.safeNeg?.[idx]),
+        formatNumberOrNA(riskSeries.guard?.[idx]),
+        formatNumberOrNA(riskSeries.mm?.[idx]),
+        formatSignedPercent(riskSeries.comboMomentum?.[idx]),
+        formatPercentOrNA(riskSeries.breadth?.[idx]),
+      ];
+    }
+    if (isFFL) {
+      return [
+        date,
+        label,
+        formatNumberOrNA(riskSeries.score?.[idx]),
+        formatNumberOrNA(riskSeries.scCorr?.[idx]),
+        formatNumberOrNA(riskSeries.safeNeg?.[idx]),
+        formatNumberOrNA(riskSeries.fflFlux?.[idx]),
+        formatNumberOrNA(riskSeries.fluxIntensity?.[idx]),
+        formatNumberOrNA(riskSeries.far?.[idx]),
         formatNumberOrNA(riskSeries.guard?.[idx]),
         formatNumberOrNA(riskSeries.mm?.[idx]),
         formatSignedPercent(riskSeries.comboMomentum?.[idx]),
@@ -1712,6 +1995,15 @@ function formatRegimeTransitionLine(riskSeries, idx) {
     const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
     const combo = formatSignedPercent(riskSeries.comboMomentum?.[idx]);
     extras = `, Guard=${guard}, Absorption=${mm}, Combo=${combo}`;
+  } else if (state.riskMode === 'ffl') {
+    const flux = formatNumberOrNA(riskSeries.fflFlux?.[idx]);
+    const fint = formatNumberOrNA(riskSeries.fluxIntensity?.[idx]);
+    const far = formatNumberOrNA(riskSeries.far?.[idx]);
+    const guard = formatNumberOrNA(riskSeries.guard?.[idx]);
+    const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
+    const combo = formatSignedPercent(riskSeries.comboMomentum?.[idx]);
+    const breadth = formatPercentOrNA(riskSeries.breadth?.[idx]);
+    extras = `, J_norm=${flux}, FINT=${fint}, FAR=${far}, Guard=${guard}, Absorption=${mm}, Combo=${combo}, Breadth=${breadth}`;
   }
   return `- ${riskSeries.dates[idx]} · ${label} (Score=${scoreValue}, Corr=${corrValue}, Safe-NEG=${safeValue}${extras})`;
 }
@@ -1962,16 +2254,18 @@ function renderGauge() {
   const averageLabel = averageWindowSize > 0 ? `최근 ${averageWindowSize}일 평균` : '평균';
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
-  // Regime summary (Classic/Enhanced)
+  // Regime summary (Classic/Enhanced/FFL)
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(state.metrics[state.window], filteredRecords)
-    : computeRiskSeriesClassic(state.metrics[state.window], filteredRecords);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(state.metrics[state.window], filteredRecords)
+      : computeRiskSeriesClassic(state.metrics[state.window], filteredRecords);
   if (riskSeries && riskSeries.score.length > 0) {
     const idx = riskSeries.score.length - 1;
     const rState = riskSeries.state[idx];
     const rLabel = rState > 0 ? 'Risk-On' : rState < 0 ? 'Risk-Off' : 'Neutral';
     const rScore = safeNumber(riskSeries.score[idx]).toFixed(3);
-    const modeLabel = state.riskMode === 'enhanced' ? 'Enhanced' : 'Classic';
+    const modeLabel = state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : 'Classic';
     const summary = `${modeLabel} 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
     setGaugePanelFeedback(summary);
   }
@@ -2022,6 +2316,13 @@ function renderSubGauges() {
     { key: 'traditional', element: 'traditional-gauge' },
     { key: 'safeNegative', element: 'safe-neg-gauge' },
   ];
+  const extraFFL = state.riskMode === 'ffl'
+    ? [
+        { keyFrom: 'fflFlux', element: 'ffl-flux-gauge', min: -1, max: 1, formatter: (v) => safeNumber(v).toFixed(3) },
+        { keyFrom: 'fluxIntensity', element: 'ffl-fint-gauge', min: 0, max: 2, formatter: (v) => safeNumber(v).toFixed(3) },
+        { keyFrom: 'far', element: 'ffl-far-gauge', min: 0, max: 5, formatter: (v) => safeNumber(v).toFixed(3) },
+      ]
+    : [];
 
   mapping.forEach(({ key, element }) => {
     const container = document.getElementById(element);
@@ -2068,6 +2369,63 @@ function renderSubGauges() {
       }],
     });
   });
+
+  if (extraFFL.length === 0) {
+    return;
+  }
+
+  const fflSeries = empty ? null : computeRiskSeriesFFL(metrics, filteredRecords);
+
+  extraFFL.forEach(({ keyFrom, element, min, max, formatter }) => {
+    const container = document.getElementById(element);
+    if (!container) return;
+    const chart = charts[element] || echarts.init(container);
+    charts[element] = chart;
+
+    if (empty || !fflSeries || !Array.isArray(fflSeries[keyFrom]) || fflSeries[keyFrom].length === 0) {
+      chart.clear();
+      return;
+    }
+
+    const latestIndex = fflSeries[keyFrom].length - 1;
+    const rawValue = fflSeries[keyFrom][latestIndex];
+    if (!Number.isFinite(rawValue)) {
+      chart.clear();
+      return;
+    }
+
+    chart.setOption({
+      series: [{
+        type: 'gauge',
+        startAngle: 210,
+        endAngle: -30,
+        min,
+        max,
+        splitNumber: 10,
+        axisLine: {
+          lineStyle: {
+            width: 16,
+            color: [
+              [0.5, '#f87171'],
+              [0.75, '#facc15'],
+              [1, '#4ade80'],
+            ],
+          },
+        },
+        pointer: {
+          length: '65%',
+          width: 4,
+        },
+        detail: {
+          formatter: (value) => (typeof formatter === 'function' ? formatter(value) : safeNumber(value).toFixed(3)),
+          fontSize: 14,
+          color: TEXT_PRIMARY,
+          offsetCenter: [0, '60%'],
+        },
+        data: [{ value: rawValue }],
+      }],
+    });
+  });
 }
 
 function renderHistory() {
@@ -2081,7 +2439,9 @@ function renderHistory() {
   const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, series)
-    : computeRiskSeriesClassic(metrics, series);
+    : state.riskMode === 'ffl'
+      ? computeRiskSeriesFFL(metrics, series)
+      : computeRiskSeriesClassic(metrics, series);
   let markAreas = [];
   if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
     const segments = computeRegimeSegments(riskSeries.dates, riskSeries.state) || [];
