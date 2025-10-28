@@ -976,6 +976,8 @@ function renderRisk() {
             const fluxVal = series.fflFlux?.[idx];
             const fintVal = series.fluxIntensity?.[idx];
             const farVal = series.far?.[idx];
+            const rbVal = series.riskBetaFlux?.[idx];
+            const fullZ = series.fullFluxZ?.[idx];
             const mm = series.mm?.[idx];
             const guardVal = series.guard?.[idx];
             const combo = series.comboMomentum?.[idx];
@@ -983,6 +985,8 @@ function renderRisk() {
             if (Number.isFinite(fluxVal)) parts.push(`J_norm ${fluxVal.toFixed(3)}`);
             if (Number.isFinite(fintVal)) parts.push(`FINT ${fintVal.toFixed(3)}`);
             if (Number.isFinite(farVal)) parts.push(`FAR ${farVal.toFixed(3)}`);
+            if (Number.isFinite(rbVal)) parts.push(`RB_Flux ${rbVal.toFixed(3)}`);
+            if (Number.isFinite(fullZ)) parts.push(`ΔCorr-Z ${fullZ.toFixed(3)}`);
             if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
             if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
             if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
@@ -1494,6 +1498,13 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   }
 
   const stateArr = new Array(length).fill(0);
+  let prevState = 0;
+  let holdDays = 0;
+  let onCand = 0;
+  let offCand = 0;
+  // Track guard-only exit sequences to require confirmation in high-correlation bursts
+  let offGuardSeq = 0;
+  const confirmOnDays = 2; // require 2-day confirmation to flip into On
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0;
     const scoreVal = score[i] ?? 0.5;
@@ -1508,24 +1519,65 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const guardHard = 0.98;
       const breadthGate = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.6);
       // 메인 On: 위험↔안전 플럭스 양(+) + 가드 양호 + 폭 확보
-      const onClassicMain = fluxVal >= dynOnFlux && guardValue < guardSoft && mmValue < th.mmOff && breadthGate;
+      // mm 높을수록 On 문턱 상향(고상관 구간에서 보수화)
+      const dynOnAdj = dynOnFlux + (mmValue >= 0.94 ? 0.05 : mmValue >= 0.90 ? 0.03 : 0);
+      const onClassicMain = fluxVal >= dynOnAdj && guardValue < guardSoft && mmValue < th.mmOff && breadthGate;
       // 보조 On: 위험군 내부 베타 플럭스가 양(+)이고 Combo 모멘텀이 양(+)일 때(2023 저상관 상승 대응)
       const onClassicAlt = (Number.isFinite(jRiskBeta[i]) && jRiskBeta[i] >= 0.06) &&
         (Number.isFinite(comboValue) && comboValue >= 0.10) &&
         guardValue < 0.90;
       const onClassic = onClassicMain || onClassicAlt;
-      const offClassic = fluxVal <= dynOffFlux ||
-        guardValue >= guardHard ||
-        mmValue >= th.mmOff;
-      if (onClassic) {
-        stateArr[i] = 1;
-        fragile[i] = guardValue >= th.mmFragile || (guardValue >= guardSoft && guardValue < guardHard);
-      } else if (offClassic) {
-        stateArr[i] = -1;
+      const offFlux = fluxVal <= dynOffFlux;
+      const offGuard = (guardValue >= guardHard) || (mmValue >= th.mmOff);
+      // Guard-only exit detection (no flux break)
+      const guardOnly = offGuard && !offFlux;
+      // Trend support in high-correlation: mild positive flux/breadth & non-negative combo
+      const breadthGateLoosen = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.5);
+      const trendSupport = (fluxVal >= (dynOnFlux - 0.03)) && breadthGateLoosen && (Number.isFinite(comboValue) ? comboValue >= 0 : true);
+      const hiCorr = mmValue >= 0.92;
+      // Require confirmation for guard-only exits; extend to 3 days when hiCorr + trend support
+      const guardConfirmDays = (hiCorr && trendSupport) ? 3 : 2;
+      if (guardOnly) {
+        offGuardSeq += 1;
       } else {
-        stateArr[i] = 0;
-        fragile[i] = guardValue >= guardSoft && fluxVal >= 0;
+        offGuardSeq = 0;
       }
+      const offGuardConfirmed = guardOnly && offGuardSeq >= guardConfirmDays;
+      const offClassic = offFlux || offGuardConfirmed;
+      // PC1 방향(위험군 평균 3일 수익) 음수 & mm 높음이면 On 차단(고상관 하락 방지)
+      const risk3 = (() => {
+        const idxPrice = baseIdx + i + windowOffset;
+        const rList = CLUSTERS.risk.map((sym) => rollingReturnFromSeries(prices[sym], idxPrice, 3)).filter(Number.isFinite);
+        return rList.length ? rList.reduce((a, b) => a + b, 0) / rList.length : null;
+      })();
+      const blockOnHighCorrDown = Number.isFinite(risk3) && risk3 <= 0 && mmValue >= 0.90;
+
+      // 원시 판정으로 후보 카운트
+      const rawOn = onClassic && !blockOnHighCorrDown;
+      const rawOff = offClassic;
+      onCand = rawOn ? onCand + 1 : 0;
+      offCand = rawOff ? offCand + 1 : 0;
+
+      // Sticky 로직: 중립보다 On/Off 지속을 우선, 전환은 확인일수 요구
+      let decided = prevState;
+      if (prevState === 1) {
+        // On 유지. Flux 급락(offFlux)엔 즉시 Off, guard-only는 확인일수 반영
+        if (rawOff) decided = -1; else decided = 1;
+      } else if (prevState === -1) {
+        // Off 유지, On은 2일 연속 확인
+        if (onCand >= confirmOnDays) decided = 1;
+        else decided = -1;
+      } else {
+        // Neutral에서는 Off가 우선, 아니면 On 2일 확인
+        if (offCand >= 1) decided = -1;
+        else if (onCand >= confirmOnDays) decided = 1;
+        else decided = 0;
+      }
+
+      stateArr[i] = decided;
+      fragile[i] = decided >= 0 && (guardValue >= th.mmFragile || (guardValue >= guardSoft && guardValue < guardHard));
+      holdDays = decided === prevState ? holdDays + 1 : 0;
+      prevState = decided;
     } else {
       const on = scoreVal >= dynScoreOn &&
         fluxVal >= dynOnFlux &&
@@ -1921,7 +1973,8 @@ function buildMethodologySection() {
     '- 하위 지수: (a) 주식-암호화폐(+) = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산(+) = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG(-) = max(0, -corr(주식, TLT/GLD)) 평균.',
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
-    '- FFL Mode = Safe↔Risk 클러스터 플럭스(J_norm)와 Flux Intensity·FAR·Guard를 결합한 레짐입니다. J_norm ≥ 0.10 & Score ≥ 0.60 등 필터를 통과해야 Risk-On이 유지되며 Absorption ≥ 0.96 또는 Guard ≥ 1.00이면 강제 Off가 발생합니다.',
+    '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다. 동작: (1) On은 흡수비(mm)가 높을수록 J_norm 문턱을 상향(동적)하고 Guard < 0.95 및 폭 조건을 만족하거나, 위험군 베타 플럭스(RB_Flux) ≥ 0.06 & Combo ≥ +0.10일 때 대안 경로로 통과합니다. (2) Off는 J_norm ≤ 동적 Off 문턱 또는 Absorption ≥ mmOff(기본 0.98)에서 발생하되, Guard/Absorption만으로 생기는 Off는 2일(고상관·상승 환경은 3일) 연속 확인 후 확정합니다.',
+    '- 기본 동작은 Classic이며 사용자가 명시적으로 변경한 경우에만 Enhanced/FFL이 적용됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
   ];
@@ -1979,7 +2032,7 @@ function buildRiskScoreSection(riskSeries) {
   const headers = isEnhanced
     ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'Guard', 'Absorption', 'Combo(10일)', 'Breadth(5일)']
     : isFFL
-      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
+      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'RB_Flux', 'ΔCorr-Z', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
       : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
 
   const rows = riskSeries.dates.map((date, idx) => {
@@ -2007,6 +2060,8 @@ function buildRiskScoreSection(riskSeries) {
         formatNumberOrNA(riskSeries.fflFlux?.[idx]),
         formatNumberOrNA(riskSeries.fluxIntensity?.[idx]),
         formatNumberOrNA(riskSeries.far?.[idx]),
+        formatNumberOrNA(riskSeries.riskBetaFlux?.[idx]),
+        formatNumberOrNA(riskSeries.fullFluxZ?.[idx]),
         formatNumberOrNA(riskSeries.guard?.[idx]),
         formatNumberOrNA(riskSeries.mm?.[idx]),
         formatSignedPercent(riskSeries.comboMomentum?.[idx]),

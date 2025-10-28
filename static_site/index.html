@@ -76,6 +76,17 @@
           <div id="risk-timeline" class="chart risk-timeline"></div>
         </div>
       </div>
+      <!-- FFL extra gauges (only populated when risk-mode=ffl) -->
+      <div class="sub-gauges">
+        <div class="sub-gauge">
+          <h3>FFL 플럭스 (J_norm)</h3>
+          <div id="ffl-flux-gauge" class="chart"></div>
+        </div>
+        <div class="sub-gauge">
+          <h3>FFL 강도 (FINT)</h3>
+          <div id="ffl-fint-gauge" class="chart"></div>
+        </div>
+      </div>
     </section>
     <section class="panel" id="gauge-panel">
       <div class="panel-header">
@@ -209,6 +220,9 @@
     </p>
     <p>
       Enhanced: Classic 점수에 10일 공동 모멘텀, IWM·SPY·BTC 5일 리스크 폭, 흡수비/안정성 기반 guardScore를 더해 “확신된” On만 통과시킵니다. blended ≥ 0.60, corr ≥ 0.33, momentum ≥ 0.35, guard &lt; 0.9, combo > −0.5%를 동시에 만족해야 합니다.
+    </p>
+    <p>
+      FFL(Classic+Flux): Safe↔Risk 플럭스(J_norm)·FINT·FAR·Guard를 Classic 위에 얹은 변형입니다. On은 mm(흡수비) 수준에 따라 J_norm 문턱을 상향 적용하고(고상관일수록 보수화) Guard &lt; 0.95 및 폭 조건을 만족하거나, RB_Flux ≥ 0.06 &amp; Combo ≥ +0.10이면 대안 경로로 허용합니다. Off는 J_norm이 동적 Off 문턱 이하이거나 Absorption ≥ 0.98일 때이며, Guard/Absorption만으로 발생하는 Off는 2일(고상관·상승 환경은 3일) 연속 확인 후 확정합니다. 기본 모드는 Classic입니다.
     </p>
     <p>
       활용 팁: <strong>강력 Risk-On</strong>은 (1) corr ≥ 0.5, (2) comboMomentum ≥ +1.5%, (3) guard < 0.7이 동시에 잡힐 때이며 2025-10-24가 대표 사례입니다. 스태빌리티·상관이 높아도 guard ≥ 0.9 또는 combo ≤ 0%라면 “안정된 하락”으로 보고 On 진입을 유보하세요.
