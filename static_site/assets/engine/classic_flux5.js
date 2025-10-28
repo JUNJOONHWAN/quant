@@ -40,7 +40,7 @@
     return 1.0;
   }
 
-  function computeClassicFlux5({ aligned, returns, window = 30, symbols, categories, prices, pairGroups }) {
+  function computeClassicFlux5({ aligned, returns, window = 30, symbols, categories, prices, pairGroups, params = {} }) {
     const dates = returns.dates;
     const n = dates.length;
     const priceOffset = window - 1;
@@ -48,6 +48,12 @@
     const out = {
       dates: [],
       flux5: [],
+      jnorm: [],
+      diff: [],
+      fluxSlope: [],
+      mmDelta: [],
+      downAll: [],
+      vAll: [],
       pcon: [],
       mm: [],
       scCorr: [],
@@ -74,6 +80,7 @@
 
     const cap = symbols.length;
 
+    let prevJ = null; let prevMM = null;
     for (let end = window - 1; end < n; end += 1) {
       const start = end - window + 1;
       const full = MM.buildCorrelationMatrix(symbols, returns.returns, start, end);
@@ -99,8 +106,16 @@
       const priceIndex = priceOffset + end;
       const z = {}; symbols.forEach((s) => { z[s] = zMomentum(prices[s], priceIndex, 10, 20, 2.0); });
 
+      // common down ratio across 5 signals
+      const sigs = pairGroups.risk.concat(pairGroups.safe);
+      const zAll = sigs.map((s) => z[s]).filter((v) => Number.isFinite(v));
+      const downAll = zAll.length ? zAll.filter((v) => v < 0).length / zAll.length : 0;
+      const vAll = zAll.length ? zAll.reduce((a,b)=>a+b,0)/zAll.length : 0;
+
       // 10-pair flux (Fick-like)
       let wAll = 0; let apdf = 0; let pconSum = 0; let pconW = 0;
+      // cross-only Jbar for Diff/Jnorm
+      let wCross = 0; let jbar = 0;
       const add = (a, b, mode) => {
         const i = idx.get(a); const j = idx.get(b); if (i == null || j == null) return;
         const c = signalMatrix[Math.min(i,j)][Math.max(i,j)] || 0; const w = Math.pow(Math.abs(c), 1.5);
@@ -110,37 +125,91 @@
         else if (mode === 'risk') { apdf += w * (0.5 * (za + zb)); pconSum += w * ((za > 0 && zb > 0) ? 1 : 0); }
         else if (mode === 'safe') { apdf += w * (-0.5 * (za + zb)); pconSum += w * ((za <= 0 && zb <= 0) ? 1 : 0); }
         pconW += w;
+        if (mode === 'cross') { jbar += w * (zb - za); wCross += w; }
       };
       crossPairs.forEach(([a,b]) => add(a,b,'cross'));
       riskPairs.forEach(([a,b]) => add(a,b,'risk'));
       safePairs.forEach(([a,b]) => add(a,b,'safe'));
       const APDF = wAll>0 ? Math.tanh((apdf/wAll)/0.25) : 0; // normalize
+      const JNORM = wCross>0 ? Math.tanh((jbar/wCross)/0.25) : 0;
+      const mmDelta = (prevMM!=null && Number.isFinite(mm)) ? (mm - prevMM) : 0;
+      const fluxSlope = (prevJ!=null && Number.isFinite(JNORM)) ? (JNORM - prevJ) : 0;
+      const Diff = JNORM - 0.50*Math.max(0, mmDelta) - 0.15*Math.max(0, -fluxSlope);
+      prevMM = mm; prevJ = JNORM;
       const PCON = pconW>0 ? Math.max(0, Math.min(1, pconSum/pconW)) : 0;
 
-      out.dates.push(recordDate); out.mm.push(mm); out.scCorr.push(scCorr); out.safeNeg.push(safeNeg); out.flux5.push(APDF); out.pcon.push(PCON);
+      out.dates.push(recordDate);
+      out.mm.push(mm);
+      out.scCorr.push(scCorr);
+      out.safeNeg.push(safeNeg);
+      out.flux5.push(APDF);
+      out.pcon.push(PCON);
+      out.jnorm.push(JNORM);
+      out.mmDelta.push(mmDelta);
+      out.fluxSlope.push(fluxSlope);
+      out.diff.push(Diff);
+      out.downAll.push(downAll);
+      out.vAll.push(vAll);
     }
 
-    // Classic baseline + Flux5 gating (minimal)
-    const thresholds = { jOn: +0.10, jOff: -0.08, pconOn: 0.55, pconOff: 0.40, mmOff: 0.96 };
-    const state = []; let prev = 0; let onC = 0; let offC = 0;
+    // Classic baseline + Flux5 + Drift/Corr-Lock gating
+    const thresholds = Object.assign({ jOn: +0.10, jOff: -0.08, pconOn: 0.55, pconOff: 0.40, mmOff: 0.96, mmHi: 0.90, downAll: 0.60, corrConeDays: 5, driftMinDays: 3, driftCool: 2, vOn: +0.05, vOff: -0.05, offMinDays: 3 }, params);
+    const state = []; let prev = 0; let onC = 0; let offC = 0; let offStreak = 0; let reentryArmed = false;
+    // drift epoch
+    let driftSeq = 0; let driftCool = 0; let inDrift = false; let driftEpochs = 0; let driftDays = 0; let offFromDriftDays = 0; let suppressed = 0;
+    // corr-cone lock (short Off window)
+    let coneLock = 0;
     for (let i = 0; i < out.dates.length; i += 1) {
       const flux = out.flux5[i] ?? 0; const mm = out.mm[i] ?? 0; const sc = out.scCorr[i] ?? 0; const safeN = out.safeNeg[i] ?? 0; const pcon = out.pcon[i] ?? 0;
+      const jn = out.jnorm[i] ?? 0; const diff = out.diff[i] ?? 0; const down = out.downAll[i] ?? 0; const vAll = out.vAll[i] ?? 0;
       // Classic score
       const score = 0.70 * Math.max(0, sc) + 0.30 * safeN; out.score.push(score);
-      const onMain = (flux >= thresholds.jOn) && (pcon >= thresholds.pconOn) && (mm < thresholds.mmOff);
-      const offMain = (flux <= thresholds.jOff) || (pcon <= thresholds.pconOff) || (mm >= thresholds.mmOff);
+      // Drift update
+      const bench20 = (() => {
+        const series = returns.priceSeries['QQQ']; const idx = (window - 1) + i; if (!Array.isArray(series) || idx - 20 < 0) return null; const a = series[idx - 20]; const b = series[idx]; if (!Number.isFinite(a)||!Number.isFinite(b)||a===0) return null; return b/a - 1;
+      })();
+      const driftNow = ((down >= thresholds.downAll) && (jn <= 0)) || ((mm >= thresholds.mmHi) && (Number.isFinite(bench20) ? bench20 <= 0 : true));
+      if (driftNow) { driftSeq += 1; driftCool = 0; } else { driftSeq = 0; driftCool += 1; }
+      if (!inDrift && driftSeq >= thresholds.driftMinDays) { inDrift = true; driftEpochs += 1; }
+      if (inDrift && driftCool >= thresholds.driftCool) { inDrift = false; }
+      if (inDrift) driftDays += 1;
+
+      // CorrCone lock trigger (BTC–주식↑ & 주채권 동행 & 흡수 높음)
+      const coneNow = (Number.isFinite(sc) ? sc >= 0.50 : false) && (()=>{
+        const iSPY = symbols.indexOf('SPY'); const iTLT = symbols.indexOf('TLT'); if (iSPY<0||iTLT<0) return false; const c = aligned ? null : null; return true; })();
+      // compute corr(SPY,TLT) from rolling window
+      let corrST = null;
+      try {
+        const iSPY = symbols.indexOf('SPY'); const iTLT = symbols.indexOf('TLT');
+        if (iSPY>=0 && iTLT>=0) {
+          const m = MM.buildCorrelationMatrix([symbols[iSPY], symbols[iTLT]], returns.returns, (window - 1) + i - (window - 1), (window - 1) + i);
+          corrST = m[0][1];
+        }
+      } catch (e) { corrST = null; }
+      const coneTrigger = (Number.isFinite(sc) && sc >= 0.50) && (Number.isFinite(corrST) ? corrST >= -0.10 : false) && (mm >= thresholds.mmHi);
+      if (coneTrigger) coneLock = thresholds.corrConeDays;
+      if (coneLock > 0) coneLock -= 1;
+
+      // reentry one-shot stronger threshold right after drift epoch
+      if (!inDrift && driftSeq === 0 && driftCool === 1) reentryArmed = true;
+      const reentryBonus = reentryArmed ? 0.05 : 0;
+      const onMain = (diff >= (thresholds.jOn + reentryBonus)) && (pcon >= thresholds.pconOn) && (mm < thresholds.mmOff) && (vAll >= thresholds.vOn) && (!inDrift) && (coneLock === 0) && (offStreak >= thresholds.offMinDays);
+      const offMain = (diff <= thresholds.jOff) || (pcon <= thresholds.pconOff) || (mm >= thresholds.mmOff) || (vAll <= thresholds.vOff) || inDrift || (coneLock > 0) || ((mm >= thresholds.mmHi) && (vAll <= 0));
       const rawOn = onMain; const rawOff = offMain;
       onC = rawOn ? onC + 1 : 0; offC = rawOff ? offC + 1 : 0;
-      let s = prev;
+      let s = prev; const before = s;
       if (prev === 1) { s = rawOff ? -1 : 1; }
       else if (prev === -1) { s = onC >= 2 ? 1 : -1; }
       else { s = rawOff ? -1 : onC >= 2 ? 1 : 0; }
+      if (inDrift) { if (before !== -1 && s !== -1) suppressed += 1; s = -1; offFromDriftDays += 1; }
+      if (s === -1) { offStreak += 1; } else { offStreak = 0; }
+      if (s === 1 && reentryArmed) reentryArmed = false;
       state.push(s); prev = s;
     }
     out.state = state; out.executedState = state.map((v, i) => i===0?0:state[i-1]||0);
+    out.diagnostics.drift = { epochs: driftEpochs, days: driftDays, offFromDriftDays, suppressed };
     return out;
   }
 
   return { computeClassicFlux5 };
 });
-
