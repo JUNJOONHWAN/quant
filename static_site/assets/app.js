@@ -1588,6 +1588,12 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   // Track guard-only exit sequences to require confirmation in high-correlation bursts
   let offGuardSeq = 0;
   // 기본 확인일은 2일이지만, 확산/흡수 상황에 따라 동적으로 조정
+  // Drift epoch tracking
+  const DRIFT_MIN_DAYS = 5;
+  const DRIFT_COOLDOWN_DAYS = 2;
+  let driftSeq = 0;
+  let driftCooldown = 0;
+  let inDriftEpoch = false;
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0;
     const diffVal = diffusionScore[i] ?? fluxVal;
@@ -1618,6 +1624,11 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       // Drift-Lock(간단): 5자산 중 60% 이상이 하락(z<0)이고 J_norm<=0 이면 드리프트
       const hiCorrDrift = ((Number.isFinite(coDownAll[i]) ? coDownAll[i] >= 0.60 : false) && ((fluxVal ?? 0) <= 0)) ||
         ((mmValue >= 0.90) && (Number.isFinite(bench20) ? bench20 <= 0 : true));
+      // Drift epoch update
+      if (hiCorrDrift) { driftSeq += 1; driftCooldown = 0; }
+      else { driftSeq = 0; driftCooldown += 1; }
+      if (driftSeq >= DRIFT_MIN_DAYS) inDriftEpoch = true;
+      if (inDriftEpoch && driftCooldown >= DRIFT_COOLDOWN_DAYS) inDriftEpoch = false;
       const stricter = !hiCorrBear || (
         (diffVal >= (dynOnAdj + 0.05)) && (Number.isFinite(pcon[i]) ? pcon[i] >= 0.65 : true) && (Number.isFinite(apdf[i]) ? apdf[i] >= 0 : true) && (Number.isFinite(comboValue) ? comboValue >= 0.10 : true)
       );
@@ -1684,6 +1695,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         else decided = 0;
       }
 
+      // Long drift makes entire regime Off
+      if (inDriftEpoch) decided = -1;
       stateArr[i] = decided;
       fragile[i] = decided >= 0 && (guardValue >= th.mmFragile || (guardValue >= guardSoft && guardValue < guardHard));
       holdDays = decided === prevState ? holdDays + 1 : 0;
