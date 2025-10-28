@@ -855,7 +855,7 @@ const RISK_CFG_FFL = {
     mmFragile: 0.88,
     mmOff: 0.96,
   },
-  variant: 'enhanced', // swap to 'classic' for Classic-FFL
+  variant: 'classic', // default: Classic-FFL with enhanced guard; set to 'enhanced' for stricter gating
 };
 const RISK_CFG_CLASSIC = {
   // original corr-heavy classic with stronger safe-neg weighting
@@ -1356,12 +1356,16 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const guard = new Array(length).fill(null);
   const score = new Array(length).fill(null);
   const jFlux = new Array(length).fill(null);
+  const jRiskBeta = new Array(length).fill(null);
+  const fullFlux = new Array(length).fill(null);
+  const fullFluxZ = new Array(length).fill(null);
   const fluxRaw = new Array(length).fill(null);
   const fluxIntensity = new Array(length).fill(null);
   const comboMomentum = new Array(length).fill(null);
   const breadth = new Array(length).fill(null);
   const fragile = new Array(length).fill(false);
   const far = new Array(length).fill(null);
+  let prevMatrix = null;
 
   for (let i = 0; i < length; i += 1) {
     const record = allRecords[baseIdx + i];
@@ -1410,6 +1414,35 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     fluxRaw[i] = weightSum > 0 ? Jbar : null;
     fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
 
+    // Risk-beta 방향성 플럭스: 위험군 내부 Δcorr의 방향성(모멘텀 합) 반영
+    let rbW = 0; let rbSum = 0;
+    if (Array.isArray(prevMatrix)) {
+      CLUSTERS.risk.forEach((a, ai) => {
+        const ia = SIGNAL.symbols.indexOf(a);
+        CLUSTERS.risk.forEach((b, bi) => {
+          if (bi <= ai) return;
+          const ib = SIGNAL.symbols.indexOf(b);
+          const curr = Array.isArray(matrix?.[ia]) ? matrix[ia][ib] : null;
+          const prev = Array.isArray(prevMatrix?.[ia]) ? prevMatrix[ia][ib] : null;
+          if (!Number.isFinite(curr) || !Number.isFinite(prev)) return;
+          const delta = curr - prev;
+          const w = Math.pow(Math.abs(curr), RISK_CFG_FFL.p);
+          const dir = Math.sign((zr[a] ?? 0) + (zr[b] ?? 0));
+          rbW += w;
+          rbSum += w * delta * dir;
+        });
+      });
+    }
+    const rbBar = rbW > 0 ? rbSum / rbW : 0;
+    jRiskBeta[i] = Math.tanh(rbBar / (RISK_CFG_FFL.lambda || 0.25));
+
+    // Full-matrix ΔCorr 기반 Flux-Guard(Z)
+    const fraw = frobeniusDiff(matrix, prevMatrix);
+    prevMatrix = matrix;
+    fullFlux[i] = Number.isFinite(fraw) ? fraw : null;
+    const z = rollingZScore(fullFlux, i, Math.min(63, Math.max(15, Math.floor(length / 4))));
+    fullFluxZ[i] = Number.isFinite(z) ? z : null;
+
     const riskZValues = CLUSTERS.risk
       .map((symbol) => zr[symbol])
       .filter((value) => Number.isFinite(value));
@@ -1423,25 +1456,39 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const safePen = normalizeRangeSafe(safeNeg[i], 0.35, 0.60);
     const mmPen = normalizeRangeSafe(mm[i], 0.85, 0.97);
     const deltaPen = normalizeRangeSafe(Math.max(0, -(record?.delta ?? 0)), 0.015, 0.05);
-    const guardVal = 0.5 * mmPen + 0.2 * safePen + 0.3 * deltaPen;
+    const fluxGuard = Number.isFinite(fullFluxZ[i]) ? sigmoid(fullFluxZ[i], 0.85) : 1;
+    const guardVal = 0.4 * mmPen + 0.2 * safePen + 0.2 * deltaPen + 0.2 * fluxGuard;
     guard[i] = Number.isFinite(guardVal) ? Number(guardVal.toFixed(6)) : null;
 
-    const sFFL = jFlux[i] == null ? null : 0.5 * (1 + jFlux[i]);
-    score[i] = Number.isFinite(sFFL) ? Number(sFFL.toFixed(6)) : null;
+    const fluxScore = jFlux[i] == null ? null : 0.5 * (1 + jFlux[i]);
+    const comboNorm = comboMomentum[i] == null ? null : clamp01(((comboMomentum[i] ?? 0) + 1) / 2);
+    const breadthNorm = breadth[i] == null ? null : clamp01(breadth[i] ?? 0);
+    const guardRelief = guardVal == null ? null : clamp01(1 - guardVal);
+    const components = [];
+    if (Number.isFinite(fluxScore)) components.push({ weight: 0.5, value: fluxScore });
+    if (Number.isFinite(comboNorm)) components.push({ weight: 0.2, value: comboNorm });
+    if (Number.isFinite(breadthNorm)) components.push({ weight: 0.2, value: breadthNorm });
+    if (Number.isFinite(guardRelief)) components.push({ weight: 0.1, value: guardRelief });
+    const totalWeight = components.reduce((acc, item) => acc + item.weight, 0);
+    const aggregated = totalWeight > 0
+      ? components.reduce((acc, item) => acc + item.weight * item.value, 0) / totalWeight
+      : (Number.isFinite(fluxScore) ? fluxScore : 0.5);
+    score[i] = Number(aggregated.toFixed(6));
   }
 
   const th = RISK_CFG_FFL.thresholds;
+  const variant = RISK_CFG_FFL.variant;
   const validFlux = jFlux.filter((value) => Number.isFinite(value));
   const validScore = score.filter((value) => Number.isFinite(value));
   let dynOnFlux = th.jOn;
   let dynOffFlux = th.jOff;
   let dynScoreOn = th.scoreOn;
   let dynScoreOff = th.scoreOff;
-  if (validFlux.length >= 50) {
+  if (variant !== 'classic' && validFlux.length >= 50) {
     dynOnFlux = Math.max(th.jOn, quantile(validFlux, 0.75));
     dynOffFlux = Math.min(th.jOff, quantile(validFlux, 0.25));
   }
-  if (validScore.length >= 50) {
+  if (variant !== 'classic' && validScore.length >= 50) {
     dynScoreOn = Math.max(th.scoreOn, quantile(validScore, 0.75));
     dynScoreOff = Math.min(th.scoreOff, quantile(validScore, 0.25));
   }
@@ -1455,15 +1502,29 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const breadthValue = breadth[i] ?? null;
     const guardVal = guard[i] ?? 1;
 
-    if (RISK_CFG_FFL.variant === 'classic') {
-      if (fluxVal >= dynOnFlux && mmValue < th.mmOff) {
+    if (variant === 'classic') {
+      const guardValue = Number.isFinite(guardVal) ? guardVal : 1;
+      const guardSoft = 0.95;
+      const guardHard = 0.98;
+      const breadthGate = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.6);
+      // 메인 On: 위험↔안전 플럭스 양(+) + 가드 양호 + 폭 확보
+      const onClassicMain = fluxVal >= dynOnFlux && guardValue < guardSoft && mmValue < th.mmOff && breadthGate;
+      // 보조 On: 위험군 내부 베타 플럭스가 양(+)이고 Combo 모멘텀이 양(+)일 때(2023 저상관 상승 대응)
+      const onClassicAlt = (Number.isFinite(jRiskBeta[i]) && jRiskBeta[i] >= 0.06) &&
+        (Number.isFinite(comboValue) && comboValue >= 0.10) &&
+        guardValue < 0.90;
+      const onClassic = onClassicMain || onClassicAlt;
+      const offClassic = fluxVal <= dynOffFlux ||
+        guardValue >= guardHard ||
+        mmValue >= th.mmOff;
+      if (onClassic) {
         stateArr[i] = 1;
-        fragile[i] = mmValue >= th.mmFragile;
-      } else if (fluxVal <= dynOffFlux || mmValue >= th.mmOff) {
+        fragile[i] = guardValue >= th.mmFragile || (guardValue >= guardSoft && guardValue < guardHard);
+      } else if (offClassic) {
         stateArr[i] = -1;
       } else {
         stateArr[i] = 0;
-        fragile[i] = mmValue >= th.mmFragile;
+        fragile[i] = guardValue >= guardSoft && fluxVal >= 0;
       }
     } else {
       const on = scoreVal >= dynScoreOn &&
@@ -1496,6 +1557,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const diagnostics = {
     fluxThresholds: { on: dynOnFlux, off: dynOffFlux },
     scoreThresholds: { on: dynScoreOn, off: dynScoreOff },
+    scoreLatest: score.length > 0 ? score[score.length - 1] ?? null : null,
   };
 
   return {
@@ -1509,6 +1571,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     mm,
     far,
     fflFlux: jFlux,
+    riskBetaFlux: jRiskBeta,
+    fullFlux,
+    fullFluxZ,
     fluxRaw,
     fluxIntensity,
     comboMomentum,
@@ -1625,6 +1690,60 @@ function quantile(values, q) {
   if (lower === upper) return sorted[lower];
   const weight = pos - lower;
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+}
+
+// --- New math helpers for full-matrix flux guard ---
+function frobeniusDiff(matrix, prevMatrix) {
+  if (!Array.isArray(matrix) || !Array.isArray(prevMatrix)) return null;
+  let sumSq = 0;
+  let count = 0;
+  const n = Math.min(matrix.length, prevMatrix.length);
+  for (let i = 0; i < n; i += 1) {
+    const row = matrix[i];
+    const prow = prevMatrix[i];
+    if (!Array.isArray(row) || !Array.isArray(prow)) continue; // eslint-disable-line no-continue
+    const m = Math.min(row.length, prow.length);
+    for (let j = 0; j < m; j += 1) {
+      const a = Number(row[j]);
+      const b = Number(prow[j]);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue; // eslint-disable-line no-continue
+      const d = a - b;
+      sumSq += d * d;
+      count += 1;
+    }
+  }
+  if (count === 0) return null;
+  return Math.sqrt(sumSq / count);
+}
+
+function rollingMeanVariance(arr, index, lookback) {
+  if (!Array.isArray(arr) || !Number.isInteger(index) || index < 0) return null;
+  if (!Number.isInteger(lookback) || lookback <= 1) return null;
+  const start = Math.max(0, index - lookback + 1);
+  const window = [];
+  for (let i = start; i <= index; i += 1) {
+    const v = Number(arr[i]);
+    if (Number.isFinite(v)) window.push(v);
+  }
+  if (window.length < 2) return null;
+  const mean = window.reduce((a, b) => a + b, 0) / window.length;
+  const variance = window.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (window.length - 1);
+  return { mean, variance: Math.max(0, variance) };
+}
+
+function rollingZScore(arr, index, lookback) {
+  const stats = rollingMeanVariance(arr, index, lookback);
+  if (!stats) return null;
+  const v = Number(arr[index]);
+  const std = Math.sqrt(stats.variance);
+  if (!Number.isFinite(v) || !Number.isFinite(std) || std === 0) return null;
+  return (v - stats.mean) / std;
+}
+
+function sigmoid(x, slope = 1) {
+  if (!Number.isFinite(x)) return null;
+  const t = Math.max(Math.min(x * slope, 60), -60);
+  return 1 / (1 + Math.exp(-t));
 }
 
 function leveragedReturn(baseReturn, leverage = 3) {
