@@ -856,7 +856,19 @@ const RISK_CFG_FFL = {
     mmOff: 0.96,
     pconOn: 0.55,
     pconOff: 0.40,
+    // Added for diffusion+drift gating
+    mmHi: 0.90,
+    downAll: 0.60,
+    corrConeDays: 5,
+    driftMinDays: 3,
+    driftCool: 2,
+    offMinDays: 2,
+    vOn: +0.05,
+    vOff: -0.05,
+    kOn: 0.60,
   },
+  // Relative-strength lambda for kappa (diffusion vs drift)
+  kLambda: 1.0,
   variant: 'classic', // default: Classic-FFL with enhanced guard; set to 'enhanced' for stricter gating
 };
 const RISK_CFG_CLASSIC = {
@@ -1376,6 +1388,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const mmTrend = new Array(length).fill(null);
   const fluxSlope = new Array(length).fill(null);
   const diffusionScore = new Array(length).fill(null);
+  const vPC1 = new Array(length).fill(null);
+  const kappa = new Array(length).fill(null);
   const apdf = new Array(length).fill(null); // all-pairs directional flux
   const pcon = new Array(length).fill(null); // pairwise consistency [0,1]
   const fluxRaw = new Array(length).fill(null);
@@ -1561,6 +1575,30 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const fsNeg = Number.isFinite(fluxSlope[i]) ? Math.max(0, -fluxSlope[i]) : 0; // 둔화(음수)만 페널티
     const diff = (Number.isFinite(jFlux[i]) ? jFlux[i] : 0) - (k1 * mt) - (k2 * fsNeg);
     diffusionScore[i] = Number.isFinite(diff) ? Number(diff.toFixed(6)) : null;
+
+    // PC1 velocity (market mode) using top eigenvector · z-momentum
+    try {
+      if (Array.isArray(matrix) && matrix.length > 0) {
+        const e1 = topEigenvectorLocal(matrix);
+        if (Array.isArray(e1)) {
+          let num = 0; let den = 0;
+          for (let ei = 0; ei < e1.length; ei += 1) {
+            const sym = SIGNAL.symbols[ei];
+            const zi = Number.isFinite(zr[sym]) ? zr[sym] : 0;
+            num += e1[ei] * zi;
+            den += Math.abs(e1[ei]);
+          }
+          const vproj = den > 0 ? (num / den) : 0;
+          vPC1[i] = Math.tanh(vproj / 0.5);
+        } else {
+          vPC1[i] = null;
+        }
+      } else {
+        vPC1[i] = null;
+      }
+    } catch (e) {
+      vPC1[i] = null;
+    }
   }
 
   const th = RISK_CFG_FFL.thresholds;
@@ -1589,8 +1627,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   let offGuardSeq = 0;
   // 기본 확인일은 2일이지만, 확산/흡수 상황에 따라 동적으로 조정
   // Drift epoch tracking
-  const DRIFT_MIN_DAYS = 5;
-  const DRIFT_COOLDOWN_DAYS = 2;
+  const DRIFT_MIN_DAYS = Number.isFinite(RISK_CFG_FFL.thresholds.driftMinDays) ? RISK_CFG_FFL.thresholds.driftMinDays : 5;
+  const DRIFT_COOLDOWN_DAYS = Number.isFinite(RISK_CFG_FFL.thresholds.driftCool) ? RISK_CFG_FFL.thresholds.driftCool : 2;
   let driftSeq = 0;
   let driftCooldown = 0;
   let inDriftEpoch = false;
@@ -1602,6 +1640,10 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const comboValue = comboMomentum[i] ?? null;
     const breadthValue = breadth[i] ?? null;
     const guardVal = guard[i] ?? 1;
+    const vpc1Val = Number.isFinite(vPC1[i]) ? vPC1[i] : 0;
+    const lam = Number.isFinite(RISK_CFG_FFL.kLambda) ? RISK_CFG_FFL.kLambda : 1.0;
+    const kappaVal = (Math.abs(diffVal)) / (Math.abs(diffVal) + lam * Math.abs(vpc1Val) + 1e-6);
+    kappa[i] = Number.isFinite(kappaVal) ? kappaVal : null;
 
     if (variant === 'classic') {
       const guardValue = Number.isFinite(guardVal) ? guardVal : 1;
@@ -1638,7 +1680,14 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const onClassicAlt = !hiCorrBear && (Number.isFinite(jRiskBeta[i]) && jRiskBeta[i] >= 0.06) &&
         (Number.isFinite(comboValue) && comboValue >= 0.10) &&
         guardValue < 0.90;
-      const onClassic = (onClassicMain || onClassicAlt) && !hiCorrDrift;
+      // Strong-On: diffusion 우세(κ) + PC1 drift 양(+) + 일관성 높음
+      const strongOn = (diffVal >= (dynOnAdj + 0.03))
+        && (Number.isFinite(kappaVal) ? kappaVal >= (RISK_CFG_FFL.thresholds.kOn ?? 0.60) : true)
+        && (Number.isFinite(pcon[i]) ? pcon[i] >= Math.max(0.65, (th.pconOn ?? 0.55)) : true)
+        && (Number.isFinite(vpc1Val) ? vpc1Val >= (th.vOn ?? 0.05) : true)
+        && guardValue < guardSoft
+        && mmValue < th.mmOff;
+      const onClassic = (onClassicMain || onClassicAlt || strongOn) && !hiCorrDrift;
       const offFlux = fluxVal <= dynOffFlux;
       const offGuard = (guardValue >= guardHard) || (mmValue >= th.mmOff);
       // Guard-only exit detection (no flux break)
@@ -1655,7 +1704,10 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         offGuardSeq = 0;
       }
       const offGuardConfirmed = guardOnly && offGuardSeq >= guardConfirmDays;
-      let offClassic = offFlux || offGuardConfirmed || (Number.isFinite(pcon[i]) && pcon[i] <= (th.pconOff ?? 0.40) && mmValue >= 0.92);
+      // Off by relative strength of negative drift or weak diffusion dominance
+      const offByRel = ((Number.isFinite(vpc1Val) ? vpc1Val <= (th.vOff ?? -0.05) : false) && (Math.abs(vpc1Val) >= 0.05))
+        || ((diffVal <= dynOffFlux) && (Number.isFinite(kappaVal) ? kappaVal < 0.55 : false));
+      let offClassic = offByRel || offFlux || offGuardConfirmed || (Number.isFinite(pcon[i]) && pcon[i] <= (th.pconOff ?? 0.40) && mmValue >= 0.92);
       // Drift-Lock 중에는 즉시 Off(확인 불요)
       if (hiCorrDrift) {
         offClassic = true;
@@ -1675,7 +1727,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const hiCorrRisk = (mmValue >= 0.90) || ((mmTrend[i] ?? 0) > 0.005) || ((fullFluxZ[i] ?? 0) >= 1.5);
       const accel = (fluxSlope[i] ?? 0) > 0 && (mmTrend[i] ?? 0) <= 0;
       const strongPcon = Number.isFinite(pcon[i]) && pcon[i] >= 0.68;
-      const confirmOnDays = hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2);
+      // Strong-On path shortens confirmation to 1 day
+      const confirmOnDays = strongOn ? 1 : (hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2));
       onCand = rawOn ? onCand + 1 : 0;
       offCand = rawOff ? offCand + 1 : 0;
 
@@ -1758,6 +1811,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     fluxIntensity,
     comboMomentum,
     breadth,
+    vPC1,
+    kappa,
     scCorr,
     safeNeg,
     diagnostics,
@@ -1918,6 +1973,29 @@ function rollingZScore(arr, index, lookback) {
   const std = Math.sqrt(stats.variance);
   if (!Number.isFinite(v) || !Number.isFinite(std) || std === 0) return null;
   return (v - stats.mean) / std;
+}
+
+// Power-iteration top eigenvector for symmetric matrices (PC1 direction)
+function topEigenvectorLocal(matrix, maxIter = 50, tol = 1e-6) {
+  if (!Array.isArray(matrix) || matrix.length === 0) return null;
+  const n = matrix.length;
+  let v = new Array(n).fill(1 / Math.sqrt(n));
+  for (let it = 0; it < maxIter; it += 1) {
+    const w = new Array(n).fill(0);
+    for (let i = 0; i < n; i += 1) {
+      const row = matrix[i];
+      let s = 0;
+      for (let j = 0; j < n; j += 1) s += row[j] * v[j];
+      w[i] = s;
+    }
+    const norm = Math.sqrt(w.reduce((a, x) => a + x * x, 0)) || 1;
+    const nv = w.map((x) => x / norm);
+    let diff = 0;
+    for (let i = 0; i < n; i += 1) { const d = nv[i] - v[i]; diff += d * d; }
+    v = nv;
+    if (diff < tol * tol) break;
+  }
+  return v;
 }
 
 function sigmoid(x, slope = 1) {
@@ -2101,7 +2179,7 @@ function buildMethodologySection() {
     '- 하위 지수: (a) 주식-암호화폐(+) = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산(+) = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG(-) = max(0, -corr(주식, TLT/GLD)) 평균.',
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
-    '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다. 추가로 Fick의 제1법칙 관점에서 Diff(확산) = J_norm − 0.50·max(0, mmΔ) − 0.15·max(0, −ΔJ)를 사용해 “동조화 강화·플럭스 둔화” 환경의 On을 보수화합니다. 동작: (1) On은 Diff ≥ 동적 J_norm 문턱이고 Guard < 0.95 및 폭 조건을 만족하거나, RB_Flux ≥ 0.06 & Combo ≥ +0.10일 때 대안 경로로 통과합니다. 확산 가속(+), 흡수 하락(≤0)이면 1일 확인, 기본 2일, 고상관/흡수 상승·ΔCorr-Z↑면 3일 확인. (2) Off는 J_norm ≤ 동적 Off 문턱 또는 Absorption ≥ mmOff(기본 0.98)에서 발생하되, Guard/Absorption만으로 생기는 Off는 2일(고상관·상승 환경은 3일) 연속 확인 후 확정합니다.',
+    '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다. 추가로 Fick의 제1법칙 관점에서 Diff(확산) = J_norm − 0.50·max(0, mmΔ) − 0.15·max(0, −ΔJ)와 시장 공통 모드 PC1 속도(v_PC1)를 함께 사용해, κ = |Diff| / (|Diff| + λ·|v_PC1|) 상대강도로 On/Off를 가중합니다. 동작: (1) On은 Diff ≥ 동적 문턱이며 κ와 PCON, v_PC1 양(+)을 만족(Strong-On은 1일 확인)하거나 RB_Flux ≥ 0.06 & Combo ≥ +0.10일 때 대안 경로로 통과합니다. (2) Off는 v_PC1 ≤ vOff 또는 Diff ≤ Off 문턱·κ 약세, 혹은 Absorption ≥ mmOff(Guard-only는 2~3일 확인)로 확정합니다.',
     '- 기본 동작은 Classic이며 사용자가 명시적으로 변경한 경우에만 Enhanced/FFL이 적용됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
@@ -2160,7 +2238,7 @@ function buildRiskScoreSection(riskSeries) {
   const headers = isEnhanced
     ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'Guard', 'Absorption', 'Combo(10일)', 'Breadth(5일)']
     : isFFL
-      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'RB_Flux', 'ΔCorr-Z', 'Diff', 'mmΔ', 'APDF', 'PCON', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
+      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'RB_Flux', 'ΔCorr-Z', 'Diff', 'mmΔ', 'APDF', 'PCON', 'v_PC1', 'κ(diff↔drift)', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
       : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
 
   const rows = riskSeries.dates.map((date, idx) => {
@@ -2194,6 +2272,8 @@ function buildRiskScoreSection(riskSeries) {
         formatNumberOrNA(riskSeries.mmTrend?.[idx]),
         formatNumberOrNA(riskSeries.apdf?.[idx]),
         (Number.isFinite(riskSeries.pcon?.[idx]) ? (riskSeries.pcon[idx] * 100).toFixed(0) + '%' : 'N/A'),
+        formatNumberOrNA(riskSeries.vPC1?.[idx]),
+        (Number.isFinite(riskSeries.kappa?.[idx]) ? (riskSeries.kappa[idx] * 100).toFixed(0) + '%' : 'N/A'),
         formatNumberOrNA(riskSeries.guard?.[idx]),
         formatNumberOrNA(riskSeries.mm?.[idx]),
         formatSignedPercent(riskSeries.comboMomentum?.[idx]),

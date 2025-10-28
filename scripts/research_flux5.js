@@ -41,9 +41,10 @@ function equityFromState(dates, returns, baseSymbol, state, window) {
   const offset = Math.max(1, window - 1);
   let s = 1; let b = 1;
   const eqS = []; const eqB = [];
+  const LEV = Number(process.env.LEV || 3);
   for (let i = 0; i < dates.length; i += 1) {
     const pi = offset + i; const pr = priceSeries[pi] / priceSeries[pi - 1] - 1;
-    const rr = state[i] > 0 ? Math.max(-0.99, 3 * pr) : 0; // Neutral도 현금 취급(방어적 연구 설정)
+    const rr = state[i] > 0 ? Math.max(-0.99, LEV * pr) : (state[i] < 0 ? 0 : pr); // On=LEV×, Neutral=1×, Off=현금
     s *= (1 + rr); b *= (1 + pr);
     eqS.push(Number(s.toFixed(6))); eqB.push(Number(b.toFixed(6)));
   }
@@ -90,23 +91,23 @@ function gridSearch() {
   const vOffs = [-0.05, 0.00];
   const pconOns = [0.55, 0.60, 0.65];
   const pconOffs = [0.40, 0.45, 0.50];
-  const mmHis = [0.90, 0.92, 0.88];
-  const downAlls = [0.60, 0.65, 0.70];
+  const mmHis = [0.90, 0.92];
+  const downAlls = [0.60, 0.65];
   const driftDays = [3, 5];
+  const kOns = [0.55, 0.60, 0.65];
   for (const vOn of vOns) for (const vOff of vOffs)
   for (const pconOn of pconOns) for (const pconOff of pconOffs)
   for (const mmHi of mmHis) for (const downAll of downAlls)
-  for (const dMin of driftDays) {
-    grid.push({ vOn, vOff, pconOn, pconOff, mmHi, downAll, driftMinDays: dMin, corrConeDays: 5, offMinDays: 3 });
+  for (const dMin of driftDays) for (const kOn of kOns) {
+    grid.push({ vOn, vOff, pconOn, pconOff, mmHi, downAll, driftMinDays: dMin, corrConeDays: 5, offMinDays: 3, kOn });
   }
   let best = null; let bestScore = -Infinity; let bestRes = null; let tried = 0;
+  function mdd(series) { let peak = series[0] || 1; let dd = 0; for (const v of series) { if (v > peak) peak = v; const d = (v/peak) - 1; if (d < dd) dd = d; } return dd; }
   for (const params of grid) {
     const r = runOnce(params); tried++;
-    const y = r.yearly.strategy;
-    const f2022 = y[2022] ?? -Infinity; const f2023 = y[2023] ?? -Infinity; const f2024 = y[2024] ?? -Infinity;
-    // Objective: 2022 ≥ -0.05, 2023/2024 positive, maximize (2023+2024) and minimize |2022|
-    const ok = (f2022 >= -0.05);
-    const score = (ok ? 1000 : 0) + (f2023 || 0) + (f2024 || 0) - Math.max(0, -f2022);
+    const y = r.yearly.strategy; const eq = r.equity.strategy || 1;
+    // Objective variant A: maximize final equity only (for pure return)
+    const score = eq;
     if (score > bestScore) { bestScore = score; best = params; bestRes = r; }
   }
   return { best, bestRes, tried };
@@ -122,6 +123,13 @@ function main() {
       if (process.env[k] != null) p[k] = Number(process.env[k]);
     }
     const r = runOnce(p);
+    // attach MDD
+    const { aligned, returns } = loadHistorical();
+    const symbols = Object.keys(aligned.prices); const categories = aligned.categories; const prices = returns.priceSeries; const pairGroups = { risk: SIGNAL.risk, safe: SIGNAL.safe, stocks: SIGNAL.stocks };
+    const out = CF5.computeClassicFlux5({ aligned, returns, window: WINDOW, symbols, categories, prices, pairGroups, params: p });
+    const { eqS } = equityFromState(out.dates, returns, 'QQQ', out.executedState, WINDOW);
+    let peak = eqS[0]||1; let dd=0; for(const v of eqS){ if(v>peak) peak=v; const d=(v/peak)-1; if(d<dd) dd=d; }
+    r.metrics = { mdd: dd };
     console.log(JSON.stringify(r, null, 2));
   }
 }

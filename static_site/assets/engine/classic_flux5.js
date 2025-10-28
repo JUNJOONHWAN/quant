@@ -8,6 +8,17 @@
     window.ClassicFlux5 = globalFactory(window.MarketMetrics);
   }
 })(function (MM) {
+  function topEigenvector(matrix, maxIter = 50, tol = 1e-6) {
+    if (!Array.isArray(matrix) || matrix.length === 0) return null;
+    const n = matrix.length; let v = new Array(n).fill(1/Math.sqrt(n));
+    for (let it=0; it<maxIter; it+=1) {
+      const w = new Array(n).fill(0);
+      for (let i=0;i<n;i+=1){ const row = matrix[i]; let s=0; for(let j=0;j<n;j+=1){ s += row[j]*v[j]; } w[i]=s; }
+      const norm = Math.sqrt(w.reduce((a,x)=>a+x*x,0)) || 1; const nv = w.map(x=>x/norm);
+      let diff=0; for(let i=0;i<n;i+=1){ const d=nv[i]-v[i]; diff+=d*d; } v=nv; if(diff<tol*tol) break;
+    }
+    return v;
+  }
   function zMomentum(series, index, k = 10, v = 20, zSat = 2.0) {
     if (!Array.isArray(series) || index == null) return null;
     if (index - k < 0 || index >= series.length) return null;
@@ -136,6 +147,10 @@
       const fluxSlope = (prevJ!=null && Number.isFinite(JNORM)) ? (JNORM - prevJ) : 0;
       const Diff = JNORM - 0.50*Math.max(0, mmDelta) - 0.15*Math.max(0, -fluxSlope);
       prevMM = mm; prevJ = JNORM;
+      // PC1 velocity (market-mode)
+      const e1 = topEigenvector(signalMatrix);
+      let vpc1 = 0; if (Array.isArray(e1)) { let num=0; let den=0; for (let i=0;i<e1.length;i+=1){ const s = symbols[i]; const zi = Number.isFinite(z[s])?z[s]:0; num += e1[i]*zi; den += Math.abs(e1[i]); } vpc1 = den>0 ? (num/den) : 0; }
+      const VPC1 = Math.tanh(vpc1/0.5);
       const PCON = pconW>0 ? Math.max(0, Math.min(1, pconSum/pconW)) : 0;
 
       out.dates.push(recordDate);
@@ -150,6 +165,8 @@
       out.diff.push(Diff);
       out.downAll.push(downAll);
       out.vAll.push(vAll);
+      out.vPC1 = out.vPC1 || [];
+      out.vPC1.push(VPC1);
     }
 
     // Classic baseline + Flux5 + Drift/Corr-Lock gating
@@ -161,7 +178,7 @@
     let coneLock = 0;
     for (let i = 0; i < out.dates.length; i += 1) {
       const flux = out.flux5[i] ?? 0; const mm = out.mm[i] ?? 0; const sc = out.scCorr[i] ?? 0; const safeN = out.safeNeg[i] ?? 0; const pcon = out.pcon[i] ?? 0;
-      const jn = out.jnorm[i] ?? 0; const diff = out.diff[i] ?? 0; const down = out.downAll[i] ?? 0; const vAll = out.vAll[i] ?? 0;
+      const jn = out.jnorm[i] ?? 0; const diff = out.diff[i] ?? 0; const down = out.downAll[i] ?? 0; const vAll = (out.vPC1?.[i] ?? out.vAll[i] ?? 0);
       // Classic score
       const score = 0.70 * Math.max(0, sc) + 0.30 * safeN; out.score.push(score);
       // Drift update
@@ -192,9 +209,16 @@
 
       // reentry one-shot stronger threshold right after drift epoch
       if (!inDrift && driftSeq === 0 && driftCool === 1) reentryArmed = true;
+      // Relative strength of diffusion vs drift
+      const lam = Number.isFinite(params.kLambda) ? params.kLambda : 1.0; // drift weight
+      const kappa = (Math.abs(diff)) / (Math.abs(diff) + lam * Math.abs(vAll) + 1e-6); // 0..1, diffusion dominance
+      const kOn = Number.isFinite(params.kOn) ? params.kOn : 0.60;
       const reentryBonus = reentryArmed ? 0.05 : 0;
-      const onMain = (diff >= (thresholds.jOn + reentryBonus)) && (pcon >= thresholds.pconOn) && (mm < thresholds.mmOff) && (vAll >= thresholds.vOn) && (!inDrift) && (coneLock === 0) && (offStreak >= thresholds.offMinDays);
-      const offMain = (diff <= thresholds.jOff) || (pcon <= thresholds.pconOff) || (mm >= thresholds.mmOff) || (vAll <= thresholds.vOff) || inDrift || (coneLock > 0) || ((mm >= thresholds.mmHi) && (vAll <= 0));
+      // Quadrant-aware gating: prefer On when (diff>0) and diffusion dominance high, and drift not negative
+      const onMain = (diff >= (thresholds.jOn + reentryBonus)) && (kappa >= kOn) && (pcon >= thresholds.pconOn) && (mm < thresholds.mmOff) && (vAll >= thresholds.vOn) && (!inDrift) && (coneLock === 0) && (offStreak >= thresholds.offMinDays);
+      // Off when drift negative or diffusion negative with dominance low, or guards trip
+      const offByRel = ((vAll <= thresholds.vOff) && (Math.abs(vAll) >= 0.05)) || ((diff <= thresholds.jOff) && (kappa < 0.55));
+      const offMain = offByRel || (pcon <= thresholds.pconOff) || (mm >= thresholds.mmOff) || inDrift || (coneLock > 0) || ((mm >= thresholds.mmHi) && (vAll <= 0));
       const rawOn = onMain; const rawOff = offMain;
       onC = rawOn ? onC + 1 : 0; offC = rawOff ? offC + 1 : 0;
       let s = prev; const before = s;
