@@ -1079,11 +1079,10 @@ function renderBacktest() {
     leveredReturns.push(leveragedReturn(daily, tradeConfig.leverage));
   }
 
-  const laggedState = series.state.map((value, idx) => {
-    if (idx === 0) return 0;
-    return series.state[idx - 1] || 0;
-  });
-  const stratReturns = laggedState.map((regime, idx) => {
+  const executedState = Array.isArray(series.executedState) && series.executedState.length === series.state.length
+    ? series.executedState
+    : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
+  const stratReturns = executedState.map((regime, idx) => {
     if (regime > 0) return leveredReturns[idx];
     if (regime < 0) return 0; // cash
     return baseReturns[idx]; // neutral holds base asset
@@ -1333,16 +1332,15 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   }
 
   const labels = SIGNAL.symbols;
-  const indexMap = {};
-  labels.forEach((symbol, idx) => { indexMap[symbol] = idx; });
+  const indexLookup = {};
+  labels.forEach((symbol, idx) => { indexLookup[symbol] = idx; });
 
   const allRecords = metrics.records;
-  const primaryRecords = Array.isArray(recordsOverride) && recordsOverride.length > 0 ? recordsOverride : null;
-  const firstDate = primaryRecords?.[0]?.date ?? allRecords[0]?.date;
+  const alignedRecords = Array.isArray(recordsOverride) && recordsOverride.length > 0 ? recordsOverride : null;
+  const firstDate = alignedRecords?.[0]?.date ?? allRecords[0]?.date;
   let baseIdx = allRecords.findIndex((record) => record.date === firstDate);
   if (baseIdx < 0) baseIdx = 0;
-
-  const length = primaryRecords ? primaryRecords.length : allRecords.length - baseIdx;
+  const length = alignedRecords ? alignedRecords.length : allRecords.length - baseIdx;
   if (length <= 0) return null;
 
   const slice = allRecords.slice(baseIdx, baseIdx + length);
@@ -1354,15 +1352,15 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const prices = state.priceSeries || {};
 
-  const score = new Array(length).fill(null);
-  const stateArr = new Array(length).fill(0);
-  const fragile = new Array(length).fill(false);
-  const guard = new Array(length).fill(null);
   const mm = new Array(length).fill(null);
+  const guard = new Array(length).fill(null);
+  const score = new Array(length).fill(null);
   const jFlux = new Array(length).fill(null);
-  const fIntensity = new Array(length).fill(null);
+  const fluxRaw = new Array(length).fill(null);
+  const fluxIntensity = new Array(length).fill(null);
   const comboMomentum = new Array(length).fill(null);
   const breadth = new Array(length).fill(null);
+  const fragile = new Array(length).fill(false);
   const far = new Array(length).fill(null);
 
   for (let i = 0; i < length; i += 1) {
@@ -1389,19 +1387,17 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     let fluxSum = 0;
     let absSum = 0;
     CLUSTERS.safe.forEach((safeSymbol) => {
-      const safeIdx = indexMap[safeSymbol];
+      const safeIdx = indexLookup[safeSymbol];
       if (!Number.isInteger(safeIdx)) return;
       CLUSTERS.risk.forEach((riskSymbol) => {
-        const riskIdx = indexMap[riskSymbol];
+        const riskIdx = indexLookup[riskSymbol];
         if (!Number.isInteger(riskIdx)) return;
-        const coefficient = Array.isArray(matrix) ? matrix?.[safeIdx]?.[riskIdx] : null;
-        const weight = Math.pow(Math.max(0, Number(coefficient) || 0), RISK_CFG_FFL.p);
-        if (!Number.isFinite(weight) || weight <= 0) {
-          return;
-        }
-        const safeZ = Number.isFinite(zr[safeSymbol]) ? zr[safeSymbol] : 0;
-        const riskZ = Number.isFinite(zr[riskSymbol]) ? zr[riskSymbol] : 0;
-        const diff = safeZ - riskZ;
+        const coef = Array.isArray(matrix) ? (Number(matrix?.[safeIdx]?.[riskIdx]) || 0) : 0;
+        const weight = Math.pow(Math.abs(coef), RISK_CFG_FFL.p);
+        if (!Number.isFinite(weight) || weight <= 0) return;
+        const sZ = Number.isFinite(zr[safeSymbol]) ? zr[safeSymbol] : 0;
+        const rZ = Number.isFinite(zr[riskSymbol]) ? zr[riskSymbol] : 0;
+        const diff = rZ - sZ;
         weightSum += weight;
         fluxSum += weight * diff;
         absSum += weight * Math.abs(diff);
@@ -1410,10 +1406,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
 
     const Jbar = weightSum > 0 ? fluxSum / weightSum : 0;
     const Jnorm = Math.tanh(Jbar / RISK_CFG_FFL.lambda);
-    const fluxVal = Number.isFinite(Jnorm) ? Jnorm : null;
-    jFlux[i] = fluxVal;
-    const intensityVal = weightSum > 0 ? absSum / weightSum : null;
-    fIntensity[i] = Number.isFinite(intensityVal) ? intensityVal : null;
+    jFlux[i] = Number.isFinite(Jnorm) ? Jnorm : null;
+    fluxRaw[i] = weightSum > 0 ? Jbar : null;
+    fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
 
     const riskZValues = CLUSTERS.risk
       .map((symbol) => zr[symbol])
@@ -1431,33 +1426,55 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const guardVal = 0.5 * mmPen + 0.2 * safePen + 0.3 * deltaPen;
     guard[i] = Number.isFinite(guardVal) ? Number(guardVal.toFixed(6)) : null;
 
-    const sFFL = fluxVal == null ? null : 0.5 * (1 + fluxVal);
-    const scoreVal = Number.isFinite(sFFL) ? sFFL : null;
-    score[i] = scoreVal == null ? null : Number(scoreVal.toFixed(6));
+    const sFFL = jFlux[i] == null ? null : 0.5 * (1 + jFlux[i]);
+    score[i] = Number.isFinite(sFFL) ? Number(sFFL.toFixed(6)) : null;
+  }
 
-    const thresholds = RISK_CFG_FFL.thresholds;
+  const th = RISK_CFG_FFL.thresholds;
+  const validFlux = jFlux.filter((value) => Number.isFinite(value));
+  const validScore = score.filter((value) => Number.isFinite(value));
+  let dynOnFlux = th.jOn;
+  let dynOffFlux = th.jOff;
+  let dynScoreOn = th.scoreOn;
+  let dynScoreOff = th.scoreOff;
+  if (validFlux.length >= 50) {
+    dynOnFlux = Math.max(th.jOn, quantile(validFlux, 0.75));
+    dynOffFlux = Math.min(th.jOff, quantile(validFlux, 0.25));
+  }
+  if (validScore.length >= 50) {
+    dynScoreOn = Math.max(th.scoreOn, quantile(validScore, 0.75));
+    dynScoreOff = Math.min(th.scoreOff, quantile(validScore, 0.25));
+  }
+
+  const stateArr = new Array(length).fill(0);
+  for (let i = 0; i < length; i += 1) {
+    const fluxVal = jFlux[i] ?? 0;
+    const scoreVal = score[i] ?? 0.5;
     const mmValue = mm[i] ?? 0;
     const comboValue = comboMomentum[i] ?? null;
+    const breadthValue = breadth[i] ?? null;
+    const guardVal = guard[i] ?? 1;
+
     if (RISK_CFG_FFL.variant === 'classic') {
-      if ((fluxVal ?? 0) >= thresholds.jOn && mmValue < thresholds.mmOff) {
+      if (fluxVal >= dynOnFlux && mmValue < th.mmOff) {
         stateArr[i] = 1;
-        fragile[i] = mmValue >= thresholds.mmFragile;
-      } else if ((fluxVal ?? 0) <= thresholds.jOff || mmValue >= thresholds.mmOff) {
+        fragile[i] = mmValue >= th.mmFragile;
+      } else if (fluxVal <= dynOffFlux || mmValue >= th.mmOff) {
         stateArr[i] = -1;
       } else {
         stateArr[i] = 0;
-        fragile[i] = mmValue >= thresholds.mmFragile;
+        fragile[i] = mmValue >= th.mmFragile;
       }
     } else {
-      const on = (scoreVal ?? 0) >= thresholds.scoreOn &&
-        (fluxVal ?? 0) >= thresholds.jOn &&
+      const on = scoreVal >= dynScoreOn &&
+        fluxVal >= dynOnFlux &&
         (comboValue ?? 0) > -0.005 &&
-        (breadth[i] ?? 0) >= thresholds.breadthOn &&
+        (breadthValue ?? 0) >= th.breadthOn &&
         guardVal < 0.90;
-      const off = (scoreVal ?? 0) <= thresholds.scoreOff ||
-        (fluxVal ?? 0) <= thresholds.jOff ||
+      const off = scoreVal <= dynScoreOff ||
+        fluxVal <= dynOffFlux ||
         (comboValue ?? 0) <= -0.03 ||
-        mmValue >= thresholds.mmOff ||
+        mmValue >= th.mmOff ||
         guardVal >= 1.0;
       if (on) {
         stateArr[i] = 1;
@@ -1466,28 +1483,39 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         stateArr[i] = -1;
       } else {
         stateArr[i] = 0;
-        fragile[i] = guardVal >= 0.80 && (fluxVal ?? 0) >= 0 && (comboValue ?? 0) >= -0.02;
+        fragile[i] = guardVal >= 0.80 && fluxVal >= 0 && (comboValue ?? 0) >= -0.02;
       }
     }
 
-    far[i] = Number.isFinite(fluxVal) ? Math.abs(fluxVal) / (mmValue + 1e-9) : null;
+    far[i] = Number.isFinite(jFlux[i]) && Number.isFinite(mmValue) && mmValue > 0
+      ? Math.abs(jFlux[i]) / (mmValue + 1e-9)
+      : null;
   }
+
+  const executedState = stateArr.map((value, idx) => (idx === 0 ? 0 : stateArr[idx - 1] || 0));
+  const diagnostics = {
+    fluxThresholds: { on: dynOnFlux, off: dynOffFlux },
+    scoreThresholds: { on: dynScoreOn, off: dynScoreOff },
+  };
 
   return {
     dates,
     score,
     riskScore: score,
     state: stateArr,
+    executedState,
     fragile,
     guard,
     mm,
     far,
     fflFlux: jFlux,
-    fluxIntensity: fIntensity,
+    fluxRaw,
+    fluxIntensity,
     comboMomentum,
     breadth,
     scCorr,
     safeNeg,
+    diagnostics,
   };
 }
 
@@ -1586,6 +1614,17 @@ function averageFinite(...values) {
   const finite = values.filter((value) => Number.isFinite(value));
   if (finite.length === 0) return null;
   return finite.reduce((acc, value) => acc + value, 0) / finite.length;
+}
+
+function quantile(values, q) {
+  if (!Array.isArray(values) || values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = Math.min(Math.max(q, 0), 1) * (sorted.length - 1);
+  const lower = Math.floor(pos);
+  const upper = Math.ceil(pos);
+  if (lower === upper) return sorted[lower];
+  const weight = pos - lower;
+  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
 }
 
 function leveragedReturn(baseReturn, leverage = 3) {
