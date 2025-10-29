@@ -1757,7 +1757,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       // 확산 점수(diffVal) + 전쌍 일관성(PCON) + APDF 약한 필터
       const pconOkBase = !Number.isFinite(pcon[i]) || pcon[i] >= (th.pconOn ?? 0.55);
       const apdfOk = !Number.isFinite(apdf[i]) || apdf[i] >= -0.05;
-      const pconOk = pconOkBase || (diffVal >= (dynOnAdj + 0.07));
+      let pconOk = pconOkBase || (diffVal >= (dynOnAdj + 0.07));
       // 고상관·약세(벤치 10일 ≤ 0) 잠금: 더 강한 확인 요구
       const idxPrice = baseIdx + i + windowOffset;
       const bench10 = rollingReturnFromSeries(prices[SIGNAL.trade.baseSymbol], idxPrice, 10);
@@ -1801,11 +1801,22 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         const tauOff = Number.isFinite(sig) ? offK * sig : 0;
         const scale = mmValue >= 0.90 ? hiScale : 1.0;
         const St = expSt[i];
+        const prevSt = i>0 ? expSt[i-1] : null;
         const dSt = expStPrev[i];
         const stOn = Number.isFinite(St) && Number.isFinite(dSt) && (St > scale * tauOn) && (dSt > 0) && (Number(ratioS) > 0);
         const stOff = Number.isFinite(St) && Number.isFinite(dSt) && (St < -scale * tauOff) && (dSt < 0) && (Number(ratioS) < 0);
+        const crossUp = Number.isFinite(prevSt) && Number.isFinite(St) && prevSt <= 0 && St > 0 && (dSt ?? 0) > 0;
+        // On Booster: high corr-with-BTC & risk breadth or momentum combo, when not hiCorrBear
+        const sc = Number(scCorr?.[i]) || 0;
+        const booster = (!hiCorrBear && ((sc >= 0.50 && ((breadthValue ?? 0) >= 0.55 || (comboValue ?? 0) >= 0.05))));
         expOkOn = (Number.isFinite(ratioS) ? (ratioS >= rOn) : true) && day0Ok && breadth1dOk && (stOn || (!Number.isFinite(sig))); // fall back if sigma unavailable
+        // Allow On when crossing to positive timing or booster pattern
+        if (!expOkOn && day0Ok && (crossUp || booster)) {
+          expOkOn = true;
+        }
         expForceOff = (Number.isFinite(ratioS) ? (ratioS <= rOff) : false) || stOff;
+        // relax pcon when booster triggers
+        if (booster) pconOk = true;
       }
 
       const onClassicMain = (diffVal >= dynOnAdj) && pconOk && apdfOk && stricter && guardValue < guardSoft && mmValue < th.mmOff && breadthGate && expOkOn;
@@ -1870,6 +1881,12 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         const St = expSt[i];
         const tauOn = Number.isFinite(sig) ? (Number.isFinite(RISK_CFG_FFL?.exp?.ti?.onK) ? RISK_CFG_FFL.exp.ti.onK : 0.75) * sig : null;
         if (Number.isFinite(St) && Number.isFinite(tauOn) && St >= strongK * tauOn) confirmOnDays = 1;
+        const prevSt = i>0 ? expSt[i-1] : null;
+        const dSt = expStPrev[i];
+        if (Number.isFinite(prevSt) && Number.isFinite(St) && prevSt <= 0 && St > 0 && (dSt ?? 0) > 0) {
+          // bullish timing cross-up: shorten confirmation by 1 day
+          confirmOnDays = Math.max(1, confirmOnDays - 1);
+        }
       }
       onCand = rawOn ? onCand + 1 : 0;
       offCand = rawOff ? offCand + 1 : 0;
