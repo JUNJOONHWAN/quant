@@ -36,9 +36,34 @@ const RISK_CFG_FFL = {
   p: 1.5,
   zSat: 2.0,
   lambda: 0.25,
-  thresholds: { jOn: +0.10, jOff: -0.08, scoreOn: 0.60, scoreOff: 0.40, breadthOn: 0.50, mmFragile: 0.88, mmOff: 0.96 },
-  variant: 'classic',
+  thresholds: {
+    jOn: +0.10, jOff: -0.08, scoreOn: 0.60, scoreOff: 0.40, breadthOn: 0.50, mmFragile: 0.88, mmOff: 0.96,
+    pconOn: 0.55, pconOff: 0.40, mmHi: 0.90, downAll: 0.60, corrConeDays: 5, driftMinDays: 3, driftCool: 2, offMinDays: 3, vOn: +0.05, vOff: -0.05,
+  },
+  kOn: 0.60,
+  kLambda: 1.0,
+  exp: { lam: 1.0, rOn: 1.20, rOff: -1.10, breadth1dMin: 0.55, d0AnyPos: true, d0BothPosHiCorr: true },
+  variant: (process.env.MODE === 'ffl_exp' || process.env.VARIANT === 'exp') ? 'exp' : 'classic',
 };
+
+// Allow ENV overrides for quick sweeps (e.g., MODE=ffl_exp RON=0.95 ROFF=-0.80 ELAM=0.9 BMIN=0.45 D0ANY=1 D0BOTH=0)
+if (RISK_CFG_FFL.variant === 'exp') {
+  const num = (v) => (v == null ? undefined : Number(v));
+  const bool = (v) => (v == null ? undefined : (String(v) === '1' || String(v).toLowerCase() === 'true'));
+  const rOn = num(process.env.RON);
+  const rOff = num(process.env.ROFF);
+  const lam = num(process.env.ELAM);
+  const bmin = num(process.env.BMIN);
+  const d0any = bool(process.env.D0ANY);
+  const d0both = bool(process.env.D0BOTH);
+  if (!RISK_CFG_FFL.exp) RISK_CFG_FFL.exp = {};
+  if (Number.isFinite(rOn)) RISK_CFG_FFL.exp.rOn = rOn;
+  if (Number.isFinite(rOff)) RISK_CFG_FFL.exp.rOff = rOff;
+  if (Number.isFinite(lam)) RISK_CFG_FFL.exp.lam = lam;
+  if (Number.isFinite(bmin)) RISK_CFG_FFL.exp.breadth1dMin = bmin;
+  if (typeof d0any === 'boolean') RISK_CFG_FFL.exp.d0AnyPos = d0any;
+  if (typeof d0both === 'boolean') RISK_CFG_FFL.exp.d0BothPosHiCorr = d0both;
+}
 
 function rollingReturnFromSeries(series, index, lookback) {
   if (!Array.isArray(series) || !Number.isInteger(index) || !Number.isInteger(lookback) || lookback <= 0) return null;
@@ -78,6 +103,28 @@ function rollingZScore(arr, index, lookback) { const stats = rollingMeanVariance
 function sigmoid(x, slope = 1) { if (!Number.isFinite(x)) return null; const t = Math.max(Math.min(x * slope, 60), -60); return 1 / (1 + Math.exp(-t)); }
 function frobeniusDiff(matrix, prevMatrix) { if (!Array.isArray(matrix) || !Array.isArray(prevMatrix)) return null; let sumSq = 0; let count = 0; const n = Math.min(matrix.length, prevMatrix.length); for (let i = 0; i < n; i += 1) { const row = matrix[i]; const prow = prevMatrix[i]; if (!Array.isArray(row) || !Array.isArray(prow)) continue; const m = Math.min(row.length, prow.length); for (let j = 0; j < m; j += 1) { const a = Number(row[j]); const b = Number(prow[j]); if (!Number.isFinite(a) || !Number.isFinite(b)) continue; const d = a - b; sumSq += d * d; count += 1; } } if (count === 0) return null; return Math.sqrt(sumSq / count); }
 function quantile(values, q) { if (!Array.isArray(values) || values.length === 0) return NaN; const sorted = [...values].sort((a, b) => a - b); const pos = Math.min(Math.max(q, 0), 1) * (sorted.length - 1); const lower = Math.floor(pos); const upper = Math.ceil(pos); if (lower === upper) return sorted[lower]; const weight = pos - lower; return sorted[lower] * (1 - weight) + sorted[upper] * weight; }
+function median(xs){ const a=xs.slice().sort((x,y)=>x-y); const n=a.length; if(n===0) return null; const m=Math.floor(n/2); return n%2? a[m] : 0.5*(a[m-1]+a[m]); }
+function rollingSigmaMAD(arr, end, win){ const xs=[]; for(let k=Math.max(0,end-win+1); k<=end; k+=1){ const v=arr[k]; if(Number.isFinite(v)) xs.push(v);} if(xs.length<5) return null; const med=median(xs); const dev=xs.map(v=>Math.abs(v-med)); const mad=median(dev); return Number.isFinite(mad)? 1.4826*mad : null; }
+
+// Minimal power-iteration to get top eigenvector of symmetric matrix
+function topEigenvectorLocal(matrix, maxIter = 60, tol = 1e-8) {
+  if (!Array.isArray(matrix) || matrix.length === 0) return null;
+  const n = matrix.length;
+  let v = new Array(n).fill(1 / Math.sqrt(n));
+  for (let it = 0; it < maxIter; it += 1) {
+    const w = new Array(n).fill(0);
+    for (let i = 0; i < n; i += 1) {
+      let s = 0; const row = matrix[i];
+      for (let j = 0; j < n; j += 1) s += row[j] * v[j];
+      w[i] = s;
+    }
+    const norm = Math.sqrt(w.reduce((a, x) => a + x * x, 0)) || 1;
+    const nv = w.map((x) => x / norm);
+    let diff = 0; for (let i = 0; i < n; i += 1) { const d = nv[i] - v[i]; diff += d * d; }
+    v = nv; if (diff < tol * tol) break;
+  }
+  return v;
+}
 
 const state = { window: WINDOW, priceSeries: {}, metrics: {} };
 
@@ -148,6 +195,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const fluxRaw = new Array(length).fill(null); const fluxIntensity = new Array(length).fill(null); const comboMomentum = new Array(length).fill(null); const breadth = new Array(length).fill(null);
   const coDownAll = new Array(length).fill(null);
   const fragile = new Array(length).fill(false); const far = new Array(length).fill(null); let prevMatrix = null;
+
+  // EXP timing accumulators
+  let efPrev = null, esPrev = null; const alpha3 = 2 / (3 + 1), alpha10 = 2 / (10 + 1);
 
   for (let i = 0; i < length; i += 1) {
     const record = allRecords[baseIdx + i]; const matrix = record?.matrix;
@@ -245,6 +295,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   if (variant !== 'classic' && validScore.length >= 50) { dynScoreOn = Math.max(th.scoreOn, quantile(validScore, 0.75)); dynScoreOff = Math.min(th.scoreOff, quantile(validScore, 0.25)); }
 
   const stateArr = new Array(length).fill(0);
+  const expRatio = new Array(length).fill(null); // EXP ratio buffer
+  const st = new Array(length).fill(null); const dSt = new Array(length).fill(null); const sigma = new Array(length).fill(null);
   let prevState = 0; let onCand = 0; let offCand = 0; let offGuardSeq = 0;
   const DRIFT_MIN_DAYS = 5; const DRIFT_COOLDOWN_DAYS = 2;
   let driftSeq = 0; let driftCooldown = 0; let inDriftEpoch = false; let prevInDrift = false;
@@ -252,6 +304,24 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0; const diffVal = diffusionScore[i] ?? fluxVal; const mmValue = mm[i] ?? 0; const comboValue = comboMomentum[i] ?? null; const breadthValue = breadth[i] ?? null; const guardVal = guard[i] ?? 1;
     const vpc1Val = Number.isFinite(vPC1[i]) ? vPC1[i] : 0; const lam = 1.0; const kappaVal = (Math.abs(diffVal)) / (Math.abs(diffVal) + lam * Math.abs(vpc1Val) + 1e-6); kappa[i] = Number.isFinite(kappaVal) ? kappaVal : null;
+    if (variant === 'exp') {
+      const lamExp = Number.isFinite(RISK_CFG_FFL?.exp?.lam) ? RISK_CFG_FFL.exp.lam : 1.0;
+      const denom = lamExp * Math.abs(vpc1Val) + 1e-6;
+      const raw = Number.isFinite(diffVal) ? (diffVal / denom) : null;
+      const prev = i > 0 ? expRatio[i - 1] : null;
+      expRatio[i] = (Number.isFinite(raw) && Number.isFinite(prev)) ? (0.5 * prev + 0.5 * raw) : (Number.isFinite(raw) ? raw : prev);
+      // timing EMA fast/slow on ratio
+      const r = expRatio[i];
+      if (Number.isFinite(r)) {
+        efPrev = (efPrev == null) ? r : (alpha3 * r + (1 - alpha3) * efPrev);
+        esPrev = (esPrev == null) ? r : (alpha10 * r + (1 - alpha10) * esPrev);
+        st[i] = efPrev - esPrev;
+        dSt[i] = (i > 0 && Number.isFinite(st[i - 1])) ? (st[i] - st[i - 1]) : null;
+        sigma[i] = rollingSigmaMAD(st, i, Number.isFinite(Number(process.env.WIN)) ? Number(process.env.WIN) : 63);
+      } else {
+        st[i] = st[i] ?? null; dSt[i] = dSt[i] ?? null; sigma[i] = sigma[i] ?? null;
+      }
+    }
     const guardValue = Number.isFinite(guardVal) ? guardVal : 1; const guardSoft = 0.95; const guardHard = 0.98; const breadthGate = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.6);
     const dynOnAdj = dynOnFlux + (mmValue >= 0.94 ? 0.05 : mmValue >= 0.90 ? 0.03 : 0);
     const pconOkBase = !Number.isFinite(pcon[i]) || pcon[i] >= (RISK_CFG_FFL.thresholds.pconOn ?? 0.55);
@@ -272,11 +342,36 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const onClassicMain = (diffVal >= dynOnAdj) && pconOk && apdfOk && stricter && guardValue < guardSoft && mmValue < th.mmOff && breadthGate;
     const onClassicAlt = !hiCorrBear && (Number.isFinite(jRiskBeta[i]) && jRiskBeta[i] >= 0.06) && (Number.isFinite(comboValue) && comboValue >= 0.10) && guardValue < 0.90;
     const strongOn = (diffVal >= (dynOnAdj + 0.03)) && (Number.isFinite(kappaVal) ? kappaVal >= (RISK_CFG_FFL.thresholds.kOn ?? 0.60) : true) && (Number.isFinite(pcon[i]) ? pcon[i] >= Math.max(0.65, (RISK_CFG_FFL.thresholds.pconOn ?? 0.55)) : true) && (Number.isFinite(vpc1Val) ? vpc1Val >= (RISK_CFG_FFL.thresholds.vOn ?? 0.05) : true) && guardValue < guardSoft && mmValue < th.mmOff;
-    const onClassic = (onClassicMain || onClassicAlt || strongOn) && !hiCorrDrift;
+    // EXP gates layered on top
+    let expOkOn = true; let expForceOff = false;
+    if (variant === 'exp') {
+      const ratioS = expRatio[i];
+      const rOn = Number.isFinite(RISK_CFG_FFL?.exp?.rOn) ? RISK_CFG_FFL.exp.rOn : 1.20;
+      const rOff = Number.isFinite(RISK_CFG_FFL?.exp?.rOff) ? RISK_CFG_FFL.exp.rOff : -1.10;
+      const breadthMin = Number.isFinite(RISK_CFG_FFL?.exp?.breadth1dMin) ? RISK_CFG_FFL.exp.breadth1dMin : 0.55;
+      const idxPrice0 = baseIdx + i + windowOffset;
+      const rQQQ = rollingReturnFromSeries(prices[SIGNAL.trade.baseSymbol], idxPrice0, 1);
+      const rIWM = rollingReturnFromSeries(prices['IWM'], idxPrice0, 1);
+      const anyPos = (Number.isFinite(rQQQ) ? rQQQ > 0 : false) || (Number.isFinite(rIWM) ? rIWM > 0 : false);
+      const bothPos = (Number.isFinite(rQQQ) ? rQQQ > 0 : false) && (Number.isFinite(rIWM) ? rIWM > 0 : false);
+      const needBoth = (RISK_CFG_FFL?.exp?.d0BothPosHiCorr ? (mmValue >= 0.90) : false);
+      const day0Ok = needBoth ? bothPos : (RISK_CFG_FFL?.exp?.d0AnyPos ? anyPos : true);
+      const breadth1dOk = (mmValue >= 0.90) ? ((breadthValue ?? 0) >= breadthMin) : true;
+      const onK = Number.isFinite(Number(process.env.ONK)) ? Number(process.env.ONK) : 0.75;
+      const offK = Number.isFinite(Number(process.env.OFFK)) ? Number(process.env.OFFK) : 0.50;
+      const hiScale = Number.isFinite(Number(process.env.HCORR)) ? Number(process.env.HCORR) : 1.25;
+      const sig = sigma[i]; const tauOn = Number.isFinite(sig) ? onK * sig : 0; const tauOff = Number.isFinite(sig) ? offK * sig : 0; const scale = mmValue >= 0.90 ? hiScale : 1.0;
+      const stOn = Number.isFinite(st[i]) && Number.isFinite(dSt[i]) && (st[i] > scale * tauOn) && (dSt[i] > 0) && (Number(ratioS) > 0);
+      const stOff = Number.isFinite(st[i]) && Number.isFinite(dSt[i]) && (st[i] < -scale * tauOff) && (dSt[i] < 0) && (Number(ratioS) < 0);
+      expOkOn = (Number.isFinite(ratioS) ? (ratioS >= rOn) : true) && day0Ok && breadth1dOk && (stOn || !Number.isFinite(sig));
+      expForceOff = (Number.isFinite(ratioS) ? (ratioS <= rOff) : false) || stOff;
+    }
+    const onExpAlt = (variant === 'exp') && expOkOn && guardValue < guardSoft && mmValue < th.mmOff;
+    const onClassic = ((onClassicMain || onClassicAlt || strongOn) || onExpAlt) && !hiCorrDrift;
     const offFlux = fluxVal <= dynOffFlux; const offGuard = (guardValue >= guardHard) || (mmValue >= th.mmOff); const guardOnly = offGuard && !offFlux;
     const breadthGateLoosen = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.5); const trendSupport = (fluxVal >= (dynOnFlux - 0.03)) && breadthGateLoosen && (Number.isFinite(comboValue) ? comboValue >= 0 : true);
     const hiCorr = mmValue >= 0.92; const guardConfirmDays = (hiCorr && trendSupport) ? 3 : 2; if (guardOnly) offGuardSeq += 1; else offGuardSeq = 0; const offGuardConfirmed = guardOnly && offGuardSeq >= guardConfirmDays;
-    const offByRel = ((Number.isFinite(vpc1Val) ? vpc1Val <= (RISK_CFG_FFL.thresholds.vOff ?? -0.05) : false) && (Math.abs(vpc1Val) >= 0.05)) || ((diffVal <= dynOffFlux) && (Number.isFinite(kappaVal) ? kappaVal < 0.55 : false));
+    const offByRel = ((Number.isFinite(vpc1Val) ? vpc1Val <= (RISK_CFG_FFL.thresholds.vOff ?? -0.05) : false) && (Math.abs(vpc1Val) >= 0.05)) || ((diffVal <= dynOffFlux) && (Number.isFinite(kappaVal) ? kappaVal < 0.55 : false)) || (variant === 'exp' && expForceOff);
     let offClassic = offByRel || offFlux || offGuardConfirmed || (Number.isFinite(pcon[i]) && pcon[i] <= (RISK_CFG_FFL.thresholds.pconOff ?? 0.40) && mmValue >= 0.92);
     if (hiCorrDrift) {
       offClassic = true;
@@ -284,7 +379,15 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const idxPrice = baseIdx + i + windowOffset; const rList = CLUSTERS.risk.map((sym) => rollingReturnFromSeries(prices[sym], idxPrice, 3)).filter(Number.isFinite);
     const risk3 = rList.length ? rList.reduce((a, b) => a + b, 0) / rList.length : null; const blockOnHighCorrDown = Number.isFinite(risk3) && risk3 <= 0 && mmValue >= 0.90;
     const rawOn = onClassic && !blockOnHighCorrDown; const rawOff = offClassic;
-    const hiCorrRisk = (mmValue >= 0.90) || ((mmTrend[i] ?? 0) > 0.005) || ((fullFluxZ[i] ?? 0) >= 1.5); const accel = (fluxSlope[i] ?? 0) > 0 && (mmTrend[i] ?? 0) <= 0; const strongPcon = Number.isFinite(pcon[i]) && pcon[i] >= 0.68; const confirmOnDays = strongOn ? 1 : (hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2));
+    const hiCorrRisk = (mmValue >= 0.90) || ((mmTrend[i] ?? 0) > 0.005) || ((fullFluxZ[i] ?? 0) >= 1.5);
+    const accel = (fluxSlope[i] ?? 0) > 0 && (mmTrend[i] ?? 0) <= 0;
+    const strongPcon = Number.isFinite(pcon[i]) && pcon[i] >= 0.68;
+    let confirmOnDays = strongOn ? 1 : (hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2));
+    if (variant === 'exp') {
+      const strongK = Number.isFinite(Number(process.env.STRONGK)) ? Number(process.env.STRONGK) : 1.5;
+      const sig = sigma[i]; const tOn = Number.isFinite(sig) ? (Number.isFinite(Number(process.env.ONK)) ? Number(process.env.ONK) : 0.75) * sig : null;
+      if (Number.isFinite(st[i]) && Number.isFinite(tOn) && st[i] >= strongK * tOn) confirmOnDays = 1;
+    }
     onCand = rawOn ? onCand + 1 : 0; offCand = rawOff ? offCand + 1 : 0;
     let decided = prevState; if (prevState === 1) { if (rawOff) decided = -1; else decided = 1; }
     else if (prevState === -1) { if (onCand >= confirmOnDays) decided = 1; else decided = -1; }
@@ -331,6 +434,15 @@ function main() {
   const ret = baseReturns; const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]); const state1 = ffl.state.slice(0, ffl.state.length - 1); const hr1 = computeHitRate(state1, fwd1);
   const horizon = 5; const fwd5 = []; for (let i = 0; i < ret.length; i += 1) { let prod = 1; for (let k = 1; k <= horizon && i + k < ret.length; k += 1) prod *= 1 + ret[i + k]; fwd5.push(prod - 1); } const state5 = ffl.state.slice(0, ffl.state.length - 1); const hr5 = computeHitRate(state5, fwd5.slice(0, state5.length));
   const yrStrat = yearlyReturnsFromEquity(dates, eqStrat).filter((x) => x.year >= 2020 && x.year <= 2025); const yrBH = yearlyReturnsFromEquity(dates, eqBH).filter((x) => x.year >= 2020 && x.year <= 2025);
+  // Transition timing metrics (all-time within filtered range)
+  function fwdCum(i, k) { let prod = 1; for (let t = 1; t <= k && i + t < ret.length; t += 1) prod *= 1 + (ret[i + t] || 0); return prod - 1; }
+  function timingHits(k) {
+    let onC=0,onH=0, offC=0,offH=0; const st = ffl.state;
+    for (let i=1;i<st.length;i+=1){ const prev=st[i-1], cur=st[i]; if (cur===1 && prev!==1){ onC+=1; const r=fwdCum(i,k); if (Number.isFinite(r) && r>0) onH+=1; }
+      if (cur===-1 && prev!==-1){ offC+=1; const r=fwdCum(i,k); if (Number.isFinite(r) && r<0) offH+=1; } }
+    return { on: onC>0? onH/onC : 0, off: offC>0? offH/offC : 0, counts:{on:onC,off:offC} };
+  }
+  const t5 = timingHits(5); const t10 = timingHits(10);
   // Regime proportions and miss metrics (using executed state and 1d forward returns)
   const N = Math.min(executedState.length, baseReturns.length);
   let onDays = 0, offDays = 0, neutralDays = 0;
@@ -356,7 +468,7 @@ function main() {
       offOn: offCount > 0 ? offMiss / offCount : 0,
     },
   };
-  const out = { window: WINDOW, range: { start: RANGE_START, end: dates[dates.length - 1] }, equity: { strategy: eqStrat[eqStrat.length - 1], benchmark: eqBH[eqBH.length - 1] }, hitRate: { d1: hr1, d5: hr5 }, yearly: { strategy: Object.fromEntries(yrStrat.map((x) => [x.year, x.ret])), benchmark: Object.fromEntries(yrBH.map((x) => [x.year, x.ret])) }, drift: ffl.drift, regime };
+  const out = { window: WINDOW, range: { start: RANGE_START, end: dates[dates.length - 1] }, equity: { strategy: eqStrat[eqStrat.length - 1], benchmark: eqBH[eqBH.length - 1] }, hitRate: { d1: hr1, d5: hr5 }, yearly: { strategy: Object.fromEntries(yrStrat.map((x) => [x.year, x.ret])), benchmark: Object.fromEntries(yrBH.map((x) => [x.year, x.ret])) }, drift: ffl.drift, regime, timing: { k5: t5, k10: t10 } };
   console.log(JSON.stringify(out, null, 2));
 }
 

@@ -885,6 +885,7 @@ const RISK_CFG_FFL = {
     breadth1dMin: 0.55, // stricter breadth when mm high
     d0AnyPos: true,     // require any of {QQQ,IWM} > 0 on On-day
     d0BothPosHiCorr: true, // when mm>=0.90 require both > 0
+    ti: { win: 63, onK: 0.75, offK: 0.50, hiCorrScale: 1.25, strongK: 1.5 },
   },
   variant: 'classic', // default: Classic-FFL with enhanced guard; 'exp' enables ratio gates
 };
@@ -1649,6 +1650,44 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   let driftSeq = 0;
   let driftCooldown = 0;
   let inDriftEpoch = false;
+  // EXP timing buffers
+  const expSt = new Array(length).fill(null);
+  const expStPrev = new Array(length).fill(null);
+  const expSigma = new Array(length).fill(null);
+
+  function median(values) {
+    const xs = values.slice().sort((a,b)=>a-b);
+    const n = xs.length; if (n===0) return null; const m = Math.floor(n/2);
+    return (n%2===1) ? xs[m] : 0.5*(xs[m-1]+xs[m]);
+  }
+  function rollingSigmaMAD(arr, end, win) {
+    const xs = [];
+    for (let k=Math.max(0,end-win+1); k<=end; k+=1) { const v=arr[k]; if (Number.isFinite(v)) xs.push(v); }
+    if (xs.length < 5) return null;
+    const med = median(xs);
+    const dev = xs.map(v=>Math.abs(v-med));
+    const mad = median(dev);
+    if (!Number.isFinite(mad)) return null;
+    return 1.4826 * mad;
+  }
+
+  // Precompute EXP timing series if needed
+  if (variant === 'exp') {
+    const win = Number.isFinite(RISK_CFG_FFL?.exp?.ti?.win) ? RISK_CFG_FFL.exp.ti.win : 63;
+    const ratios = slice.__expRatio || [];
+    // Build EMAs for ratio
+    const emaFast = ema(ratios.map((v)=>Number.isFinite(v)?v:0), 3);
+    const emaSlow = ema(ratios.map((v)=>Number.isFinite(v)?v:0), 10);
+    for (let i=0;i<length;i+=1){
+      const rf = Number.isFinite(emaFast[i])?emaFast[i]:null;
+      const rs = Number.isFinite(emaSlow[i])?emaSlow[i]:null;
+      const st = (rf!=null && rs!=null) ? (rf - rs) : null;
+      expSt[i] = st;
+      expStPrev[i] = i>0 && Number.isFinite(expSt[i-1]) && Number.isFinite(st) ? (st - expSt[i-1]) : null;
+      expSigma[i] = rollingSigmaMAD(expSt, i, win);
+    }
+  }
+
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0;
     const diffVal = diffusionScore[i] ?? fluxVal;
@@ -1674,7 +1713,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       slice.__expRatio[i] = smooth;
     }
 
-    if (variant === 'classic') {
+    if (variant === 'classic' || variant === 'exp') {
       const guardValue = Number.isFinite(guardVal) ? guardVal : 1;
       const guardSoft = 0.95;
       const guardHard = 0.98;
@@ -1703,7 +1742,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const stricter = !hiCorrBear || (
         (diffVal >= (dynOnAdj + 0.05)) && (Number.isFinite(pcon[i]) ? pcon[i] >= 0.65 : true) && (Number.isFinite(apdf[i]) ? apdf[i] >= 0 : true) && (Number.isFinite(comboValue) ? comboValue >= 0.10 : true)
       );
-      // EXP constraints
+      // EXP constraints + timing
       let expOkOn = true;
       let expForceOff = false;
       if (variant === 'exp') {
@@ -1720,8 +1759,20 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         const needBoth = (RISK_CFG_FFL?.exp?.d0BothPosHiCorr ? (mmValue >= 0.90) : false);
         const day0Ok = needBoth ? bothPos : (RISK_CFG_FFL?.exp?.d0AnyPos ? anyPos : true);
         const breadth1dOk = (mmValue >= 0.90) ? ((breadthValue ?? 0) >= breadthMin) : true;
-        expOkOn = (Number.isFinite(ratioS) ? (ratioS >= rOn) : true) && day0Ok && breadth1dOk;
-        expForceOff = Number.isFinite(ratioS) ? (ratioS <= rOff) : false;
+        // Timing layer
+        const onK = Number.isFinite(RISK_CFG_FFL?.exp?.ti?.onK) ? RISK_CFG_FFL.exp.ti.onK : 0.75;
+        const offK = Number.isFinite(RISK_CFG_FFL?.exp?.ti?.offK) ? RISK_CFG_FFL.exp.ti.offK : 0.50;
+        const hiScale = Number.isFinite(RISK_CFG_FFL?.exp?.ti?.hiCorrScale) ? RISK_CFG_FFL.exp.ti.hiCorrScale : 1.25;
+        const sig = expSigma[i];
+        const tauOn = Number.isFinite(sig) ? onK * sig : 0;
+        const tauOff = Number.isFinite(sig) ? offK * sig : 0;
+        const scale = mmValue >= 0.90 ? hiScale : 1.0;
+        const St = expSt[i];
+        const dSt = expStPrev[i];
+        const stOn = Number.isFinite(St) && Number.isFinite(dSt) && (St > scale * tauOn) && (dSt > 0) && (Number(ratioS) > 0);
+        const stOff = Number.isFinite(St) && Number.isFinite(dSt) && (St < -scale * tauOff) && (dSt < 0) && (Number(ratioS) < 0);
+        expOkOn = (Number.isFinite(ratioS) ? (ratioS >= rOn) : true) && day0Ok && breadth1dOk && (stOn || (!Number.isFinite(sig))); // fall back if sigma unavailable
+        expForceOff = (Number.isFinite(ratioS) ? (ratioS <= rOff) : false) || stOff;
       }
 
       const onClassicMain = (diffVal >= dynOnAdj) && pconOk && apdfOk && stricter && guardValue < guardSoft && mmValue < th.mmOff && breadthGate && expOkOn;
@@ -1779,7 +1830,14 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const accel = (fluxSlope[i] ?? 0) > 0 && (mmTrend[i] ?? 0) <= 0;
       const strongPcon = Number.isFinite(pcon[i]) && pcon[i] >= 0.68;
       // Strong-On path shortens confirmation to 1 day
-      const confirmOnDays = strongOn ? 1 : (hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2));
+      let confirmOnDays = strongOn ? 1 : (hiCorrRisk ? 3 : strongPcon ? 1 : (accel ? 1 : 2));
+      if (variant === 'exp') {
+        const strongK = Number.isFinite(RISK_CFG_FFL?.exp?.ti?.strongK) ? RISK_CFG_FFL.exp.ti.strongK : 1.5;
+        const sig = expSigma[i];
+        const St = expSt[i];
+        const tauOn = Number.isFinite(sig) ? (Number.isFinite(RISK_CFG_FFL?.exp?.ti?.onK) ? RISK_CFG_FFL.exp.ti.onK : 0.75) * sig : null;
+        if (Number.isFinite(St) && Number.isFinite(tauOn) && St >= strongK * tauOn) confirmOnDays = 1;
+      }
       onCand = rawOn ? onCand + 1 : 0;
       offCand = rawOff ? offCand + 1 : 0;
 
