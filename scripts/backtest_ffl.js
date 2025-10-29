@@ -304,23 +304,21 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0; const diffVal = diffusionScore[i] ?? fluxVal; const mmValue = mm[i] ?? 0; const comboValue = comboMomentum[i] ?? null; const breadthValue = breadth[i] ?? null; const guardVal = guard[i] ?? 1;
     const vpc1Val = Number.isFinite(vPC1[i]) ? vPC1[i] : 0; const lam = 1.0; const kappaVal = (Math.abs(diffVal)) / (Math.abs(diffVal) + lam * Math.abs(vpc1Val) + 1e-6); kappa[i] = Number.isFinite(kappaVal) ? kappaVal : null;
+    // EXP ratio (if variant=exp), else use diffusionScore directly for timing
+    const lamExp = Number.isFinite(RISK_CFG_FFL?.exp?.lam) ? RISK_CFG_FFL.exp.lam : (Number(process.env.ELAM) || 1.0);
+    const denom = lamExp * Math.abs(vpc1Val) + 1e-6;
+    const rawRatio = Number.isFinite(diffVal) ? (diffVal / denom) : null;
     if (variant === 'exp') {
-      const lamExp = Number.isFinite(RISK_CFG_FFL?.exp?.lam) ? RISK_CFG_FFL.exp.lam : 1.0;
-      const denom = lamExp * Math.abs(vpc1Val) + 1e-6;
-      const raw = Number.isFinite(diffVal) ? (diffVal / denom) : null;
       const prev = i > 0 ? expRatio[i - 1] : null;
-      expRatio[i] = (Number.isFinite(raw) && Number.isFinite(prev)) ? (0.5 * prev + 0.5 * raw) : (Number.isFinite(raw) ? raw : prev);
-      // timing EMA fast/slow on ratio
-      const r = expRatio[i];
-      if (Number.isFinite(r)) {
-        efPrev = (efPrev == null) ? r : (alpha3 * r + (1 - alpha3) * efPrev);
-        esPrev = (esPrev == null) ? r : (alpha10 * r + (1 - alpha10) * esPrev);
-        st[i] = efPrev - esPrev;
-        dSt[i] = (i > 0 && Number.isFinite(st[i - 1])) ? (st[i] - st[i - 1]) : null;
-        sigma[i] = rollingSigmaMAD(st, i, Number.isFinite(Number(process.env.WIN)) ? Number(process.env.WIN) : 63);
-      } else {
-        st[i] = st[i] ?? null; dSt[i] = dSt[i] ?? null; sigma[i] = sigma[i] ?? null;
-      }
+      expRatio[i] = (Number.isFinite(rawRatio) && Number.isFinite(prev)) ? (0.5 * prev + 0.5 * rawRatio) : (Number.isFinite(rawRatio) ? rawRatio : prev);
+    }
+    const x = (process.env.TI_SRC === 'ratio') ? (expRatio[i] ?? rawRatio) : (diffusionScore[i] ?? null);
+    if (Number.isFinite(x)) {
+      efPrev = (efPrev == null) ? x : (alpha3 * x + (1 - alpha3) * efPrev);
+      esPrev = (esPrev == null) ? x : (alpha10 * x + (1 - alpha10) * esPrev);
+      st[i] = efPrev - esPrev;
+      dSt[i] = (i > 0 && Number.isFinite(st[i - 1])) ? (st[i] - st[i - 1]) : null;
+      sigma[i] = rollingSigmaMAD(st, i, Number.isFinite(Number(process.env.WIN)) ? Number(process.env.WIN) : 63);
     }
     const guardValue = Number.isFinite(guardVal) ? guardVal : 1; const guardSoft = 0.95; const guardHard = 0.98; const breadthGate = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.6);
     const dynOnAdj = dynOnFlux + (mmValue >= 0.94 ? 0.05 : mmValue >= 0.90 ? 0.03 : 0);
@@ -371,7 +369,27 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     const offFlux = fluxVal <= dynOffFlux; const offGuard = (guardValue >= guardHard) || (mmValue >= th.mmOff); const guardOnly = offGuard && !offFlux;
     const breadthGateLoosen = (breadthValue ?? 0) >= ((th.breadthOn ?? 0.5) * 0.5); const trendSupport = (fluxVal >= (dynOnFlux - 0.03)) && breadthGateLoosen && (Number.isFinite(comboValue) ? comboValue >= 0 : true);
     const hiCorr = mmValue >= 0.92; const guardConfirmDays = (hiCorr && trendSupport) ? 3 : 2; if (guardOnly) offGuardSeq += 1; else offGuardSeq = 0; const offGuardConfirmed = guardOnly && offGuardSeq >= guardConfirmDays;
-    const offByRel = ((Number.isFinite(vpc1Val) ? vpc1Val <= (RISK_CFG_FFL.thresholds.vOff ?? -0.05) : false) && (Math.abs(vpc1Val) >= 0.05)) || ((diffVal <= dynOffFlux) && (Number.isFinite(kappaVal) ? kappaVal < 0.55 : false)) || (variant === 'exp' && expForceOff);
+    // Terminal breaker: end-of-run cut using EXP timing + high absorption
+    let endBreaker = false;
+    {
+      const TR_ON = String(process.env.TRON || '1') === '1';
+      if (TR_ON) {
+        const tr_mm = Number.isFinite(Number(process.env.TRMM)) ? Number(process.env.TRMM) : 0.95;
+        const tr_kappa = Number.isFinite(Number(process.env.TRKAPPA)) ? Number(process.env.TRKAPPA) : 0.60;
+        const onK = Number.isFinite(Number(process.env.ONK)) ? Number(process.env.ONK) : 0.75;
+        const hiScale = Number.isFinite(Number(process.env.HCORR)) ? Number(process.env.HCORR) : 1.25;
+        const sig = sigma[i];
+        const tauOff = Number.isFinite(sig) ? (Number.isFinite(Number(process.env.OFFK)) ? Number(process.env.OFFK) : 0.50) * sig : 0;
+        const scale = mmValue >= 0.90 ? hiScale : 1.0;
+        endBreaker = (mmValue >= tr_mm)
+          && Number.isFinite(st[i]) && Number.isFinite(dSt[i])
+          && (st[i] < -scale * tauOff) && (dSt[i] < 0)
+          && ((fluxSlope[i] ?? 0) < 0)
+          && ((Number.isFinite(kappaVal) ? kappaVal : 1) < tr_kappa || (vpc1Val <= 0));
+      }
+    }
+
+    const offByRel = ((Number.isFinite(vpc1Val) ? vpc1Val <= (RISK_CFG_FFL.thresholds.vOff ?? -0.05) : false) && (Math.abs(vpc1Val) >= 0.05)) || ((diffVal <= dynOffFlux) && (Number.isFinite(kappaVal) ? kappaVal < 0.55 : false)) || (endBreaker) || (variant === 'exp' && expForceOff);
     let offClassic = offByRel || offFlux || offGuardConfirmed || (Number.isFinite(pcon[i]) && pcon[i] <= (RISK_CFG_FFL.thresholds.pconOff ?? 0.40) && mmValue >= 0.92);
     if (hiCorrDrift) {
       offClassic = true;
@@ -423,8 +441,29 @@ function main() {
     if (regime > 0) {
       const idxPrice = baseIdx + i + windowOffset;
       const bench10 = rollingReturnFromSeries(state.priceSeries[SIGNAL.trade.baseSymbol], idxPrice, 10);
-      const hiCorrBear = (ffl.mm?.[i] ?? 0) >= 0.88 && (Number.isFinite(bench10) ? bench10 <= 0 : true);
-      const lev = hiCorrBear ? 1 : SIGNAL.trade.leverage;
+      const hiCorrBear = (ffl.mm?.[i] ?? 0) >= 0.90 && (Number.isFinite(bench10) ? bench10 <= 0 : true);
+      // Dynamic leverage (available for any variant)
+      let lev = SIGNAL.trade.leverage;
+      if ((process.env.LEV_MODE === '1')) {
+        const r = Array.isArray(ffl?.diffusionScore) && ffl.diffusionScore[i] != null && Number.isFinite(ffl.vPC1?.[i])
+          ? (ffl.diffusionScore[i] / ((Number(process.env.ELAM) || 1.0) * Math.abs(ffl.vPC1[i] || 0) + 1e-6))
+          : null;
+        const r0 = Number.isFinite(Number(process.env.LEV_R0)) ? Number(process.env.LEV_R0) : 0.50;
+        const r1 = Number.isFinite(Number(process.env.LEV_R1)) ? Number(process.env.LEV_R1) : 1.20;
+        const lmin = Number.isFinite(Number(process.env.LEV_MIN)) ? Number(process.env.LEV_MIN) : 1.0;
+        const lmax = Number.isFinite(Number(process.env.LEV_MAX)) ? Number(process.env.LEV_MAX) : 3.0;
+        let p = 0;
+        if (Number.isFinite(r)) {
+          p = (r - r0) / (r1 - r0);
+          if (p < 0) p = 0; if (p > 1) p = 1;
+        }
+        lev = lmin + (lmax - lmin) * p;
+        // In high-correlation bearish drift, damp leverage further
+        const dampCap = Number.isFinite(Number(process.env.LEV_DAMP)) ? Number(process.env.LEV_DAMP) : 1.25;
+        if (hiCorrBear) lev = Math.max(lmin, Math.min(lev, dampCap));
+      } else if (hiCorrBear) {
+        lev = 1;
+      }
       return Math.max(-0.99, lev * baseReturns[i]);
     }
     if (regime < 0) return 0;
@@ -443,6 +482,9 @@ function main() {
     return { on: onC>0? onH/onC : 0, off: offC>0? offH/offC : 0, counts:{on:onC,off:offC} };
   }
   const t5 = timingHits(5); const t10 = timingHits(10);
+  // MDD for strategy
+  function maxDrawdown(series){ let peak=series[0]||1, mdd=0; for(const v of series){ if(v>peak) peak=v; const dd=(v/peak)-1; if(dd<mdd) mdd=dd; } return mdd; }
+  const mdd = maxDrawdown(eqStrat);
   // Regime proportions and miss metrics (using executed state and 1d forward returns)
   const N = Math.min(executedState.length, baseReturns.length);
   let onDays = 0, offDays = 0, neutralDays = 0;
@@ -468,7 +510,7 @@ function main() {
       offOn: offCount > 0 ? offMiss / offCount : 0,
     },
   };
-  const out = { window: WINDOW, range: { start: RANGE_START, end: dates[dates.length - 1] }, equity: { strategy: eqStrat[eqStrat.length - 1], benchmark: eqBH[eqBH.length - 1] }, hitRate: { d1: hr1, d5: hr5 }, yearly: { strategy: Object.fromEntries(yrStrat.map((x) => [x.year, x.ret])), benchmark: Object.fromEntries(yrBH.map((x) => [x.year, x.ret])) }, drift: ffl.drift, regime, timing: { k5: t5, k10: t10 } };
+  const out = { window: WINDOW, range: { start: RANGE_START, end: dates[dates.length - 1] }, equity: { strategy: eqStrat[eqStrat.length - 1], benchmark: eqBH[eqBH.length - 1] }, hitRate: { d1: hr1, d5: hr5 }, yearly: { strategy: Object.fromEntries(yrStrat.map((x) => [x.year, x.ret])), benchmark: Object.fromEntries(yrBH.map((x) => [x.year, x.ret])) }, drift: ffl.drift, regime, timing: { k5: t5, k10: t10 }, metrics: { mdd } };
   console.log(JSON.stringify(out, null, 2));
 }
 

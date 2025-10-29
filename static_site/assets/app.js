@@ -879,13 +879,15 @@ const RISK_CFG_FFL = {
   kLambda: 1.0,
   // EXP (Diffusion/Drift ratio) knobs
   exp: {
-    lam: 1.0,           // ratio denominator scale for drift
-    rOn: 1.20,          // min smoothed ratio to allow On
-    rOff: -1.10,        // max smoothed ratio to force Off
-    breadth1dMin: 0.55, // stricter breadth when mm high
-    d0AnyPos: true,     // require any of {QQQ,IWM} > 0 on On-day
-    d0BothPosHiCorr: true, // when mm>=0.90 require both > 0
-    ti: { win: 63, onK: 0.75, offK: 0.50, hiCorrScale: 1.25, strongK: 1.5 },
+    lam: 0.75,          // ratio denominator scale for drift (aggressive)
+    rOn: 0.76,          // min smoothed ratio to allow On
+    rOff: -0.05,        // max smoothed ratio to force Off
+    breadth1dMin: 0.45, // high-corr breadth minimum (slightly relaxed)
+    d0AnyPos: true,     // any of {QQQ,IWM} > 0 on entry day
+    d0BothPosHiCorr: false, // don't require both in high correlation
+    ti: { win: 52, onK: 0.81, offK: 0.37, hiCorrScale: 1.25, strongK: 1.5 },
+    // Dynamic leverage defaults for UI backtest
+    lev: { r0: 0.30, r1: 1.05, min: 1.0, max: 3.0, damp: 3.0 },
   },
   variant: 'classic', // default: Classic-FFL with enhanced guard; 'exp' enables ratio gates
 };
@@ -1127,10 +1129,41 @@ function renderBacktest() {
     ? series.executedState
     : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
   const stratReturns = executedState.map((regime, idx) => {
-    if (regime > 0) return leveredReturns[idx];
+    if (regime > 0) {
+      if (state.riskMode === 'ffl_exp') {
+        // dynamic leverage based on diffusion/drift ratio strength
+        const lam = Number(RISK_CFG_FFL?.exp?.lam) || 1.0;
+        const ratio = (() => {
+          const diff = Array.isArray(series?.diffusionScore) ? series.diffusionScore[idx] : null;
+          const vpc1 = Array.isArray(series?.vPC1) ? series.vPC1[idx] : null;
+          if (!Number.isFinite(diff) || !Number.isFinite(vpc1)) return null;
+          const denom = lam * Math.abs(vpc1) + 1e-6;
+          return diff / denom;
+        })();
+        const cfg = RISK_CFG_FFL.exp.lev || { r0: 0.30, r1: 1.05, min: 1.0, max: 3.0, damp: 3.0 };
+        let p = 0; if (Number.isFinite(ratio)) { p = (ratio - cfg.r0) / (cfg.r1 - cfg.r0); if (p < 0) p = 0; if (p > 1) p = 1; }
+        let lev = (cfg.min || 1) + ((cfg.max || 3) - (cfg.min || 1)) * p;
+        // damp leverage when absorption high and 10-day QQQ momentum ≤ 0
+        const priceIndex = windowOffset + baseIdx + idx;
+        const bench10 = rollingReturnFromSeriesUI(prices, SIGNAL.trade.baseSymbol, priceIndex, 10);
+        const mmVal = Array.isArray(series?.mm) ? series.mm[idx] : 0;
+        const hiCorrBear = (mmVal >= 0.90) && (Number.isFinite(bench10) ? bench10 <= 0 : true);
+        if (hiCorrBear) lev = Math.max(cfg.min || 1, Math.min(lev, cfg.damp || 3));
+        return leveragedReturn(baseReturns[idx], lev);
+      }
+      return leveredReturns[idx];
+    }
     if (regime < 0) return 0; // cash
     return baseReturns[idx]; // neutral holds base asset
   });
+
+  function rollingReturnFromSeriesUI(priceSeries, symbol, index, lookback) {
+    const series = priceSeries?.[symbol];
+    if (!Array.isArray(series) || lookback <= 0 || index - lookback < 0) return null;
+    const end = series[index]; const start = series[index - lookback];
+    if (!Number.isFinite(end) || !Number.isFinite(start) || start === 0) return null;
+    return end / start - 1;
+  }
 
   // Equity curves
   const eqStrat = [];
