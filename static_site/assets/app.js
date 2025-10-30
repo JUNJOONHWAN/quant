@@ -2019,6 +2019,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   let stabGraceLeft = 0;
   let stabHazardLeft = 0;
   let stabLeadOnLeft = 0;
+  // neutral clamp run for stab (consecutive days)
+  let stabNeutRun = 0;
   // Running downtrend counter for simple 'accelerate Off' rule
   let sDownRun = 0;
 
@@ -2215,6 +2217,18 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       onCand = rawOn ? onCand + 1 : 0;
       offCand = rawOff ? offCand + 1 : 0;
 
+      // Neutral clamp (FFL+STAB only): mid-level S, tiny slope, tiny flux → force Neutral after 2 days
+      if (variant === 'stab') {
+        const S_now = Number.isFinite(Sseries[i]) ? Sseries[i] : null;
+        const slopeAbs = Math.abs(Number.isFinite(sSlope[i]) ? sSlope[i] : NaN);
+        const fluxAbs = Math.abs(Number.isFinite(jFlux[i]) ? jFlux[i] : NaN);
+        const inMidBand = Number.isFinite(S_now) && S_now >= sNeutralLo && S_now <= sNeutralHi;
+        const tinySlope = Number.isFinite(slopeAbs) && slopeAbs < 0.005;
+        const tinyFlux = Number.isFinite(fluxAbs) && fluxAbs < 0.03;
+        const clampCandidate = inMidBand && tinySlope && tinyFlux;
+        stabNeutRun = clampCandidate ? (stabNeutRun + 1) : 0;
+      }
+
       // Sticky 로직: 중립보다 On/Off 지속을 우선, 전환은 확인일수 요구
       let decided = prevState;
       if (prevState === 1) {
@@ -2238,11 +2252,20 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         // Neutral에서는 Off가 우선, 아니면 On 2일 확인
         if (offCand >= 1) decided = -1;
         else if (onCand >= confirmOnDays) decided = 1;
-        else decided = 0;
+        else {
+          // EXP tie-breaker: use Flux sign when undecided
+          if (variant === 'exp') {
+            decided = (Number.isFinite(jFlux[i]) && Math.abs(jFlux[i]) > 0) ? (jFlux[i] > 0 ? 1 : -1) : 0;
+          } else {
+            decided = 0;
+          }
+        }
       }
 
       // Long drift makes entire regime Off
       if (inDriftEpoch) decided = -1;
+      // Apply neutral clamp after decision (takes priority only in stab)
+      if (variant === 'stab' && stabNeutRun >= 2) decided = 0;
       stateArr[i] = decided;
       fragile[i] = decided >= 0 && (guardValue >= th.mmFragile || (guardValue >= guardSoft && guardValue < guardHard));
       holdDays = decided === prevState ? holdDays + 1 : 0;
@@ -2673,7 +2696,7 @@ function buildMethodologySection() {
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
     '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다.',
-    '- FFL+EXP Mode = Classic(현재 레짐) + Flux(J_norm, 전환 감지) + Stability(시장 결합도, EMA/레벨) 3요소를 단순 결합합니다. 다수결로 On/Off를 결정(동률이면 Classic 우선→Flux), 점수는 세 값을 단순 평균합니다. 별도 수식은 추가하지 않습니다.',
+    '- FFL+EXP Mode = Classic(현재 레짐) + Flux(J_norm, 전환 감지) + Stability(시장 결합도, EMA/레벨) 3요소를 단순 결합합니다. 다수결로 On/Off를 결정(동률이면 Flux 우선), 점수는 세 값을 단순 평균합니다. 별도 수식은 추가하지 않습니다.',
     '- 기본 동작은 Classic이며 사용자가 명시적으로 변경한 경우에만 Enhanced/FFL이 적용됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
