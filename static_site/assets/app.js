@@ -2015,10 +2015,12 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     sDownSeq = downCond ? (sDownSeq + 1) : 0;
   }
 
-  // STAB phase counters (grace then hazard after sharp down-slope)
+  // STAB phase counters (not used in simplified variant, kept for compatibility)
   let stabGraceLeft = 0;
   let stabHazardLeft = 0;
   let stabLeadOnLeft = 0;
+  // Running downtrend counter for simple 'accelerate Off' rule
+  let sDownRun = 0;
 
   for (let i = 0; i < length; i += 1) {
     const fluxVal = jFlux[i] ?? 0;
@@ -2059,6 +2061,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       const sZ_now = Number.isFinite(sZ[i]) ? sZ[i] : null;
       const stabUpTrend = (variant === 'stab') && Number.isFinite(sVal_now) && sVal_now > 0;
       const stabPlunge = (variant === 'stab') && Number.isFinite(sVal_now) && Number.isFinite(sZ_now) && (sZ_now <= -sZDown) && (sVal_now < 0);
+      if (variant === 'stab') {
+        if (Number.isFinite(sVal_now) && sVal_now < -Math.max(1e-6, sMin)) sDownRun += 1; else sDownRun = 0;
+      }
       // 확산 점수(diffVal) + 전쌍 일관성(PCON) + APDF 약한 필터
       const pconOkBase = !Number.isFinite(pcon[i]) || pcon[i] >= (th.pconOn ?? 0.55);
       const apdfOk = !Number.isFinite(apdf[i]) || apdf[i] >= -0.05;
@@ -2180,6 +2185,11 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         }
         if (stabPlunge) {
           rawOff = true; // switch to Off early on plunge
+        }
+        // Accelerate Off on sustained downtrend (time-lagged effect)
+        const needDown = Math.max(1, Number.isFinite(stab.lagDown) ? Math.floor(stab.lagDown) : 4);
+        if (!stabUpTrend && !stabPlunge && sDownRun >= needDown) {
+          rawOff = true;
         }
       }
       // 동적 On 확인일: 확산 가속(+), 흡수 하락(≤0)이면 1일, 기본 2일, 고상관/흡수 상승·ΔCorr-Z↑면 3일
