@@ -2608,7 +2608,7 @@ function buildTextReportPayload() {
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
-    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : 'Classic'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : state.riskMode === 'ffl_stab' ? 'FFL+STAB' : 'Classic'}`,
     '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',

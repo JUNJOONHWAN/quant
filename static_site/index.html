@@ -202,6 +202,9 @@
     <p>
       색상: 빨강(0–0.3)은 분산/결합 약함, 노랑(0.3–0.4)은 동조 전환 구간, 초록(0.4–1.0)은 결합 강함(위험/기회 집중)입니다. 초록이어도 흡수비(mm) ≥ 0.90이면 Guard가 긴장 상태일 수 있습니다.
     </p>
+    <p>
+      참고: FFL+STAB 보정에서 쓰는 <strong>기울기</strong>는 EMA(21)−EMA(63)이며, 하락 급변 여부는 이 기울기의 MAD‑z(126일)를 활용합니다. 상승 추세(slope&gt;0)에서는 조기 Risk‑Off를 막고, 변곡 급락(z≤−zDown)이나 하락 지속(lagDown일)에서는 Off 전환을 앞당깁니다.
+    </p>
   </section>
   <section class="info-popover" id="info-sub">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
@@ -223,6 +226,10 @@
     </p>
     <p>
       FFL+EXP(Classic + Flux + Stability): 세 가지 축을 단순 결합합니다. (1) Classic(선형): 현재 레짐을 알려주는 기본 점수, (2) Flux(미분): Safe↔Risk 자금 흐름(J_norm)으로 전환 감지, (3) Stability(적분): 시장 결합도(EMA/레벨)로 거시 방향. 세 값의 다수결로 On/Off를 결정하며(동률이면 Classic 우선, 그다음 Flux), 점수는 세 값을 단순 평균합니다. 별도의 추가 수식 없이 이 3요소 조합만 사용합니다. 기본 모드는 Classic입니다.
+    </p>
+    <p>
+      FFL+STAB(FFL 기반, Stability 추세/변곡 보정): 기본 레짐은 FFL이 결정하고, Stability의 월단위 기울기(EMA(21)−EMA(63))로 <em>전환 타이밍만</em> 간단히 조정합니다.
+      규칙은 3가지입니다. (1) <strong>추세 상승(slope&gt;0)</strong>일 때는 당일 Risk‑Off 전환을 차단해 조기 이탈을 방지, (2) <strong>변곡 급락</strong>(slope&lt;0 이면서 z≤−zDown)일 때는 Off로 <strong>조기 전환</strong>, (3) <strong>완만한 하락 추세 지속</strong>(slope&lt;−slopeMin 연속 lagDown일)일 때도 Off로 <strong>앞당겨 전환</strong>. 이 보정은 FFL의 수익 구간은 최대한 유지하고 하락 전환은 빠르게 잡아내는 것을 목표로 합니다.
     </p>
     <p>
       활용 팁: <strong>강력 Risk-On</strong>은 (1) corr ≥ 0.5, (2) comboMomentum ≥ +1.5%, (3) guard < 0.7이 동시에 잡힐 때이며 2025-10-24가 대표 사례입니다. 스태빌리티·상관이 높아도 guard ≥ 0.9 또는 combo ≤ 0%라면 “안정된 하락”으로 보고 On 진입을 유보하세요.
