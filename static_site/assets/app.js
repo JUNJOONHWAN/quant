@@ -1129,30 +1129,7 @@ function renderBacktest() {
     ? series.executedState
     : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
   const stratReturns = executedState.map((regime, idx) => {
-    if (regime > 0) {
-      if (state.riskMode === 'ffl_exp') {
-        // dynamic leverage based on diffusion/drift ratio strength
-        const lam = Number(RISK_CFG_FFL?.exp?.lam) || 1.0;
-        const ratio = (() => {
-          const diff = Array.isArray(series?.diffusionScore) ? series.diffusionScore[idx] : null;
-          const vpc1 = Array.isArray(series?.vPC1) ? series.vPC1[idx] : null;
-          if (!Number.isFinite(diff) || !Number.isFinite(vpc1)) return null;
-          const denom = lam * Math.abs(vpc1) + 1e-6;
-          return diff / denom;
-        })();
-        const cfg = RISK_CFG_FFL.exp.lev || { r0: 0.30, r1: 1.05, min: 1.0, max: 3.0, damp: 3.0 };
-        let p = 0; if (Number.isFinite(ratio)) { p = (ratio - cfg.r0) / (cfg.r1 - cfg.r0); if (p < 0) p = 0; if (p > 1) p = 1; }
-        let lev = (cfg.min || 1) + ((cfg.max || 3) - (cfg.min || 1)) * p;
-        // damp leverage when absorption high and 10-day QQQ momentum ≤ 0
-        const priceIndex = windowOffset + baseIdx + idx;
-        const bench10 = rollingReturnFromSeriesUI(prices, SIGNAL.trade.baseSymbol, priceIndex, 10);
-        const mmVal = Array.isArray(series?.mm) ? series.mm[idx] : 0;
-        const hiCorrBear = (mmVal >= 0.90) && (Number.isFinite(bench10) ? bench10 <= 0 : true);
-        if (hiCorrBear) lev = Math.max(cfg.min || 1, Math.min(lev, cfg.damp || 3));
-        return leveragedReturn(baseReturns[idx], lev);
-      }
-      return leveredReturns[idx];
-    }
+    if (regime > 0) return leveredReturns[idx];
     if (regime < 0) return 0; // cash
     return baseReturns[idx]; // neutral holds base asset
   });
@@ -1389,6 +1366,38 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
     }
 
     classic.score[i] = riskScore[i];
+  }
+
+  // Replace with Classic + Flux + Stability majority rule for EXP variant
+  if ((state.riskMode === 'ffl_exp')) {
+    const classic = computeRiskSeriesClassic(metrics, alignedRecords || slice);
+    function majority(a, b, c) {
+      const votes = [a, b, c].filter((v) => v === -1 || v === 1);
+      if (votes.length === 0) return 0;
+      const sum = votes.reduce((acc, v) => acc + v, 0);
+      if (sum > 0) return 1;
+      if (sum < 0) return -1;
+      return 0;
+    }
+    for (let i = 0; i < length; i += 1) {
+      const classicVote = Number.isInteger(classic?.state?.[i]) ? Math.max(-1, Math.min(1, classic.state[i])) : 0;
+      const jf = jFlux[i];
+      const fluxVote = Number.isFinite(jf) ? (jf >= dynOnFlux ? 1 : (jf <= dynOffFlux ? -1 : 0)) : 0;
+      const sLvl = slice?.[i]?.smoothed ?? slice?.[i]?.stability ?? null;
+      const macroVote = Number.isFinite(sLvl) ? (sLvl >= 0.45 ? 1 : (sLvl <= 0.35 ? -1 : 0)) : 0;
+      let v = majority(classicVote, fluxVote, macroVote);
+      if (v === 0) v = classicVote !== 0 ? classicVote : (fluxVote !== 0 ? fluxVote : 0);
+      stateArr[i] = v;
+      // Composite score = mean(Classic score, Flux scaled, Stability level)
+      const parts = [];
+      const cs = classic?.score?.[i]; if (Number.isFinite(cs)) parts.push(cs);
+      if (Number.isFinite(jf)) parts.push(Math.max(0, Math.min(1, 0.5 * (jf + 1))));
+      if (Number.isFinite(sLvl)) parts.push(Math.max(0, Math.min(1, sLvl)));
+      if (parts.length > 0) {
+        score[i] = parts.reduce((a, b) => a + b, 0) / parts.length;
+      }
+      fragile[i] = false;
+    }
   }
 
   return {
@@ -2338,7 +2347,8 @@ function buildMethodologySection() {
     '- 하위 지수: (a) 주식-암호화폐(+) = |corr(IWM/SPY, BTC)| 평균, (b) 전통자산(+) = |corr(IWM, SPY, TLT, GLD)| 평균, (c) Safe-NEG(-) = max(0, -corr(주식, TLT/GLD)) 평균.',
     '- Classic Risk Score = 0.70·max(0, corr(IWM, BTC)) + 0.30·Safe-NEG. corr ≥ 0.50 또는 Score ≥ 0.65 → Risk-On, corr ≤ -0.05 또는 Score ≤ 0.30 → Risk-Off.',
     '- Enhanced Mode = Classic Score + 10일 공동 모멘텀(IWM & BTC) + 5일 리스크 폭(IWM·SPY·BTC 상승비중) + Absorption/안정성 Guard. Guard ≥ 0.9 또는 Combo ≤ 0%면 On이 차단됩니다.',
-    '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다. 추가로 Fick의 제1법칙 관점에서 Diff(확산) = J_norm − 0.50·max(0, mmΔ) − 0.15·max(0, −ΔJ)와 시장 공통 모드 PC1 속도(v_PC1)를 함께 사용해, κ = |Diff| / (|Diff| + λ·|v_PC1|) 상대강도로 On/Off를 가중합니다. 동작: (1) On은 Diff ≥ 동적 문턱이며 κ와 PCON, v_PC1 양(+)을 만족(Strong-On은 1일 확인)하거나 RB_Flux ≥ 0.06 & Combo ≥ +0.10일 때 대안 경로로 통과합니다. (2) Off는 v_PC1 ≤ vOff 또는 Diff ≤ Off 문턱·κ 약세, 혹은 Absorption ≥ mmOff(Guard-only는 2~3일 확인)로 확정합니다.',
+    '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다.',
+    '- FFL+EXP Mode = Classic(현재 레짐) + Flux(J_norm, 전환 감지) + Stability(시장 결합도, EMA/레벨) 3요소를 단순 결합합니다. 다수결로 On/Off를 결정(동률이면 Classic 우선→Flux), 점수는 세 값을 단순 평균합니다. 별도 수식은 추가하지 않습니다.',
     '- 기본 동작은 Classic이며 사용자가 명시적으로 변경한 경우에만 Enhanced/FFL이 적용됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
