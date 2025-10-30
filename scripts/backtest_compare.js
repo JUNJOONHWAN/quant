@@ -123,6 +123,9 @@ async function main() {
   // FFL+EXP (our new majority rule)
   vm.runInContext(`state.riskMode='ffl_exp';`, ctx);
   const fflExp = ctx.computeRiskSeriesFFL(metrics, metrics.records);
+  // FFL+STAB (FFL base + Stability slope predictive)
+  vm.runInContext(`state.riskMode='ffl_stab';`, ctx);
+  const fflStab = ctx.computeRiskSeriesFFL(metrics, metrics.records);
 
   // Bench (QQQ BH)
   const windowOffset = WINDOW - 1;
@@ -146,6 +149,7 @@ async function main() {
   summarize('Enhanced', backtestSeries(enhanced, pricesQQQ));
   summarize('FFL', backtestSeries(ffl, pricesQQQ));
   summarize('FFL+EXP', backtestSeries(fflExp, pricesQQQ));
+  summarize('FFL+STAB', backtestSeries(fflStab, pricesQQQ));
   console.log(`Bench QQQ: Total ${formatPct(totalBH)} | CAGR ${formatPct(cagrBH)} | MDD ${formatPct(mddBH)}`);
 }
 
