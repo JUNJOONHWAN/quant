@@ -892,24 +892,24 @@ const RISK_CFG_FFL = {
   // Tunable parameters for EXP majority rule (no formula change)
   expTune: {
     // Stability bias (integral)
-    macroOn: 0.472, // tuned S0
-    macroOff: 0.339, // tuned S1
+    macroOn: 0.514, // tuned S0 (random search)
+    macroOff: 0.371, // tuned S1 (random search)
     // Flux thresholds (derivative) via quantiles
-    qOn: 0.680,
-    qOff: 0.135,
+    qOn: 0.715,
+    qOff: 0.244,
     // Gains for dynamic thresholds (no new metrics; combine Classic/Flux/Stability)
-    aS: 0.240, // tuned gains (ease On more with high S)
-    aJ: 0.129,
-    bS: 0.120,
-    bJ: 0.080,
-    gSPos: 0.055,
-    gSNeg: 0.039,
+    aS: 0.187,
+    aJ: 0.095,
+    bS: 0.106,
+    bJ: 0.058,
+    gSPos: 0.052,
+    gSNeg: 0.065,
     // Confirmation days base
     confirmOn: 2,
-    confirmOff: 2,
-    // Hazard (Stability 급락 선행 경고, 리포트 산식 기반)
-    hazardHigh: 0.539,
-    hazardDrop: 0.025,
+    confirmOff: 1,
+    // Hazard (Stability 급락 선행 경고)
+    hazardHigh: 0.513,
+    hazardDrop: 0.033,
     hazardLookback: 5,
     // Display score fusion weights (for gauge only)
     wC: 0.5,
