@@ -994,9 +994,9 @@ function renderRisk() {
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
       ? computeRiskSeriesFFL(metrics, filteredRecords2)
-      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filteredRecords2) : computeRiskSeriesClassic(metrics, filteredRecords2));
+      : computeRiskSeriesClassic(metrics, filteredRecords2);
   // Precompute FFL overlay metrics so we can display Flux/FINT in any mode
   const fflOverlay = computeRiskSeriesFFL(metrics, filteredRecords2);
   if (!series) {
@@ -1159,9 +1159,9 @@ function renderBacktest() {
 
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
       ? computeRiskSeriesFFL(metrics, filtered)
-      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filtered) : computeRiskSeriesClassic(metrics, filtered));
+      : computeRiskSeriesClassic(metrics, filtered);
   if (!series) return;
 
   const symbol = baseSymbol;
@@ -1287,9 +1287,9 @@ function renderAlerts() {
   if (empty) { box.innerHTML = ''; return; }
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
       ? computeRiskSeriesFFL(metrics, filtered)
-      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filtered) : computeRiskSeriesClassic(metrics, filtered));
+      : computeRiskSeriesClassic(metrics, filtered);
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -2045,7 +2045,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       slice.__expRatio[i] = smooth;
     }
 
-    if (variant === 'classic' || variant === 'exp') {
+    if (variant === 'classic' || variant === 'exp' || variant === 'stab') {
       const guardValue = Number.isFinite(guardVal) ? guardVal : 1;
       const guardSoft = 0.95;
       const guardHard = 0.98;
@@ -2053,42 +2053,12 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       // 메인 On: 위험↔안전 플럭스 양(+) + 가드 양호 + 폭 확보
       // mm 높을수록 On 문턱 상향(고상관 구간에서 보수화)
       let dynOnAdj = dynOnFlux + (mmValue >= 0.94 ? 0.05 : mmValue >= 0.90 ? 0.03 : 0);
-      // STAB predictive adjustments (slope shocks)
+      // STAB simple flags
       let dynOffLocal = dynOffFlux;
-      let graceActive = false;
-      let hazardActive = false;
-      if (variant === 'stab') {
-        const S = Number.isFinite(Sseries[i]) ? Sseries[i] : null;
-        const lvlNeutral = Number.isFinite(S) ? (S >= sNeutralLo && S <= sNeutralHi) : false;
-        const sVal = Number.isFinite(sSlope[i]) ? sSlope[i] : null;
-        const zVal = Number.isFinite(sZ[i]) ? sZ[i] : null;
-        const shockUp = Number.isFinite(zVal) && Number.isFinite(sVal) && zVal >= sZUp && sVal >= sMin;
-        const shockDown = Number.isFinite(zVal) && Number.isFinite(sVal) && zVal <= -sZDown && sVal <= -sMin;
-        if (shockUp) {
-          stabLeadOnLeft = Math.max(stabLeadOnLeft, Number.isFinite(stab.leadOnWindow) ? stab.leadOnWindow : 3);
-        }
-        if (shockDown) {
-          stabGraceLeft = Number.isFinite(stab.downGrace) ? stab.downGrace : 3;
-          stabHazardLeft = Number.isFinite(stab.hazardWindow) ? stab.hazardWindow : 5;
-        }
-        if (stabGraceLeft > 0) { graceActive = true; stabGraceLeft -= 1; }
-        else if (stabHazardLeft > 0) { hazardActive = true; stabHazardLeft -= 1; }
-        if ((shockUp || stabLeadOnLeft > 0) && !inDriftEpoch) {
-          const ease = Number.isFinite(stab.onFluxEase) ? Math.max(0, stab.onFluxEase) : 0.03;
-          dynOnAdj = Math.max(th.jOn - 0.10, dynOnAdj - ease);
-          stabLeadOnLeft = Math.max(0, stabLeadOnLeft - 1);
-        }
-        if (graceActive) {
-          const relax = Math.max(0.005, (Number.isFinite(stab.onFluxEase) ? (stab.onFluxEase / 1.5) : 0.02));
-          dynOffLocal = dynOffFlux - relax; // harder to flip Off during grace
-        } else if (hazardActive) {
-          const tight = Number.isFinite(stab.offFluxTighten) ? Math.max(0, stab.offFluxTighten) : 0.03;
-          dynOffLocal = dynOffFlux + tight; // easier Off during hazard
-        } else if (stabLeadOnLeft > 0 && !inDriftEpoch) {
-          const harden = Math.max(0, Number.isFinite(stab.upOffHarden) ? stab.upOffHarden : 0.02);
-          dynOffLocal = dynOffFlux - harden; // up-shock lead: keep On unless stronger Off
-        }
-      }
+      const sVal_now = Number.isFinite(sSlope[i]) ? sSlope[i] : null;
+      const sZ_now = Number.isFinite(sZ[i]) ? sZ[i] : null;
+      const stabUpTrend = (variant === 'stab') && Number.isFinite(sVal_now) && sVal_now > 0;
+      const stabPlunge = (variant === 'stab') && Number.isFinite(sVal_now) && Number.isFinite(sZ_now) && (sZ_now <= -sZDown) && (sVal_now < 0);
       // 확산 점수(diffVal) + 전쌍 일관성(PCON) + APDF 약한 필터
       const pconOkBase = !Number.isFinite(pcon[i]) || pcon[i] >= (th.pconOn ?? 0.55);
       const apdfOk = !Number.isFinite(apdf[i]) || apdf[i] >= -0.05;
@@ -2168,7 +2138,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         && guardValue < guardSoft
         && mmValue < th.mmOff;
       const onClassic = (onClassicMain || onClassicAlt || strongOn) && !hiCorrDrift;
-      const offFlux = fluxVal <= (variant === 'stab' ? dynOffLocal : dynOffFlux);
+      const offFlux = fluxVal <= dynOffLocal;
       const offGuard = (guardValue >= guardHard) || (mmValue >= th.mmOff);
       // Guard-only exit detection (no flux break)
       const guardOnly = offGuard && !offFlux;
@@ -2205,10 +2175,11 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       let rawOn = onClassic && !blockOnHighCorrDown;
       let rawOff = offClassic;
       if (variant === 'stab') {
-        const upTriggered = sUpSeq >= Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3);
-        const margin = Number.isFinite(RISK_CFG_FFL?.stabTune?.onOverrideMargin) ? RISK_CFG_FFL.stabTune.onOverrideMargin : 0.01;
-        if (!rawOn && upTriggered && (fluxVal > (dynOffFlux - margin)) && guardValue < 0.98 && !inDriftEpoch) {
-          rawOn = true;
+        if (stabUpTrend) {
+          rawOff = false; // do not switch to Off while stability uptrend
+        }
+        if (stabPlunge) {
+          rawOff = true; // switch to Off early on plunge
         }
       }
       // 동적 On 확인일: 확산 가속(+), 흡수 하락(≤0)이면 1일, 기본 2일, 고상관/흡수 상승·ΔCorr-Z↑면 3일
@@ -2230,13 +2201,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
           confirmOnDays = Math.max(1, confirmOnDays - 1);
         }
       }
-      if (variant === 'stab') {
-        const upTriggered = sUpSeq >= Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3);
-        if (upTriggered || stabLeadOnLeft > 0) {
-          const minOn = Math.max(1, Number(RISK_CFG_FFL?.stabTune?.confirmOnMin) || 2);
-          confirmOnDays = Math.min(confirmOnDays, minOn);
-        }
-      }
+      // no confirm-day modification for STAB (keep simple)
       onCand = rawOn ? onCand + 1 : 0;
       offCand = rawOff ? offCand + 1 : 0;
 
@@ -2625,9 +2590,9 @@ function buildTextReportPayload() {
   const rangeText = rangeLabel || `${state.range}일`;
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
       ? computeRiskSeriesFFL(metrics, records)
-      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, records) : computeRiskSeriesClassic(metrics, records));
+      : computeRiskSeriesClassic(metrics, records);
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',
