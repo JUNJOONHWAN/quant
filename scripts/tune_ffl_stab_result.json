@@ -1,0 +1,24 @@
+{
+  "cycleDays": 30,
+  "bestScore": -0.15890413184107982,
+  "params": {
+    "fast": 10,
+    "slow": 30,
+    "zWin": 67,
+    "zUp": 1.9357872331514954,
+    "zDown": 1.5398511189967392,
+    "slopeMin": 0.015265925421845168,
+    "lagUp": 2,
+    "lagDown": 4,
+    "leadOnWindow": 5,
+    "downGrace": 4,
+    "hazardWindow": 4,
+    "onFluxEase": 0.04146176500478759,
+    "offFluxTighten": 0.04982950259931386,
+    "confirmOnMin": 1,
+    "confirmOffMin": 1,
+    "onOverrideMargin": 0.015014589754864575,
+    "neutralLo": 0.3,
+    "neutralHi": 0.4
+  }
+}

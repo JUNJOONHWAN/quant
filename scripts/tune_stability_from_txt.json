@@ -1,0 +1,23 @@
+{
+  "cycleDays": 30,
+  "stabTune": {
+    "fast": 21,
+    "slow": 63,
+    "zWin": 126,
+    "zUp": 2.5,
+    "zDown": 2.5,
+    "slopeMin": 0.02,
+    "neutralLo": 0.3,
+    "neutralHi": 0.4,
+    "lagUp": 3,
+    "lagDown": 4,
+    "onFluxEase": 0.02,
+    "confirmOnMin": 2,
+    "leadOnWindow": 6,
+    "downGrace": 6,
+    "hazardWindow": 9,
+    "offFluxTighten": 0.03,
+    "confirmOffMin": 1,
+    "onOverrideMargin": 0.01
+  }
+}

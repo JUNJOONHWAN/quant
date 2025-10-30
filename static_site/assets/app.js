@@ -925,30 +925,29 @@ const RISK_CFG_FFL = {
   },
   // STAB: Stability-slope predictive tuning (no new data, only uses existing stability EMA3/EMA10)
   stabTune: {
-    // EMA windows for Stability slope (must match visuals)
-    fast: 3,
-    slow: 10,
-    // Z-score window for slope volatility (MAD-based)
-    zWin: 63,
-    // Shock thresholds on z-score of slope
-    zUp: 1.1,
-    zDown: 1.1,
-    // Minimum absolute slope to consider (guards tiny drift)
-    slopeMin: 0.010,
-    // Neutral band where level-only context is weak
+    // Stability tuned from 1.txt/2.txt
+    fast: 21,             // ~1 month
+    slow: 63,             // ~3 months
+    zWin: 126,
+    zUp: 2.50,
+    zDown: 2.50,
+    slopeMin: 0.0200,
     neutralLo: 0.30,
     neutralHi: 0.40,
-    // On shockUp: make entry easier for a short window
-    onFluxEase: 0.03,     // reduce On flux threshold by this
-    confirmOnMin: 1,      // minimal confirm-on days during shockUp
-    leadOnWindow: 3,      // days ease after shockUp
-    // On shockDown: two-phase behavior
-    downGrace: 3,         // grace days: allow On to persist (liquidity)
-    hazardWindow: 5,      // after grace: tighten Off for this many days
-    offFluxTighten: 0.03, // raise Off propensity (i.e., less negative threshold)
-    confirmOffMin: 1,     // minimal confirm-off during hazard
-    // Small margin to allow early On override if flux not deeply negative
-    onOverrideMargin: 0.02,
+    // sustained-days to avoid single-day spikes
+    lagUp: 3,
+    lagDown: 4,
+    onFluxEase: 0.02,
+    confirmOnMin: 2,
+    leadOnWindow: 6,
+    downGrace: 6,
+    hazardWindow: 9,
+    offFluxTighten: 0.03,
+    confirmOffMin: 1,
+    onOverrideMargin: 0.01,
+    // Up-shock protection: keep On unless Off persists
+    upOffHarden: 0.02,      // make Off threshold more negative during up-lead
+    upConfirmOffMin: 2,     // require N consecutive Off days while up-lead active
   },
   variant: 'classic', // default: Classic-FFL with enhanced guard; 'exp' enables ratio gates
 };
@@ -1878,6 +1877,8 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const sSlope = new Array(length).fill(null);
   const sSigma = new Array(length).fill(null);
   const sZ = new Array(length).fill(null);
+  let sUpSeq = 0;
+  let sDownSeq = 0;
   for (let i = 0; i < length; i += 1) {
     const vF = Number.isFinite(sEmaF[i]) ? sEmaF[i] : null;
     const vS = Number.isFinite(sEmaS[i]) ? sEmaS[i] : null;
@@ -1885,7 +1886,13 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
     sSlope[i] = d;
     sSigma[i] = rollingSigmaMAD(sSlope, i, sZWin);
     const sig = sSigma[i];
-    sZ[i] = (Number.isFinite(d) && Number.isFinite(sig) && sig > 0) ? (d / sig) : null;
+    const z = (Number.isFinite(d) && Number.isFinite(sig) && sig > 0) ? (d / sig) : null;
+    sZ[i] = z;
+    // sustained detection sequences (monthly-level): require consecutive days
+    const upCond = Number.isFinite(z) && Number.isFinite(d) && z >= sZUp && d >= sMin;
+    const downCond = Number.isFinite(z) && Number.isFinite(d) && z <= -sZDown && d <= -sMin;
+    sUpSeq = upCond ? (sUpSeq + 1) : 0;
+    sDownSeq = downCond ? (sDownSeq + 1) : 0;
   }
 
   // STAB phase counters (grace then hazard after sharp down-slope)
@@ -1957,6 +1964,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         } else if (hazardActive) {
           const tight = Number.isFinite(stab.offFluxTighten) ? Math.max(0, stab.offFluxTighten) : 0.03;
           dynOffLocal = dynOffFlux + tight; // easier Off during hazard
+        } else if (stabLeadOnLeft > 0 && !inDriftEpoch) {
+          const harden = Math.max(0, Number.isFinite(stab.upOffHarden) ? stab.upOffHarden : 0.02);
+          dynOffLocal = dynOffFlux - harden; // up-shock lead: keep On unless stronger Off
         }
       }
       // 확산 점수(diffVal) + 전쌍 일관성(PCON) + APDF 약한 필터
@@ -2075,11 +2085,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       let rawOn = onClassic && !blockOnHighCorrDown;
       let rawOff = offClassic;
       if (variant === 'stab') {
-        const sVal = Number.isFinite(sSlope[i]) ? sSlope[i] : null;
-        const zVal = Number.isFinite(sZ[i]) ? sZ[i] : null;
-        const shockUpNow = Number.isFinite(zVal) && Number.isFinite(sVal) && zVal >= sZUp && sVal >= sMin;
-        const margin = Number.isFinite(RISK_CFG_FFL?.stabTune?.onOverrideMargin) ? RISK_CFG_FFL.stabTune.onOverrideMargin : 0.02;
-        if (!rawOn && shockUpNow && (fluxVal > (dynOffFlux - margin)) && guardValue < 0.98 && !inDriftEpoch) {
+        const upTriggered = sUpSeq >= Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3);
+        const margin = Number.isFinite(RISK_CFG_FFL?.stabTune?.onOverrideMargin) ? RISK_CFG_FFL.stabTune.onOverrideMargin : 0.01;
+        if (!rawOn && upTriggered && (fluxVal > (dynOffFlux - margin)) && guardValue < 0.98 && !inDriftEpoch) {
           rawOn = true;
         }
       }
@@ -2103,11 +2111,9 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
         }
       }
       if (variant === 'stab') {
-        const sVal = Number.isFinite(sSlope[i]) ? sSlope[i] : null;
-        const zVal = Number.isFinite(sZ[i]) ? sZ[i] : null;
-        const shockUpNow = Number.isFinite(zVal) && Number.isFinite(sVal) && zVal >= sZUp && sVal >= sMin;
-        if (shockUpNow || stabLeadOnLeft > 0) {
-          const minOn = Math.max(1, Number(RISK_CFG_FFL?.stabTune?.confirmOnMin) || 1);
+        const upTriggered = sUpSeq >= Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3);
+        if (upTriggered || stabLeadOnLeft > 0) {
+          const minOn = Math.max(1, Number(RISK_CFG_FFL?.stabTune?.confirmOnMin) || 2);
           confirmOnDays = Math.min(confirmOnDays, minOn);
         }
       }
@@ -2117,8 +2123,18 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       // Sticky 로직: 중립보다 On/Off 지속을 우선, 전환은 확인일수 요구
       let decided = prevState;
       if (prevState === 1) {
-        // On 유지. Flux 급락(offFlux)엔 즉시 Off, guard-only는 확인일수 반영
-        if (rawOff) decided = -1; else decided = 1;
+        // On 유지. Up-shock lead 중에는 Off에도 최소 확인일 요구
+        if (rawOff) {
+          const upLeadActive = (stabLeadOnLeft > 0) || (sUpSeq >= Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3));
+          if (variant === 'stab' && upLeadActive) {
+            const need = Math.max(1, Number.isFinite(stab.upConfirmOffMin) ? Math.floor(stab.upConfirmOffMin) : 2);
+            decided = (offCand >= need) ? -1 : 1;
+          } else {
+            decided = -1;
+          }
+        } else {
+          decided = 1;
+        }
       } else if (prevState === -1) {
         // Off 유지, On은 2일 연속 확인
         if (onCand >= confirmOnDays) decided = 1;
