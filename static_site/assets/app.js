@@ -889,6 +889,33 @@ const RISK_CFG_FFL = {
     // Dynamic leverage defaults for UI backtest
     lev: { r0: 0.30, r1: 1.05, min: 1.0, max: 3.0, damp: 3.0 },
   },
+  // Tunable parameters for EXP majority rule (no formula change)
+  expTune: {
+    // Stability bias (integral)
+    macroOn: 0.45, // S0: above this, On 쪽으로 완화
+    macroOff: 0.35, // S1: below/근처, Off 쪽으로 강화
+    // Flux thresholds (derivative) via quantiles
+    qOn: 0.72,
+    qOff: 0.18,
+    // Gains for dynamic thresholds (no new metrics; combine Classic/Flux/Stability)
+    aS: 0.20, // On에서 Stability 양(+) 초과가 scoreOn을 얼마나 내리는지
+    aJ: 0.08, // On에서 Flux 양(+)이 scoreOn을 얼마나 내리는지
+    bS: 0.20, // Off에서 Stability 저(−) 갭이 scoreOff를 얼마나 올리는지
+    bJ: 0.10, // Off에서 Flux 음(−)이 scoreOff를 얼마나 올리는지
+    gSPos: 0.06, // Stability 양(+)일 때 J_on을 얼마나 낮추는지
+    gSNeg: 0.06, // Stability 저(−)일 때 J_off를 얼마나 올리는지
+    // Confirmation days base
+    confirmOn: 2,
+    confirmOff: 2,
+    // Hazard (Stability 급락 선행 경고, 리포트 산식 기반)
+    hazardHigh: 0.50,
+    hazardDrop: 0.03,
+    hazardLookback: 5,
+    // Display score fusion weights (for gauge only)
+    wC: 0.5,
+    wF: 0.3,
+    wS: 0.2,
+  },
   variant: 'classic', // default: Classic-FFL with enhanced guard; 'exp' enables ratio gates
 };
 const RISK_CFG_CLASSIC = {
@@ -1368,35 +1395,103 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
     classic.score[i] = riskScore[i];
   }
 
-  // Replace with Classic + Flux + Stability majority rule for EXP variant
-  if ((state.riskMode === 'ffl_exp')) {
+  // Replace with 3-layer fusion (Classic base + Flux acceleration + Stability bias/hazard)
+  if (state.riskMode === 'ffl_exp') {
     const classic = computeRiskSeriesClassic(metrics, alignedRecords || slice);
-    function majority(a, b, c) {
-      const votes = [a, b, c].filter((v) => v === -1 || v === 1);
-      if (votes.length === 0) return 0;
-      const sum = votes.reduce((acc, v) => acc + v, 0);
-      if (sum > 0) return 1;
-      if (sum < 0) return -1;
-      return 0;
-    }
+    const S0 = Number.isFinite(RISK_CFG_FFL?.expTune?.macroOn) ? RISK_CFG_FFL.expTune.macroOn : 0.45;
+    const S1 = Number.isFinite(RISK_CFG_FFL?.expTune?.macroOff) ? RISK_CFG_FFL.expTune.macroOff : 0.35;
+    const aS = Number.isFinite(RISK_CFG_FFL?.expTune?.aS) ? RISK_CFG_FFL.expTune.aS : 0.25;
+    const aJ = Number.isFinite(RISK_CFG_FFL?.expTune?.aJ) ? RISK_CFG_FFL.expTune.aJ : 0.12;
+    const bS = Number.isFinite(RISK_CFG_FFL?.expTune?.bS) ? RISK_CFG_FFL.expTune.bS : 0.20;
+    const bJ = Number.isFinite(RISK_CFG_FFL?.expTune?.bJ) ? RISK_CFG_FFL.expTune.bJ : 0.10;
+    const gSPos = Number.isFinite(RISK_CFG_FFL?.expTune?.gSPos) ? RISK_CFG_FFL.expTune.gSPos : 0.06;
+    const gSNeg = Number.isFinite(RISK_CFG_FFL?.expTune?.gSNeg) ? RISK_CFG_FFL.expTune.gSNeg : 0.05;
+    const baseOn = Math.max(1, Number(RISK_CFG_FFL?.expTune?.confirmOn) || 2);
+    const baseOff = Math.max(1, Number(RISK_CFG_FFL?.expTune?.confirmOff) || 2);
+    const hzHigh = Number.isFinite(RISK_CFG_FFL?.expTune?.hazardHigh) ? RISK_CFG_FFL.expTune.hazardHigh : 0.50;
+    const hzDrop = Number.isFinite(RISK_CFG_FFL?.expTune?.hazardDrop) ? RISK_CFG_FFL.expTune.hazardDrop : 0.03;
+    const hzLb = Math.max(2, Number(RISK_CFG_FFL?.expTune?.hazardLookback) || 5);
+    const wC = Number.isFinite(RISK_CFG_FFL?.expTune?.wC) ? RISK_CFG_FFL.expTune.wC : 0.5;
+    const wF = Number.isFinite(RISK_CFG_FFL?.expTune?.wF) ? RISK_CFG_FFL.expTune.wF : 0.3;
+    const wS = Number.isFinite(RISK_CFG_FFL?.expTune?.wS) ? RISK_CFG_FFL.expTune.wS : 0.2;
+
+    const sSeries = slice.map((r) => Number.isFinite(r?.smoothed) ? r.smoothed : null);
+    const dSeries = slice.map((r) => Number.isFinite(r?.delta) ? r.delta : null);
+
+    let prevStateLocal = 0;
+    let onCand = 0;
+    let offCand = 0;
+
     for (let i = 0; i < length; i += 1) {
-      const classicVote = Number.isInteger(classic?.state?.[i]) ? Math.max(-1, Math.min(1, classic.state[i])) : 0;
-      const jf = jFlux[i];
-      const fluxVote = Number.isFinite(jf) ? (jf >= dynOnFlux ? 1 : (jf <= dynOffFlux ? -1 : 0)) : 0;
-      const sLvl = slice?.[i]?.smoothed ?? slice?.[i]?.stability ?? null;
-      const macroVote = Number.isFinite(sLvl) ? (sLvl >= 0.45 ? 1 : (sLvl <= 0.35 ? -1 : 0)) : 0;
-      let v = majority(classicVote, fluxVote, macroVote);
-      if (v === 0) v = classicVote !== 0 ? classicVote : (fluxVote !== 0 ? fluxVote : 0);
-      stateArr[i] = v;
-      // Composite score = mean(Classic score, Flux scaled, Stability level)
-      const parts = [];
-      const cs = classic?.score?.[i]; if (Number.isFinite(cs)) parts.push(cs);
-      if (Number.isFinite(jf)) parts.push(Math.max(0, Math.min(1, 0.5 * (jf + 1))));
-      if (Number.isFinite(sLvl)) parts.push(Math.max(0, Math.min(1, sLvl)));
-      if (parts.length > 0) {
-        score[i] = parts.reduce((a, b) => a + b, 0) / parts.length;
+      const s_c = Number.isFinite(classic?.score?.[i]) ? classic.score[i] : 0.5;
+      const mmValue = Number.isFinite(mm?.[i]) ? mm[i] : 0;
+      const guardValue = Number.isFinite(guard?.[i]) ? guard[i] : 1;
+      const jf = Number.isFinite(jFlux?.[i]) ? jFlux[i] : 0;
+      const sLvl = Number.isFinite(sSeries?.[i]) ? sSeries[i] : null;
+      const dS = Number.isFinite(dSeries?.[i]) ? dSeries[i] : 0;
+
+      // Hazard: recent 5d touched ≥ hzHigh, now < hzHigh, and 5d change ≤ -hzDrop
+      let hazard = false;
+      if (i >= hzLb && Number.isFinite(sLvl)) {
+        const start = i - hzLb;
+        let sMax = -Infinity;
+        for (let k = start; k <= i; k += 1) {
+          const v = sSeries[k]; if (Number.isFinite(v) && v > sMax) sMax = v;
+        }
+        const sLag = sSeries[i - hzLb];
+        if (Number.isFinite(sMax) && Number.isFinite(sLag)) {
+          if (sMax >= hzHigh && sLvl < hzHigh && (sLvl - sLag) <= -hzDrop) {
+            hazard = true;
+          }
+        }
       }
-      fragile[i] = false;
+
+      // Dynamic thresholds (layer fusion)
+      const posS = Number.isFinite(sLvl) ? Math.max(0, sLvl - S0) : 0;
+      const negS = Number.isFinite(sLvl) ? Math.max(0, S0 - sLvl) : 0;
+      const posJ = Math.max(0, jf);
+      const negJ = Math.max(0, -jf);
+
+      let scoreOnStar = th.scoreOn - aS * posS - aJ * posJ;
+      let scoreOffStar = th.scoreOff + bS * negS + bJ * negJ;
+      // clamp
+      scoreOnStar = Math.max(0.2, Math.min(0.9, scoreOnStar));
+      scoreOffStar = Math.max(0.05, Math.min(0.6, scoreOffStar));
+
+      let J_onStar = dynOnFlux - gSPos * posS;
+      let J_offStar = dynOffFlux + gSNeg * negS;
+
+      const onGate = (s_c >= scoreOnStar) && (jf >= J_onStar) && guardValue < 0.95 && mmValue < th.mmOff;
+      const offGate = (s_c <= scoreOffStar) || (jf <= J_offStar) || hazard || (guardValue >= 1.0) || (mmValue >= th.mmOff);
+
+      // Confirmation logic (sticky, low churn)
+      let confirmOnDays = baseOn;
+      let confirmOffDays = baseOff;
+      if ((jf >= J_onStar) && (dS >= 0)) confirmOnDays = Math.max(1, baseOn - 1);
+      if (offGate && (jf <= J_offStar || hazard || dS < 0)) confirmOffDays = 1;
+
+      onCand = onGate ? onCand + 1 : 0;
+      offCand = offGate ? offCand + 1 : 0;
+
+      let decided = prevStateLocal;
+      if (prevStateLocal === 1) {
+        decided = offGate ? -1 : 1;
+      } else if (prevStateLocal === -1) {
+        decided = onCand >= confirmOnDays ? 1 : -1;
+      } else {
+        decided = offCand >= confirmOffDays ? -1 : (onCand >= confirmOnDays ? 1 : 0);
+      }
+
+      // Apply decision
+      stateArr[i] = decided;
+      fragile[i] = decided >= 0 && (guardValue >= th.mmFragile || (guardValue >= 0.9 && guardValue < 1.0));
+      prevStateLocal = decided;
+
+      // Display score: fused (no new metric)
+      const sc = Number.isFinite(s_c) ? s_c : 0.5;
+      const sf = 0.5 * (Math.max(-1, Math.min(1, jf)) + 1);
+      const ss = Number.isFinite(sLvl) ? Math.max(0, Math.min(1, sLvl)) : 0.5;
+      score[i] = Math.max(0, Math.min(1, wC * sc + wF * sf + wS * ss));
     }
   }
 
@@ -1670,8 +1765,10 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   let dynScoreOn = th.scoreOn;
   let dynScoreOff = th.scoreOff;
   if (variant !== 'classic' && validFlux.length >= 50) {
-    dynOnFlux = Math.max(th.jOn, quantile(validFlux, 0.75));
-    dynOffFlux = Math.min(th.jOff, quantile(validFlux, 0.25));
+    const qOn = Number.isFinite(RISK_CFG_FFL?.expTune?.qOn) ? RISK_CFG_FFL.expTune.qOn : 0.75;
+    const qOff = Number.isFinite(RISK_CFG_FFL?.expTune?.qOff) ? RISK_CFG_FFL.expTune.qOff : 0.25;
+    dynOnFlux = Math.max(th.jOn, quantile(validFlux, qOn));
+    dynOffFlux = Math.min(th.jOff, quantile(validFlux, qOff));
   }
   if (variant !== 'classic' && validScore.length >= 50) {
     dynScoreOn = Math.max(th.scoreOn, quantile(validScore, 0.75));
