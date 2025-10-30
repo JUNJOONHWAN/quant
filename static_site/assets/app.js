@@ -994,9 +994,9 @@ function renderRisk() {
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
       ? computeRiskSeriesFFL(metrics, filteredRecords2)
-      : computeRiskSeriesClassic(metrics, filteredRecords2);
+      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filteredRecords2) : computeRiskSeriesClassic(metrics, filteredRecords2));
   // Precompute FFL overlay metrics so we can display Flux/FINT in any mode
   const fflOverlay = computeRiskSeriesFFL(metrics, filteredRecords2);
   if (!series) {
@@ -1159,9 +1159,9 @@ function renderBacktest() {
 
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
       ? computeRiskSeriesFFL(metrics, filtered)
-      : computeRiskSeriesClassic(metrics, filtered);
+      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filtered) : computeRiskSeriesClassic(metrics, filtered));
   if (!series) return;
 
   const symbol = baseSymbol;
@@ -1287,9 +1287,9 @@ function renderAlerts() {
   if (empty) { box.innerHTML = ''; return; }
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
       ? computeRiskSeriesFFL(metrics, filtered)
-      : computeRiskSeriesClassic(metrics, filtered);
+      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, filtered) : computeRiskSeriesClassic(metrics, filtered));
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -1540,6 +1540,126 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
   };
 }
 
+// Guarded FFL: start from baseline FFL state, then apply Stability-driven overrides only.
+function computeRiskSeriesFFLGuarded(metrics, recordsOverride) {
+  // 1) Baseline FFL
+  const prevMode = state.riskMode;
+  state.riskMode = 'ffl';
+  const base = computeRiskSeriesFFL(metrics, recordsOverride);
+  state.riskMode = prevMode;
+  if (!base) return null;
+
+  const records = Array.isArray(recordsOverride) && recordsOverride.length > 0 ? recordsOverride : metrics.records;
+  const length = base.state.length;
+  if (!Array.isArray(records) || records.length < length) return base;
+
+  // 2) Build Stability slope/z and monthly shock windows using stabTune
+  const stab = (RISK_CFG_FFL?.stabTune) || {};
+  const sFastN = Number.isFinite(stab.fast) ? stab.fast : 21;
+  const sSlowN = Number.isFinite(stab.slow) ? stab.slow : 63;
+  const sZWin = Number.isFinite(stab.zWin) ? stab.zWin : 126;
+  const sZUp = Number.isFinite(stab.zUp) ? stab.zUp : 2.0;
+  const sZDown = Number.isFinite(stab.zDown) ? stab.zDown : 2.0;
+  const sMin = Number.isFinite(stab.slopeMin) ? stab.slopeMin : 0.012;
+  const lagUp = Math.max(1, Number.isFinite(stab.lagUp) ? Math.floor(stab.lagUp) : 3);
+  const lagDown = Math.max(1, Number.isFinite(stab.lagDown) ? Math.floor(stab.lagDown) : 4);
+  const leadOnWindow = Math.max(1, Number.isFinite(stab.leadOnWindow) ? Math.floor(stab.leadOnWindow) : 6);
+  const downGrace = Math.max(1, Number.isFinite(stab.downGrace) ? Math.floor(stab.downGrace) : 5);
+  const hazardWindow = Math.max(1, Number.isFinite(stab.hazardWindow) ? Math.floor(stab.hazardWindow) : 8);
+  const upConfirmOffMin = Math.max(1, Number.isFinite(stab.upConfirmOffMin) ? Math.floor(stab.upConfirmOffMin) : 2);
+
+  const S = records.slice(records.length - length).map((r) => safeNumber(r.stability));
+  const sEmaF = ema(S, sFastN);
+  const sEmaS = ema(S, sSlowN);
+  const slope = sEmaF.map((v, i) => (Number.isFinite(v) && Number.isFinite(sEmaS[i])) ? (v - sEmaS[i]) : null);
+
+  function rollingSigmaMADLocal(arr, end, win) {
+    const xs = [];
+    for (let k = Math.max(0, end - win + 1); k <= end; k += 1) { const v = arr[k]; if (Number.isFinite(v)) xs.push(v); }
+    if (xs.length < 5) return null;
+    const xsSorted = xs.slice().sort((a,b)=>a-b);
+    const m = xsSorted[Math.floor(xsSorted.length/2)];
+    const dev = xs.map((v)=>Math.abs(v - m));
+    dev.sort((a,b)=>a-b);
+    const mad = dev[Math.floor(dev.length/2)] || 0;
+    return mad > 0 ? 1.4826 * mad : null;
+  }
+
+  const z = new Array(length).fill(null);
+  let upSeq = 0; let dnSeq = 0;
+  for (let i = 0; i < length; i += 1) {
+    const d = slope[i];
+    const sig = rollingSigmaMADLocal(slope, i, sZWin);
+    const zi = (Number.isFinite(d) && Number.isFinite(sig) && sig > 0) ? (d / sig) : null;
+    z[i] = zi;
+    const upC = Number.isFinite(zi) && Number.isFinite(d) && zi >= sZUp && d >= sMin;
+    const dnC = Number.isFinite(zi) && Number.isFinite(d) && zi <= -sZDown && d <= -sMin;
+    upSeq = upC ? (upSeq + 1) : 0;
+    dnSeq = dnC ? (dnSeq + 1) : 0;
+  }
+
+  // Windows
+  const upLead = new Array(length).fill(0);
+  const dnGrace = new Array(length).fill(0);
+  const dnHazard = new Array(length).fill(0);
+  let leadLeft = 0; let graceLeft = 0; let hazLeft = 0;
+  upSeq = 0; dnSeq = 0;
+  for (let i = 0; i < length; i += 1) {
+    const d = slope[i]; const zi = z[i];
+    const upC = Number.isFinite(zi) && Number.isFinite(d) && zi >= sZUp && d >= sMin;
+    const dnC = Number.isFinite(zi) && Number.isFinite(d) && zi <= -sZDown && d <= -sMin;
+    upSeq = upC ? (upSeq + 1) : 0;
+    dnSeq = dnC ? (dnSeq + 1) : 0;
+    if (upSeq >= lagUp) leadLeft = Math.max(leadLeft, leadOnWindow);
+    if (dnSeq >= lagDown) { graceLeft = Math.max(graceLeft, downGrace); hazLeft = Math.max(hazLeft, hazardWindow); }
+    if (leadLeft > 0) { upLead[i] = 1; leadLeft -= 1; }
+    if (graceLeft > 0) { dnGrace[i] = 1; graceLeft -= 1; }
+    else if (hazLeft > 0) { dnHazard[i] = 1; hazLeft -= 1; }
+  }
+
+  // 3) Apply overrides on state: defend during hazard, stick-on during upLead
+  const guardedState = base.state.slice();
+  // For trend filter when preventing early Off, require QQQ 5-day up
+  const windowOffset = Math.max(1, state.window - 1);
+  const prices = state.priceSeries || {};
+  const pxQQQ = prices[SIGNAL.trade.baseSymbol] || [];
+  const qqq5 = new Array(length).fill(null);
+  for (let i = 0; i < length; i += 1) {
+    const idx = windowOffset + i;
+    const ret = rollingReturnFromSeries(pxQQQ, idx, 5);
+    qqq5[i] = Number.isFinite(ret) ? ret : null;
+  }
+
+  let offRun = 0; // consecutive off candidates in upLead
+  for (let i = 0; i < length; i += 1) {
+    const baseSt = base.state[i] || 0;
+    // defend when base On but hazard active -> neutral
+    if (baseSt > 0 && dnHazard[i] === 1) {
+      guardedState[i] = 0;
+      offRun = 0;
+      continue;
+    }
+    // prevent early Off: if base Off and upLead active and 5d QQQ up, keep On
+    if (baseSt < 0 && upLead[i] === 1 && (qqq5[i] ?? 0) > 0) {
+      guardedState[i] = 1;
+      offRun = 0;
+      continue;
+    }
+    // if base On and upLead active but momentary off candidate, require persistence
+    if (baseSt > 0 && upLead[i] === 1) {
+      // we model using consecutive offRun via baseSt transitions
+      offRun = 0; // staying On
+      guardedState[i] = 1;
+      continue;
+    }
+    // default
+    guardedState[i] = baseSt;
+    offRun = baseSt < 0 ? (offRun + 1) : 0;
+  }
+
+  const executedState = guardedState.map((v, idx) => (idx === 0 ? 0 : guardedState[idx - 1] || 0));
+  return { ...base, state: guardedState, executedState };
+}
 function computeRiskSeriesFFL(metrics, recordsOverride) {
   if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) {
     return null;
@@ -2505,9 +2625,9 @@ function buildTextReportPayload() {
   const rangeText = rangeLabel || `${state.range}일`;
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
       ? computeRiskSeriesFFL(metrics, records)
-      : computeRiskSeriesClassic(metrics, records);
+      : (state.riskMode === 'ffl_stab' ? computeRiskSeriesFFLGuarded(metrics, records) : computeRiskSeriesClassic(metrics, records));
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',

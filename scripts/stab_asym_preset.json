@@ -1,0 +1,27 @@
+{
+  "stabTune": {
+    "fast": 21,
+    "slow": 63,
+    "zWin": 126,
+    "zUp": 2.5,
+    "zDown": 2.5,
+    "slopeMin": 0.02,
+    "neutralLo": 0.30,
+    "neutralHi": 0.40,
+    "lagUp": 3,
+    "lagDown": 3,
+
+    "onFluxEase": 0.03,
+    "confirmOnMin": 1,
+    "leadOnWindow": 7,
+    "upConfirmOffMin": 1,
+    "upOffHarden": 0.01,
+
+    "downGrace": 3,
+    "hazardWindow": 10,
+    "offFluxTighten": 0.05,
+    "confirmOffMin": 1,
+
+    "onOverrideMargin": 0.01
+  }
+}
