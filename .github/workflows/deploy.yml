@@ -5,7 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '10 21 * * *'  # 06:10 KST
+    - cron: '00 22 * * *'  # 07:00 KST (UTC+9)
     - cron: '10 5 * * *'   # 14:10 KST
 
 permissions:

@@ -937,6 +937,8 @@ function renderRisk() {
     : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
       ? computeRiskSeriesFFL(metrics, filteredRecords2)
       : computeRiskSeriesClassic(metrics, filteredRecords2);
+  // Precompute FFL overlay metrics so we can display Flux/FINT in any mode
+  const fflOverlay = computeRiskSeriesFFL(metrics, filteredRecords2);
   if (!series) {
     if (elementGauge && charts.riskGauge) charts.riskGauge.clear();
     if (elementTimeline && charts.riskTimeline) charts.riskTimeline.clear();
@@ -988,56 +990,54 @@ function renderRisk() {
         const label = stateValue > 0 ? (series.fragile?.[idx] ? 'Risk-On (Fragile)' : 'Risk-On') : stateValue < 0 ? 'Risk-Off' : 'Neutral';
         const sc = series.scCorr[idx];
         const sn = series.safeNeg[idx];
-        let extras = '';
-        if (state.riskMode !== 'classic') {
-          const parts = [];
-          const baseScore = state.riskMode === 'enhanced'
-            ? series.riskScore?.[idx]
-            : series.score?.[idx];
-          if (Number.isFinite(baseScore)) {
-            parts.push(`점수 ${Number(baseScore).toFixed(3)}`);
-          }
-          if (state.riskMode === 'enhanced') {
-            const mm = series.mm?.[idx];
-            const guardVal = series.guard?.[idx];
-            const combo = series.comboMomentum?.[idx];
-            const breadthVal = series.breadth?.[idx];
-            if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
-            if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
-            if (Number.isFinite(mm)) parts.push(`흡수비 ${mm.toFixed(3)}`);
-            if (Number.isFinite(guardVal)) parts.push(`위험가드 ${(guardVal * 100).toFixed(0)}%`);
-          } else if (state.riskMode === 'ffl') {
-            const fluxVal = series.fflFlux?.[idx];
-            const fintVal = series.fluxIntensity?.[idx];
-            const farVal = series.far?.[idx];
-            const rbVal = series.riskBetaFlux?.[idx];
-            const fullZ = series.fullFluxZ?.[idx];
-            const diffVal = series.diffusionScore?.[idx];
-            const mmTrend = series.mmTrend?.[idx];
-            const apdf = series.apdf?.[idx];
-            const pcon = series.pcon?.[idx];
-            const mm = series.mm?.[idx];
-            const guardVal = series.guard?.[idx];
-            const combo = series.comboMomentum?.[idx];
-            const breadthVal = series.breadth?.[idx];
-            if (Number.isFinite(fluxVal)) parts.push(`J_norm ${fluxVal.toFixed(3)}`);
-            if (Number.isFinite(fintVal)) parts.push(`FINT ${fintVal.toFixed(3)}`);
-            if (Number.isFinite(farVal)) parts.push(`FAR ${farVal.toFixed(3)}`);
-            if (Number.isFinite(rbVal)) parts.push(`RB_Flux ${rbVal.toFixed(3)}`);
-            if (Number.isFinite(fullZ)) parts.push(`ΔCorr-Z ${fullZ.toFixed(3)}`);
-            if (Number.isFinite(diffVal)) parts.push(`Diff ${diffVal.toFixed(3)}`);
-            if (Number.isFinite(mmTrend)) parts.push(`mmΔ ${mmTrend.toFixed(3)}`);
-            if (Number.isFinite(apdf)) parts.push(`APDF ${apdf.toFixed(3)}`);
-            if (Number.isFinite(pcon)) parts.push(`PCON ${(pcon * 100).toFixed(0)}%`);
-            if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
-            if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
-            if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
-            if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
-          }
-          if (parts.length > 0) {
-            extras = `<br/>${parts.join(' · ')}`;
-          }
+        const parts = [];
+        const baseScore = (state.riskMode === 'enhanced') ? (series.riskScore?.[idx]) : (series.score?.[idx]);
+        if (Number.isFinite(baseScore)) parts.push(`점수 ${Number(baseScore).toFixed(3)}`);
+        if (state.riskMode === 'enhanced') {
+          const mm = series.mm?.[idx];
+          const guardVal = series.guard?.[idx];
+          const combo = series.comboMomentum?.[idx];
+          const breadthVal = series.breadth?.[idx];
+          if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
+          if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+          if (Number.isFinite(mm)) parts.push(`흡수비 ${mm.toFixed(3)}`);
+          if (Number.isFinite(guardVal)) parts.push(`위험가드 ${(guardVal * 100).toFixed(0)}%`);
+        } else if (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp') {
+          const fluxVal = series.fflFlux?.[idx];
+          const fintVal = series.fluxIntensity?.[idx];
+          const farVal = series.far?.[idx];
+          const rbVal = series.riskBetaFlux?.[idx];
+          const fullZ = series.fullFluxZ?.[idx];
+          const diffVal = series.diffusionScore?.[idx];
+          const mmTrend = series.mmTrend?.[idx];
+          const apdf = series.apdf?.[idx];
+          const pcon = series.pcon?.[idx];
+          const mm = series.mm?.[idx];
+          const guardVal = series.guard?.[idx];
+          const combo = series.comboMomentum?.[idx];
+          const breadthVal = series.breadth?.[idx];
+          if (Number.isFinite(fluxVal)) parts.push(`J_norm ${fluxVal.toFixed(3)}`);
+          if (Number.isFinite(fintVal)) parts.push(`FINT ${fintVal.toFixed(3)}`);
+          if (Number.isFinite(farVal)) parts.push(`FAR ${farVal.toFixed(3)}`);
+          if (Number.isFinite(rbVal)) parts.push(`RB_Flux ${rbVal.toFixed(3)}`);
+          if (Number.isFinite(fullZ)) parts.push(`ΔCorr-Z ${fullZ.toFixed(3)}`);
+          if (Number.isFinite(diffVal)) parts.push(`Diff ${diffVal.toFixed(3)}`);
+          if (Number.isFinite(mmTrend)) parts.push(`mmΔ ${mmTrend.toFixed(3)}`);
+          if (Number.isFinite(apdf)) parts.push(`APDF ${apdf.toFixed(3)}`);
+          if (Number.isFinite(pcon)) parts.push(`PCON ${(pcon * 100).toFixed(0)}%`);
+          if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
+          if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
+          if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
+          if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
         }
+        // Always include FFL overlays (Flux/FINT) for Classic/Enhanced tooltips
+        if (fflOverlay) {
+          const fx = fflOverlay.fflFlux?.[idx];
+          const fint = fflOverlay.fluxIntensity?.[idx];
+          if (Number.isFinite(fx)) parts.push(`FFL J_norm ${fx.toFixed(3)}`);
+          if (Number.isFinite(fint)) parts.push(`FFL FINT ${fint.toFixed(3)}`);
+        }
+        const extras = parts.length > 0 ? `<br/>${parts.join(' · ')}` : '';
         const corrLabel = formatRiskPairLabel();
         return `${series.dates[idx]}<br/>${label}<br/>${corrLabel}: ${Number(sc).toFixed(3)}<br/>Safe-NEG: ${Number(sn).toFixed(3)}${extras}`;
       } },
@@ -2900,13 +2900,12 @@ function renderSubGauges() {
     { key: 'traditional', element: 'traditional-gauge' },
     { key: 'safeNegative', element: 'safe-neg-gauge' },
   ];
-  const extraFFL = (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp')
-    ? [
-        { keyFrom: 'fflFlux', element: 'ffl-flux-gauge', min: -1, max: 1, formatter: (v) => safeNumber(v).toFixed(3) },
-        { keyFrom: 'fluxIntensity', element: 'ffl-fint-gauge', min: 0, max: 2, formatter: (v) => safeNumber(v).toFixed(3) },
-        { keyFrom: 'far', element: 'ffl-far-gauge', min: 0, max: 5, formatter: (v) => safeNumber(v).toFixed(3) },
-      ]
-    : [];
+  // Always expose FFL auxiliary gauges regardless of regime mode.
+  const extraFFL = [
+    { keyFrom: 'fflFlux', element: 'ffl-flux-gauge', min: -1, max: 1, formatter: (v) => safeNumber(v).toFixed(3) },
+    { keyFrom: 'fluxIntensity', element: 'ffl-fint-gauge', min: 0, max: 2, formatter: (v) => safeNumber(v).toFixed(3) },
+    { keyFrom: 'far', element: 'ffl-far-gauge', min: 0, max: 5, formatter: (v) => safeNumber(v).toFixed(3) },
+  ];
 
   mapping.forEach(({ key, element }) => {
     const container = document.getElementById(element);
