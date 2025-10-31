@@ -2739,70 +2739,114 @@ function buildSubIndexSection(records) {
 }
 
 function buildRiskScoreSection(riskSeries) {
-  const lines = ['[3. 리스크온 점수]','- 결합 강도, Safe-NEG(안전자산 역동), 모멘텀, 리스크 폭, Guard(흡수비·안정성) 등을 결합한 실제 행동 신호입니다. 결합 강도만으로 On/Off가 결정되지 않습니다.'];
-  if (
-    !riskSeries ||
-    !Array.isArray(riskSeries.dates) ||
-    riskSeries.dates.length === 0 ||
-    !Array.isArray(riskSeries.state)
-  ) {
+  const lines = ['[3. 리스크온 점수]', '- 결합 강도, Safe-NEG(안전자산 역동), 모멘텀, 리스크 폭, Guard(흡수비·안정성) 등을 결합한 실제 행동 신호입니다. 결합 강도만으로 On/Off가 결정되지 않습니다.'];
+  if (!riskSeries || !Array.isArray(riskSeries.dates) || riskSeries.dates.length === 0 || !Array.isArray(riskSeries.state)) {
     lines.push('- 레짐 데이터를 계산하지 못했습니다.');
     return lines;
   }
-  const mode = state.riskMode;
-  const isEnhanced = mode === 'enhanced';
-  const isFFL = (mode === 'ffl' || mode === 'ffl_exp');
-  const headers = isEnhanced
-    ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'Guard', 'Absorption', 'Combo(10일)', 'Breadth(5일)']
-    : isFFL
-      ? ['날짜', '상태', '점수', 'Corr', 'Safe-NEG', 'J_norm', 'FINT', 'FAR', 'RB_Flux', 'ΔCorr-Z', 'Diff', 'mmΔ', 'APDF', 'PCON', 'v_PC1', 'κ(diff↔drift)', 'Guard', 'Absorption', 'Combo(Z)', 'Breadth']
-      : ['날짜', '상태', '점수', 'Corr', 'Safe-NEG'];
+
+  // Always build a regime-agnostic, unified table so columns never change.
+  // Fill missing metrics from overlay series (FFL/Enhanced/Classic) when available.
+  const metrics = state.metrics[state.window];
+  const { records } = getFilteredRecords(metrics);
+  const classicAll = computeRiskSeriesClassic(metrics, records) || {};
+  const enhancedAll = computeRiskSeriesEnhanced(metrics, records) || {};
+  const fflAll = computeRiskSeriesFFL(metrics, records) || {};
+
+  const headers = [
+    '날짜',
+    '상태',
+    'State',     // numeric state code (-1/0/1)
+    'Exec',      // executed state (T+1, numeric)
+    '점수',
+    'Corr',
+    'Safe-NEG',
+    'Guard',
+    'Absorption',
+    'J_norm',
+    'FINT',
+    'FAR',
+    'RB_Flux',
+    'ΔCorr-Z',
+    'Diff',
+    'mmΔ',
+    'APDF',
+    'PCON',
+    'v_PC1',
+    'κ(diff↔drift)',
+    'Combo(Z)',
+    'Breadth',
+  ];
+
+  function pick(arrName, idx) {
+    const a = riskSeries?.[arrName]?.[idx];
+    if (a != null && Number.isFinite(a)) return a;
+    const b = fflAll?.[arrName]?.[idx];
+    if (b != null && Number.isFinite(b)) return b;
+    const c = enhancedAll?.[arrName]?.[idx];
+    if (c != null && Number.isFinite(c)) return c;
+    const d = classicAll?.[arrName]?.[idx];
+    if (d != null && Number.isFinite(d)) return d;
+    return null;
+  }
 
   const rows = riskSeries.dates.map((date, idx) => {
-    const label = formatRegimeLabel(riskSeries.state[idx], riskSeries.fragile?.[idx]);
-    if (isEnhanced) {
-      return [
-        date,
-        label,
-        formatNumberOrNA(riskSeries.riskScore?.[idx]),
-        formatNumberOrNA(riskSeries.scCorr?.[idx]),
-        formatNumberOrNA(riskSeries.safeNeg?.[idx]),
-        formatNumberOrNA(riskSeries.guard?.[idx]),
-        formatNumberOrNA(riskSeries.mm?.[idx]),
-        formatSignedPercent(riskSeries.comboMomentum?.[idx]),
-        formatPercentOrNA(riskSeries.breadth?.[idx]),
-      ];
-    }
-    if (isFFL) {
-      return [
-        date,
-        label,
-        formatNumberOrNA(riskSeries.score?.[idx]),
-        formatNumberOrNA(riskSeries.scCorr?.[idx]),
-        formatNumberOrNA(riskSeries.safeNeg?.[idx]),
-        formatNumberOrNA(riskSeries.fflFlux?.[idx]),
-        formatNumberOrNA(riskSeries.fluxIntensity?.[idx]),
-        formatNumberOrNA(riskSeries.far?.[idx]),
-        formatNumberOrNA(riskSeries.riskBetaFlux?.[idx]),
-        formatNumberOrNA(riskSeries.fullFluxZ?.[idx]),
-        formatNumberOrNA(riskSeries.diffusionScore?.[idx]),
-        formatNumberOrNA(riskSeries.mmTrend?.[idx]),
-        formatNumberOrNA(riskSeries.apdf?.[idx]),
-        (Number.isFinite(riskSeries.pcon?.[idx]) ? (riskSeries.pcon[idx] * 100).toFixed(0) + '%' : 'N/A'),
-        formatNumberOrNA(riskSeries.vPC1?.[idx]),
-        (Number.isFinite(riskSeries.kappa?.[idx]) ? (riskSeries.kappa[idx] * 100).toFixed(0) + '%' : 'N/A'),
-        formatNumberOrNA(riskSeries.guard?.[idx]),
-        formatNumberOrNA(riskSeries.mm?.[idx]),
-        formatSignedPercent(riskSeries.comboMomentum?.[idx]),
-        formatPercentOrNA(riskSeries.breadth?.[idx]),
-      ];
-    }
+    const st = Number.isFinite(riskSeries.state?.[idx]) ? riskSeries.state[idx] : (Number.isFinite(fflAll.state?.[idx]) ? fflAll.state[idx] : (Number.isFinite(enhancedAll.state?.[idx]) ? enhancedAll.state[idx] : (Number.isFinite(classicAll.state?.[idx]) ? classicAll.state[idx] : 0)));
+    const label = formatRegimeLabel(st, riskSeries.fragile?.[idx] || fflAll.fragile?.[idx] || enhancedAll.fragile?.[idx]);
+    const exec = Number.isFinite(riskSeries.executedState?.[idx])
+      ? riskSeries.executedState[idx]
+      : Number.isFinite(fflAll.executedState?.[idx])
+        ? fflAll.executedState[idx]
+        : (idx === 0 ? 0 : (Number.isFinite(st) ? (riskSeries.state?.[idx - 1] ?? st) : 0));
+
+    // Score: prefer regime's native score key
+    const scoreVal = Number.isFinite(riskSeries.riskScore?.[idx]) ? riskSeries.riskScore[idx]
+      : Number.isFinite(riskSeries.score?.[idx]) ? riskSeries.score[idx]
+      : Number.isFinite(fflAll.score?.[idx]) ? fflAll.score[idx]
+      : Number.isFinite(enhancedAll.riskScore?.[idx]) ? enhancedAll.riskScore[idx]
+      : Number.isFinite(classicAll.score?.[idx]) ? classicAll.score[idx] : null;
+
+    const scCorr = pick('scCorr', idx);
+    const safeNeg = pick('safeNeg', idx);
+    const guard = pick('guard', idx);
+    const mm = pick('mm', idx);
+    const jn = pick('fflFlux', idx);
+    const fint = pick('fluxIntensity', idx);
+    const far = pick('far', idx);
+    const rb = pick('riskBetaFlux', idx);
+    const zcorr = pick('fullFluxZ', idx);
+    const diff = pick('diffusionScore', idx);
+    const mmd = pick('mmTrend', idx);
+    const apdf = pick('apdf', idx);
+    const pcon = pick('pcon', idx);
+    const vpc1 = pick('vPC1', idx);
+    const kappa = pick('kappa', idx);
+    const combo = pick('comboMomentum', idx);
+    const br = pick('breadth', idx);
+
     return [
       date,
       label,
-      formatNumberOrNA(riskSeries.score?.[idx]),
-      formatNumberOrNA(riskSeries.scCorr?.[idx]),
-      formatNumberOrNA(riskSeries.safeNeg?.[idx]),
+      Number.isFinite(st) ? st : '',
+      Number.isFinite(exec) ? exec : '',
+      formatNumberOrNA(scoreVal),
+      formatNumberOrNA(scCorr),
+      formatNumberOrNA(safeNeg),
+      formatNumberOrNA(guard),
+      formatNumberOrNA(mm),
+      formatNumberOrNA(jn),
+      formatNumberOrNA(fint),
+      formatNumberOrNA(far),
+      formatNumberOrNA(rb),
+      formatNumberOrNA(zcorr),
+      formatNumberOrNA(diff),
+      formatNumberOrNA(mmd),
+      formatNumberOrNA(apdf),
+      (Number.isFinite(pcon) ? `${(pcon * 100).toFixed(0)}%` : 'N/A'),
+      formatNumberOrNA(vpc1),
+      (Number.isFinite(kappa) ? `${(kappa * 100).toFixed(0)}%` : 'N/A'),
+      formatSignedPercent(combo),
+      formatPercentOrNA(br),
     ];
   });
 
