@@ -173,7 +173,7 @@ function getInitialRiskMode() {
   }
   try {
     const saved = window.localStorage?.getItem(RISK_MODE_STORAGE_KEY);
-    if (saved === 'classic' || saved === 'enhanced' || saved === 'ffl' || saved === 'ffl_exp' || saved === 'ffl_stab') {
+    if (saved === 'classic' || saved === 'enhanced' || saved === 'ffl' || saved === 'ffl_exp' || saved === 'ffl_stab' || saved === 'fll_fusion') {
       return saved;
     }
   } catch (error) {
@@ -208,7 +208,8 @@ function applyRiskMode(nextMode, { persist = true } = {}) {
   const normalized = (nextMode === 'enhanced') ? 'enhanced'
     : (nextMode === 'ffl' ? 'ffl'
     : (nextMode === 'ffl_exp' ? 'ffl_exp'
-    : (nextMode === 'ffl_stab' ? 'ffl_stab' : 'classic')));
+    : (nextMode === 'ffl_stab' ? 'ffl_stab'
+    : (nextMode === 'fll_fusion' ? 'fll_fusion' : 'classic'))));
   state.riskMode = normalized;
   if (persist) {
     try {
@@ -702,7 +703,13 @@ function populateControls() {
       opt3.textContent = 'FFL+STAB';
       riskModeSelect.appendChild(opt3);
     }
-    const supportedModes = ['classic', 'enhanced', 'ffl', 'ffl_exp', 'ffl_stab'];
+    if (!Array.from(riskModeSelect.options).some((option) => option.value === 'fll_fusion')) {
+      const opt4 = document.createElement('option');
+      opt4.value = 'fll_fusion';
+      opt4.textContent = 'FLL-Fusion';
+      riskModeSelect.appendChild(opt4);
+    }
+    const supportedModes = ['classic', 'enhanced', 'ffl', 'ffl_exp', 'ffl_stab', 'fll_fusion'];
     const currentMode = supportedModes.includes(state.riskMode) ? state.riskMode : 'classic';
     if (riskModeSelect.value !== currentMode) {
       riskModeSelect.value = currentMode;
@@ -994,9 +1001,11 @@ function renderRisk() {
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, filteredRecords2)
-      : computeRiskSeriesClassic(metrics, filteredRecords2);
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, filteredRecords2)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, filteredRecords2)
+        : computeRiskSeriesClassic(metrics, filteredRecords2));
   // Precompute FFL overlay metrics so we can display Flux/FINT in any mode
   const fflOverlay = computeRiskSeriesFFL(metrics, filteredRecords2);
   if (!series) {
@@ -1159,9 +1168,11 @@ function renderBacktest() {
 
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, filtered)
-      : computeRiskSeriesClassic(metrics, filtered);
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, filtered)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, filtered)
+        : computeRiskSeriesClassic(metrics, filtered));
   if (!series) return;
 
   const symbol = baseSymbol;
@@ -1287,9 +1298,11 @@ function renderAlerts() {
   if (empty) { box.innerHTML = ''; return; }
   const series = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, filtered)
-      : computeRiskSeriesClassic(metrics, filtered);
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, filtered)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, filtered)
+        : computeRiskSeriesClassic(metrics, filtered));
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -2412,6 +2425,120 @@ function computeRiskBreadth(priceIndex, lookback) {
   return positive / considered;
 }
 
+// FLL-Fusion: mix Classic and FFL+STAB by rolling Hit-rate and IC with softmax weights, guard by Absorption.
+function computeRiskSeriesFLLFusion(metrics, recordsOverride, opts = {}) {
+  if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) return null;
+  const records = Array.isArray(recordsOverride) && recordsOverride.length > 0 ? recordsOverride : metrics.records;
+  const cfg = Object.assign({ win: 40, lam: 0.50, tau: 4.0, floor: 0.10, onThr: +0.20, offThr: -0.20 }, opts || {});
+
+  // 1) Individual series aligned to the same filtered dates
+  const classic = computeRiskSeriesClassic(metrics, records);
+  if (!classic) return null;
+  // Force FFL variant = STAB without changing UI state
+  const prevMode = state.riskMode;
+  state.riskMode = 'ffl_stab';
+  const fflStab = computeRiskSeriesFFL(metrics, records);
+  state.riskMode = prevMode;
+  if (!fflStab) return null;
+
+  const dates = classic.dates || fflStab.dates || [];
+  const n = dates.length;
+  if (n === 0) return null;
+
+  // 2) Align QQQ returns to dates
+  const pxQQQ = state.priceSeries?.[SIGNAL.trade.baseSymbol] || [];
+  if (!Array.isArray(pxQQQ) || pxQQQ.length < 2) return null;
+  const rQQQfull = toReturns(pxQQQ); // length = analysisDates.length - 1
+  const firstDate = dates[0];
+  const gIdx = (state.analysisDates || []).indexOf(firstDate);
+  const startRetIdx = Math.max(0, gIdx - 1);
+  let rQQQ = rQQQfull.slice(startRetIdx, startRetIdx + n);
+  if (rQQQ.length < n) {
+    // pad front with zeros if needed
+    rQQQ = new Array(n - rQQQ.length).fill(0).concat(rQQQ);
+  }
+
+  // 3) Predictions and one-day execution lag
+  const predC_now = (classic.state || []).map((s) => (Number.isFinite(s) ? (s > 0 ? 1 : (s < 0 ? -1 : 0)) : 0));
+  const predF_now = (fflStab.state || []).map((s) => (Number.isFinite(s) ? (s > 0 ? 1 : (s < 0 ? -1 : 0)) : 0));
+  const predC = [0, ...predC_now.slice(0, n - 1)];
+  const predF = [0, ...predF_now.slice(0, n - 1)];
+
+  // 4) Rolling hit-rate and IC
+  function rollingHit(pred, r, W) {
+    let hits = 0; let tot = 0; const buf = []; const out = new Array(r.length).fill(0.5);
+    for (let t = 0; t < r.length; t += 1) {
+      const p = pred[t]; const y = Math.sign(r[t]);
+      if (p !== 0) { const ok = (Math.sign(p) === y) ? 1 : 0; buf.push([ok, 1]); hits += ok; tot += 1; } else { buf.push([0, 0]); }
+      if (buf.length > W) { const [okRem, totRem] = buf.shift(); hits -= okRem; tot -= totRem; }
+      out[t] = tot > 0 ? (hits / tot) : 0.5;
+    }
+    return out;
+  }
+  function rollingIC(pred, r, W) {
+    const out = new Array(r.length).fill(0); const bx = []; const by = [];
+    let sumXY = 0, sumR = 0, sumR2 = 0;
+    for (let t = 0; t < r.length; t += 1) {
+      const x = pred[t]; const y = r[t];
+      bx.push(x); by.push(y);
+      sumXY += (x * y); sumR += y; sumR2 += y * y;
+      if (bx.length > W) { const x0 = bx.shift(); const y0 = by.shift(); sumXY -= (x0 * y0); sumR -= y0; sumR2 -= y0 * y0; }
+      const nWin = by.length; const mu = nWin ? (sumR / nWin) : 0;
+      const varR = Math.max(1e-12, (sumR2 / nWin) - mu * mu); const sd = Math.sqrt(varR);
+      out[t] = sd > 0 ? (sumXY / nWin) / sd : 0;
+    }
+    return out;
+  }
+  function softmax2(a, b, tau, floor) {
+    const ezA = Math.exp(tau * a), ezB = Math.exp(tau * b);
+    let wA = ezA / (ezA + ezB), wB = 1 - wA;
+    wA = Math.max(floor, wA); wB = Math.max(floor, wB);
+    const s = wA + wB; return [wA / s, wB / s];
+  }
+
+  const hitC = rollingHit(predC, rQQQ, cfg.win);
+  const hitF = rollingHit(predF, rQQQ, cfg.win);
+  const icC = rollingIC(predC, rQQQ, cfg.win);
+  const icF = rollingIC(predF, rQQQ, cfg.win);
+  const scoreC = hitC.map((h, i) => cfg.lam * (h - 0.5) + (1 - cfg.lam) * icC[i]);
+  const scoreF = hitF.map((h, i) => cfg.lam * (h - 0.5) + (1 - cfg.lam) * icF[i]);
+  const wClassic = new Array(n).fill(0.5); const wFFL = new Array(n).fill(0.5);
+  for (let i = 0; i < n; i += 1) { const [a, b] = softmax2(scoreC[i], scoreF[i], cfg.tau, cfg.floor); wClassic[i] = a; wFFL[i] = b; }
+
+  // 5) Guard by absorption ratio (mm)
+  const mmFragile = (RISK_CFG_FFL?.thresholds?.mmFragile ?? 0.88);
+  const mmOff = (RISK_CFG_FFL?.thresholds?.mmOff ?? 0.96);
+  const mm = fflStab.mm || classic.mm || new Array(n).fill(0);
+  const guardFragile = mm.map((x) => Number.isFinite(x) && x >= mmFragile);
+  const guardHardOff = mm.map((x) => Number.isFinite(x) && x >= mmOff);
+
+  // 6) Fused raw and state
+  const fusedRaw = new Array(n).fill(0);
+  for (let i = 0; i < n; i += 1) fusedRaw[i] = wClassic[i] * predC_now[i] + wFFL[i] * predF_now[i];
+  const stateArr = fusedRaw.map((v, i) => {
+    if (guardHardOff[i]) return -1;
+    if (guardFragile[i] && v > 0) return 0;
+    if (v >= cfg.onThr) return 1;
+    if (v <= cfg.offThr) return -1;
+    return 0;
+  });
+  const executedState = stateArr.map((val, idx) => (idx === 0 ? 0 : stateArr[idx - 1] || 0));
+  const score = fusedRaw.map((v) => Math.max(0, Math.min(1, (v + 1) / 2)));
+
+  return {
+    dates,
+    state: stateArr,
+    executedState,
+    score,
+    wClassic,
+    wFFL,
+    mm,
+    fragile: guardFragile,
+    scCorr: classic.scCorr || fflStab.scCorr,
+    safeNeg: classic.safeNeg || fflStab.safeNeg,
+  };
+}
+
 function clamp01(value) {
   if (!Number.isFinite(value)) return 0;
   if (value <= 0) return 0;
@@ -2631,7 +2758,7 @@ function buildTextReportPayload() {
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
-    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : state.riskMode === 'ffl_stab' ? 'FFL+STAB' : 'Classic'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : state.riskMode === 'ffl_stab' ? 'FFL+STAB' : state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'}`,
     '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',
@@ -2990,6 +3117,11 @@ function formatRegimeTransitionLine(riskSeries, idx) {
     const combo = formatSignedPercent(riskSeries.comboMomentum?.[idx]);
     const breadth = formatPercentOrNA(riskSeries.breadth?.[idx]);
     extras = `, J_norm=${flux}, FINT=${fint}, FAR=${far}, Guard=${guard}, Absorption=${mm}, Combo=${combo}, Breadth=${breadth}`;
+  } else if (state.riskMode === 'fll_fusion') {
+    const wC = Number.isFinite(riskSeries.wClassic?.[idx]) ? `${(riskSeries.wClassic[idx] * 100).toFixed(0)}%` : 'N/A';
+    const wF = Number.isFinite(riskSeries.wFFL?.[idx]) ? `${(riskSeries.wFFL[idx] * 100).toFixed(0)}%` : 'N/A';
+    const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
+    extras = `, wC=${wC}, wFFL=${wF}, Absorption=${mm}`;
   }
   return `- ${riskSeries.dates[idx]} · ${label} (Score=${scoreValue}, Corr=${corrValue}, Safe-NEG=${safeValue}${extras})`;
 }
@@ -3240,18 +3372,25 @@ function renderGauge() {
   const averageLabel = averageWindowSize > 0 ? `최근 ${averageWindowSize}일 평균` : '평균';
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
-  // Regime summary (Classic/Enhanced/FFL)
+  // Regime summary (Classic/Enhanced/FFL/FLL-Fusion)
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(state.metrics[state.window], filteredRecords)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(state.metrics[state.window], filteredRecords)
-      : computeRiskSeriesClassic(state.metrics[state.window], filteredRecords);
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(state.metrics[state.window], filteredRecords)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(state.metrics[state.window], filteredRecords)
+        : computeRiskSeriesClassic(state.metrics[state.window], filteredRecords));
   if (riskSeries && riskSeries.score.length > 0) {
     const idx = riskSeries.score.length - 1;
     const rState = riskSeries.state[idx];
     const rLabel = rState > 0 ? 'Risk-On' : rState < 0 ? 'Risk-Off' : 'Neutral';
     const rScore = safeNumber(riskSeries.score[idx]).toFixed(3);
-    const modeLabel = state.riskMode === 'enhanced' ? 'Enhanced' : (state.riskMode === 'ffl' ? 'FFL' : (state.riskMode === 'ffl_exp' ? 'FFL+EXP' : (state.riskMode === 'ffl_stab' ? 'FFL+STAB' : 'Classic')));
+    const modeLabel = state.riskMode === 'enhanced'
+      ? 'Enhanced'
+      : (state.riskMode === 'ffl' ? 'FFL'
+      : (state.riskMode === 'ffl_exp' ? 'FFL+EXP'
+      : (state.riskMode === 'ffl_stab' ? 'FFL+STAB'
+      : (state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'))));
     const summary = `${modeLabel} 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
     setGaugePanelFeedback(summary);
   }
