@@ -1294,21 +1294,16 @@ function renderBacktest() {
   const prices = state.priceSeries[symbol] || [];
   const opens = state.priceSeriesOpen?.[symbol] || [];
   const baseReturns = [];
-  const openToCloseReturns = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
-    let daily = 0;
-    if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
-      daily = prices[priceIndex] / prices[prevIndex] - 1;
+    let openReturn = 0;
+    if (opens[priceIndex] != null && opens[prevIndex] != null && opens[prevIndex] !== 0) {
+      openReturn = opens[priceIndex] / opens[prevIndex] - 1;
+    } else if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
+      openReturn = prices[priceIndex] / prices[prevIndex] - 1;
     }
-    baseReturns.push(daily);
-    const openPrice = opens[priceIndex];
-    const closePrice = prices[priceIndex];
-    const ocReturn = Number.isFinite(openPrice) && Number.isFinite(closePrice) && openPrice !== 0
-      ? (closePrice / openPrice) - 1
-      : daily;
-    openToCloseReturns.push(ocReturn);
+    baseReturns.push(openReturn);
   }
 
   const executedState = Array.isArray(series.executedState) && series.executedState.length === series.state.length
@@ -1316,7 +1311,7 @@ function renderBacktest() {
     : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
   const stratReturns = executedState.map((regime, idx) => {
     if (regime > 0) {
-      return leveragedReturn(openToCloseReturns[idx], tradeConfig.leverage);
+      return leveragedReturn(baseReturns[idx], tradeConfig.leverage);
     }
     if (regime < 0) {
       return 0;
