@@ -108,7 +108,7 @@ async function main() {
 
     const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
-    const openSeries = buildAlignedOpenSeries(aligned.dates, mergedSeries);
+    const openSeries = buildAlignedOpenSeries(returns.dates, mergedSeries);
     const leveredAligned = buildLeveredSeries(aligned.dates, leveredSeriesMerged || []);
     const output = buildOutput(aligned, returns, openSeries, leveredAligned);
     await writeOutput(output);
