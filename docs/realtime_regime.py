@@ -13,8 +13,8 @@ import requests
 
 # Symbols and clusters (match front-end JS defaults)
 BASE_SYMBOL = "QQQ"
-_levered_sym_env = os.getenv("REGIME_LEVERED_SYMBOL", "TQQQ")
-LEVERED_SYMBOL = (_levered_sym_env or "TQQQ").upper()
+_strategy_sym_env = os.getenv("REGIME_STRATEGY_SYMBOL", "TQQQ")
+STRATEGY_SYMBOL = (_strategy_sym_env or "TQQQ").upper()
 _bench_sym_env = os.getenv("REGIME_BENCH_SYMBOL", BASE_SYMBOL)
 BENCH_SYMBOL = (_bench_sym_env or BASE_SYMBOL).upper()
 try:
@@ -28,8 +28,9 @@ except ValueError:
 RISK_SYMBOLS = ["IWM", "SPY", "BTC-USD"]
 SAFE_SYMBOLS = ["TLT", "GLD"]
 _all_symbols_seed: List[str] = [BASE_SYMBOL]
-if BENCH_SYMBOL not in _all_symbols_seed:
-    _all_symbols_seed.append(BENCH_SYMBOL)
+for sym in [STRATEGY_SYMBOL, BENCH_SYMBOL]:
+    if sym and sym not in _all_symbols_seed:
+        _all_symbols_seed.append(sym)
 for sym in ["IWM", "SPY", "TLT", "GLD", "BTC-USD"]:
     if sym not in _all_symbols_seed:
         _all_symbols_seed.append(sym)
@@ -244,11 +245,20 @@ def fetch_daily_history_fmp(symbols: List[str], from_date: str, api_key: str) ->
     out: Dict[str, pd.DataFrame] = {}
     sess = requests.Session()
     for sym in symbols:
-        url = f"{base}{_map_symbol_for_fmp(sym)}?from={from_date}&apikey={api_key}"
-        r = sess.get(url, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        hist = data.get("historical") or []
+        mapped = _map_symbol_for_fmp(sym)
+        def _fetch(url: str) -> List[Dict[str, Any]]:
+            r = sess.get(url, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("historical") or []
+        url_primary = f"{base}{mapped}?from={from_date}&apikey={api_key}"
+        hist = _fetch(url_primary)
+        if not hist:
+            # retry with serietype=line (ETF 등 일부 티커에서 필요)
+            url_alt = f"{base}{mapped}?from={from_date}&serietype=line&apikey={api_key}"
+            hist = _fetch(url_alt)
+        if not hist:
+            raise RuntimeError(f"FMP 응답에 {sym} 데이터가 없습니다. API 키 권한을 확인하세요.")
         rows = []
         for row in hist:
             d = row.get("date")
@@ -258,6 +268,7 @@ def fetch_daily_history_fmp(symbols: List[str], from_date: str, api_key: str) ->
             open_raw = row.get("open")
             if not d or not isinstance(close, (int, float)):
                 continue
+            # Build adjusted open when possible to stay aligned with adjusted close.
             if isinstance(ac, (int, float)) and isinstance(row.get("close"), (int, float)) and row.get("close"):
                 factor = float(ac) / float(row.get("close"))
                 adj_open = float(open_raw) * factor if isinstance(open_raw, (int, float)) else None
@@ -294,14 +305,23 @@ def fetch_realtime_quotes_fmp(symbols: List[str], api_key: str) -> Dict[str, Tup
         row = by_symbol.get(key)
         if not row:
             continue
-        price = float(row.get("price") or row.get("previousClose") or 0.0)
+        price_raw = row.get("price")
+        prev_close_raw = row.get("previousClose")
+        price: Optional[float] = None
+        if isinstance(price_raw, (int, float)) and price_raw > 0:
+            price = float(price_raw)
+        elif isinstance(prev_close_raw, (int, float)) and prev_close_raw > 0:
+            price = float(prev_close_raw)
+        else:
+            # Skip realtime patch when FMP returns 0.0 (or missing) to avoid zeroing out history.
+            continue
         ts = row.get("timestamp") or row.get("lastUpdated")
         try:
             t = pd.to_datetime(ts, unit="s", utc=True) if isinstance(ts, (int, float)) else pd.to_datetime(ts, utc=True)
         except Exception:
             t = pd.Timestamp.utcnow()
-        prev_close = row.get("previousClose")
-        out[sym] = (t, price, float(prev_close) if isinstance(prev_close, (int, float)) else None)
+        prev_close = float(prev_close_raw) if isinstance(prev_close_raw, (int, float)) else None
+        out[sym] = (t, price, prev_close)
     return out
 
 
@@ -1077,180 +1097,120 @@ def compute_fusion(classic: Tuple[List[str], List[float], List[int], List[float]
     }
 
 
-def leveraged_return(r: float, leverage: int = 3, weight: float = 1.0) -> float:
-    if not math.isfinite(r):
-        return 0.0
-    scale = weight if math.isfinite(weight) else 1.0
-    return max(-0.99, leverage * r * scale)
+def leveraged_return(r: float, leverage: int = 3) -> float:
+    return max(-0.99, leverage * r)
 
 
 def backtest_from_state(
-    analysis_dates: List[str],
+    prices_close: List[float],
     dates: List[str],
     state: List[int],
-    *,
-    window: int,
-    price_mode: str = "open",
-    base_close: Optional[List[float]] = None,
-    base_open: Optional[List[float]] = None,
-    benchmark_close: Optional[List[float]] = None,
-    benchmark_open: Optional[List[float]] = None,
-    levered_close: Optional[List[float]] = None,
-    levered_open: Optional[List[float]] = None,
     leverage: int = 3,
     delay_days: int = 1,
-    neutral_weight: Optional[float] = None,
+    *,
+    price_mode: str = "close",
+    prices_open: Optional[List[float]] = None,
+    strategy_close: Optional[List[float]] = None,
+    strategy_open: Optional[List[float]] = None,
+    benchmark_close: Optional[List[float]] = None,
+    benchmark_open: Optional[List[float]] = None,
+    neutral_bench_weight: Optional[float] = None,
+    risk_on_bench_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
-    if len(dates) == 0:
-        return {
-            "dates": [],
-            "equity_strategy": [],
-            "equity_bh": [],
-            "equity_levered": [],
-            "cum_strategy": 1.0,
-            "cum_bh": 1.0,
-            "price_mode": price_mode,
-            "base_returns": [],
-            "levered_returns": [],
-            "benchmark_returns": [],
-            "strategy_returns": [],
-            "executed_state": [],
-            "price_base": [],
-            "price_levered": [],
-        }
-
+    # Use arithmetic returns to match JS/UI backtest and CSV expectations
     mode = "open" if price_mode == "open" else "close"
-    neutral = NEUTRAL_BENCH_WEIGHT if neutral_weight is None else neutral_weight
 
-    def _as_float_list(seq: Optional[List[float]]) -> List[Optional[float]]:
-        if not isinstance(seq, list):
-            return []
-        out: List[Optional[float]] = []
-        for value in seq:
-            try:
-                num = float(value)
-            except Exception:
-                num = float("nan")
-            out.append(num if math.isfinite(num) else None)
+    def _select_series(close: Optional[List[float]], open_: Optional[List[float]], fallback: Optional[List[float]]) -> List[float]:
+        candidate = close if isinstance(close, list) and close else fallback
+        open_candidate = open_ if isinstance(open_, list) and open_ else None
+        if mode == "open" and open_candidate:
+            return open_candidate
+        return candidate or []
+
+    def _to_returns(series: Optional[List[float]]) -> List[float]:
+        out: List[float] = [0.0]
+        if not isinstance(series, list):
+            return out
+        for i in range(1, len(series)):
+            a, b = series[i - 1], series[i]
+            if np.isfinite(a) and np.isfinite(b) and a != 0:
+                out.append(b / a - 1.0)
+            else:
+                out.append(0.0)
         return out
 
-    base_close_arr = _as_float_list(base_close)
-    base_open_arr = _as_float_list(base_open if mode == "open" else base_close)
-    bench_close_arr = _as_float_list(benchmark_close if benchmark_close is not None else base_close_arr)
-    bench_open_arr = _as_float_list(benchmark_open if benchmark_open is not None else base_open_arr)
-    levered_close_arr = _as_float_list(levered_close)
-    levered_open_arr = _as_float_list(levered_open if mode == "open" else levered_close_arr)
+    series_base = _select_series(prices_close, prices_open, prices_close)
+    series_strategy = _select_series(strategy_close, strategy_open, series_base)
+    series_bench = _select_series(benchmark_close, benchmark_open, prices_close)
 
-    analysis_lookup = {date: idx for idx, date in enumerate(analysis_dates)}
-    first_date = dates[0]
-    first_idx = analysis_lookup.get(first_date, max(0, window - 1))
+    rets_base = _to_returns(series_base)
+    rets_strategy = _to_returns(series_strategy)
+    rets_bench = _to_returns(series_bench)
 
-    base_returns: List[float] = []
-    levered_returns: List[float] = []
-    bench_returns: List[float] = []
-    price_base: List[Optional[float]] = []
-    price_levered: List[Optional[float]] = []
+    neutral_weight = (
+        NEUTRAL_BENCH_WEIGHT if neutral_bench_weight is None else neutral_bench_weight
+    )
+    risk_on_weight = (
+        RISK_ON_BENCH_WEIGHT if risk_on_bench_weight is None else risk_on_bench_weight
+    )
 
-    for offset, date in enumerate(dates):
-        price_index = analysis_lookup.get(date, first_idx + offset)
-        prev_index = price_index - 1
-        base_now = base_open_arr[price_index] if price_index < len(base_open_arr) else None
-        base_prev = base_open_arr[prev_index] if prev_index >= 0 and prev_index < len(base_open_arr) else None
-        if base_now is None or base_prev is None or base_prev == 0:
-            base_now = base_close_arr[price_index] if price_index < len(base_close_arr) else base_now
-            base_prev = base_close_arr[prev_index] if prev_index >= 0 and prev_index < len(base_close_arr) else base_prev
-        if base_now is None or base_prev is None or base_prev == 0:
-            base_returns.append(0.0)
-        else:
-            base_returns.append(float(base_now / base_prev - 1.0))
+    # Align: dates length == len(series_base). Strategy rets length equals len(dates)
+    # We map each regime day to return at same index (already aligned to window slicing externally)
+    strat_eq: List[float] = []
+    bh_eq: List[float] = []
+    asset_eq: List[float] = []
+    s = 1.0
+    b = 1.0
+    a = 1.0
+    aligned_prices_bench: List[Optional[float]] = []
+    aligned_prices_strategy: List[Optional[float]] = []
 
-        bench_now = bench_open_arr[price_index] if price_index < len(bench_open_arr) else None
-        bench_prev = bench_open_arr[prev_index] if prev_index >= 0 and prev_index < len(bench_open_arr) else None
-        if bench_now is None or bench_prev is None or bench_prev == 0:
-            bench_now = bench_close_arr[price_index] if price_index < len(bench_close_arr) else bench_now
-            bench_prev = bench_close_arr[prev_index] if prev_index >= 0 and prev_index < len(bench_close_arr) else bench_prev
-        if bench_now is None or bench_prev is None or bench_prev == 0:
-            bench_returns.append(base_returns[-1])
-        else:
-            bench_returns.append(float(bench_now / bench_prev - 1.0))
+    def _aligned_price(series: List[float], idx: int) -> Optional[float]:
+        if not isinstance(series, list) or not series:
+            return None
+        # Use idx+1 to align with return at position idx; fallback to last available
+        target = idx + 1
+        if target < len(series):
+            return series[target]
+        if len(series) >= 1:
+            return series[-1]
+        return None
 
-        levered_now = levered_open_arr[price_index] if price_index < len(levered_open_arr) else None
-        levered_prev = levered_open_arr[prev_index] if prev_index >= 0 and prev_index < len(levered_open_arr) else None
-        if levered_now is None or levered_prev is None or levered_prev == 0:
-            levered_now = levered_close_arr[price_index] if price_index < len(levered_close_arr) else levered_now
-            levered_prev = levered_close_arr[prev_index] if prev_index >= 0 and prev_index < len(levered_close_arr) else levered_prev
-        if levered_now is None or levered_prev is None or levered_prev == 0:
-            levered_returns.append(leveraged_return(base_returns[-1], leverage, 1.0))
-        else:
-            levered_returns.append(float(levered_now / levered_prev - 1.0))
-
-        price_base.append(base_now if base_now is not None else base_close_arr[price_index] if price_index < len(base_close_arr) else None)
-        price_levered.append(levered_now if levered_now is not None else levered_close_arr[price_index] if price_index < len(levered_close_arr) else None)
-
+    use_strategy = any(abs(x) > 1e-12 for x in rets_strategy[1:]) if len(rets_strategy) > 1 else False
+    # Build executed state with delay
     exec_state = [0] * len(state)
     for i in range(len(state)):
         j = i - delay_days
         exec_state[i] = state[j] if j >= 0 else 0
-
-    strat_returns: List[float] = []
-    equity_strategy: List[float] = []
-    equity_bench: List[float] = []
-    equity_levered: List[float] = []
-    s_val = 1.0
-    b_val = 1.0
-    l_val = 1.0
-
     for i in range(len(state)):
-        base_ret = base_returns[i] if i < len(base_returns) else 0.0
-        levered_ret = levered_returns[i] if i < len(levered_returns) else leveraged_return(base_ret, leverage, 1.0)
-        neutral_ret = levered_ret * neutral if neutral else 0.0
-
+        r_base = rets_base[i] if i < len(rets_base) else 0.0
+        r_strategy = rets_strategy[i] if i < len(rets_strategy) else r_base
+        if not use_strategy:
+            r_strategy = r_base
+        r_bench = rets_bench[i] if i < len(rets_bench) else r_base
         if exec_state[i] > 0:
-            step_ret = levered_ret
+            s *= 1.0 + risk_on_weight * r_strategy
         elif exec_state[i] < 0:
-            step_ret = 0.0
+            s *= 1.0  # cash
         else:
-            step_ret = neutral_ret
-
-        s_val *= 1.0 + step_ret
-        b_val *= 1.0 + (bench_returns[i] if i < len(bench_returns) else base_ret)
-        l_val *= 1.0 + levered_ret
-
-        strat_returns.append(step_ret)
-        equity_strategy.append(s_val)
-        equity_bench.append(b_val)
-        equity_levered.append(l_val)
-
-    normalized_levered = equity_levered[:]
-    baseline = next(
-        (
-            value
-            for value in normalized_levered
-            if isinstance(value, (int, float)) and math.isfinite(value) and value != 0
-        ),
-        None,
-    )
-    if isinstance(baseline, (int, float)) and baseline != 0:
-        normalized_levered = [
-            (value / baseline) if isinstance(value, (int, float)) and math.isfinite(value) else value
-            for value in normalized_levered
-        ]
-
+            s *= 1.0 + neutral_weight * r_strategy
+        b *= 1.0 + r_bench
+        a *= 1.0 + r_strategy
+        strat_eq.append(s)
+        bh_eq.append(b)
+        asset_eq.append(a)
+        aligned_prices_bench.append(_aligned_price(series_bench, i))
+        aligned_prices_strategy.append(_aligned_price(series_strategy, i))
     return {
         "dates": dates,
-        "equity_strategy": equity_strategy,
-        "equity_bh": equity_bench,
-        "equity_levered": normalized_levered,
-        "cum_strategy": equity_strategy[-1] if equity_strategy else 1.0,
-        "cum_bh": equity_bench[-1] if equity_bench else 1.0,
+        "equity_strategy": strat_eq,
+        "equity_bh": bh_eq,
+        "equity_asset": asset_eq,
+        "prices_benchmark": aligned_prices_bench,
+        "prices_strategy": aligned_prices_strategy,
+        "cum_strategy": strat_eq[-1] if strat_eq else 1.0,
+        "cum_bh": bh_eq[-1] if bh_eq else 1.0,
         "price_mode": mode,
-        "base_returns": base_returns,
-        "levered_returns": levered_returns,
-        "benchmark_returns": bench_returns,
-        "strategy_returns": strat_returns,
-        "executed_state": exec_state,
-        "price_base": price_base,
-        "price_levered": price_levered,
     }
 
 
@@ -1268,7 +1228,6 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         raise RuntimeError("FMP_API_KEY is not set. Please add it to .env")
     # 1) Daily history (adj close + adj open)
     hist_frames = fetch_daily_history_fmp(ALL_SYMBOLS, from_str, api_key)
-    levered_frames = fetch_daily_history_fmp([LEVERED_SYMBOL], from_str, api_key)
     close_map: Dict[str, pd.Series] = {}
     open_map: Dict[str, pd.Series] = {}
     idx_union: Optional[pd.Index] = None
@@ -1317,31 +1276,9 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         sym: aligned_open[sym].reindex(idx_inter).ffill().fillna(inter_series_close[sym])
         for sym in ALL_SYMBOLS
     }
-    levered_series: Dict[str, Dict[str, List[float]]] = {}
-    if levered_frames:
-        levered_df = levered_frames.get(LEVERED_SYMBOL)
-        if levered_df is not None and not levered_df.empty:
-            close_series = levered_df["adj_close"].astype(float)
-            open_series = levered_df.get("adj_open")
-            if open_series is not None:
-                open_series = open_series.astype(float)
-            else:
-                open_series = pd.Series(index=close_series.index, dtype=float)
-            open_series = open_series.fillna(close_series)
-            close_aligned = close_series.reindex(idx_union).ffill()
-            open_aligned = open_series.reindex(idx_union).ffill().fillna(close_aligned)
-            close_final = close_aligned.reindex(idx_inter).ffill()
-            open_final = open_aligned.reindex(idx_inter).ffill().fillna(close_final)
-            levered_series[LEVERED_SYMBOL] = {
-                "close": close_final.astype(float).tolist(),
-                "open": open_final.astype(float).tolist(),
-            }
     dates = [d.strftime("%Y-%m-%d") for d in inter_dates]
     prices = {s: inter_series_close[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_close}
     prices_open = {s: inter_series_open[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_open}
-    if levered_series:
-        prices.update({sym: series["close"] for sym, series in levered_series.items()})
-        prices_open.update({sym: series["open"] for sym, series in levered_series.items()})
     # Compute window metrics for SIGNAL set
     date_idx = inter_dates
     metrics = compute_window_metrics(prices, date_idx, window)
@@ -1354,14 +1291,13 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
     fusion = compute_fusion(classic, ffl, prices[BASE_SYMBOL], window, all_dates)
     # Backtests (provide both 1d and 2d delays)
     # JS parity: segment should start at (window-1) to yield R+1 prices for R records
+    start_idx = max(0, window - 1)
     base_close_full = prices.get(BASE_SYMBOL, [])
     base_open_full = prices_open.get(BASE_SYMBOL, [])
+    strategy_close_full = prices.get(STRATEGY_SYMBOL, []) if STRATEGY_SYMBOL in prices else None
+    strategy_open_full = prices_open.get(STRATEGY_SYMBOL, []) if STRATEGY_SYMBOL in prices_open else None
     bench_close_full = prices.get(BENCH_SYMBOL, []) if BENCH_SYMBOL in prices else None
     bench_open_full = prices_open.get(BENCH_SYMBOL, []) if BENCH_SYMBOL in prices_open else None
-    levered_close_full = levered_series.get(LEVERED_SYMBOL, {}).get("close", []) if levered_series else []
-    levered_open_full = levered_series.get(LEVERED_SYMBOL, {}).get("open", []) if levered_series else []
-
-    start_idx = max(0, window - 1)
 
     def _slice(series: Optional[List[float]]) -> List[float]:
         if not isinstance(series, list):
@@ -1374,108 +1310,124 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
 
     qqq_segment = _slice(base_close_full)
     qqq_open_segment = _slice(base_open_full)
+    strategy_segment = _slice(strategy_close_full) if strategy_close_full is not None else None
+    strategy_open_segment = _slice(strategy_open_full) if strategy_open_full is not None else None
     bench_segment = _slice(bench_close_full) if bench_close_full is not None else None
     bench_open_segment = _slice(bench_open_full) if bench_open_full is not None else None
-    levered_segment = _slice(levered_close_full) if levered_close_full else []
-    levered_open_segment = _slice(levered_open_full) if levered_open_full else []
+
+    def _build_synthetic(base: List[float], factor: float = 3.0) -> List[float]:
+        if not base:
+            return []
+        out = [float(base[0])]
+        level = float(base[0])
+        for i in range(1, len(base)):
+            prev = base[i - 1]
+            curr = base[i]
+            if isinstance(prev, (int, float)) and isinstance(curr, (int, float)) and prev:
+                ret = curr / prev - 1.0
+                level *= max(0.01, 1.0 + factor * ret)
+            out.append(level)
+        return out
+
+    def _blend_strategy(base: List[float], existing: Optional[List[float]], factor: float = 3.0) -> List[float]:
+        if not base:
+            return []
+        synthetic = _build_synthetic(base, factor=factor)
+        if not existing:
+            return synthetic
+        blended: List[float] = []
+        for i in range(len(base)):
+            if i < len(existing) and isinstance(existing[i], (int, float)):
+                blended.append(float(existing[i]))
+            else:
+                blended.append(synthetic[i])
+        return blended
+
+    strategy_segment = _blend_strategy(qqq_segment, strategy_segment, factor=3.0)
+    strategy_open_segment = _blend_strategy(qqq_open_segment, strategy_open_segment, factor=3.0)
     bt0_close = backtest_from_state(
-        dates,
+        qqq_segment,
         ffl["dates"],
         ffl["state"],
-        window=window,
         delay_days=0,
         price_mode="close",
-        base_close=base_close_full,
-        base_open=base_open_full,
-        benchmark_close=bench_close_full,
-        benchmark_open=bench_open_full,
-        levered_close=levered_close_full,
-        levered_open=levered_open_full,
-        leverage=3,
-        neutral_weight=NEUTRAL_BENCH_WEIGHT,
+        strategy_close=strategy_segment,
+        strategy_open=strategy_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt1_close = backtest_from_state(
-        dates,
+        qqq_segment,
         ffl["dates"],
         ffl["state"],
-        window=window,
         delay_days=1,
         price_mode="close",
-        base_close=base_close_full,
-        base_open=base_open_full,
-        benchmark_close=bench_close_full,
-        benchmark_open=bench_open_full,
-        levered_close=levered_close_full,
-        levered_open=levered_open_full,
-        leverage=3,
-        neutral_weight=NEUTRAL_BENCH_WEIGHT,
+        strategy_close=strategy_segment,
+        strategy_open=strategy_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt2_close = backtest_from_state(
-        dates,
+        qqq_segment,
         ffl["dates"],
         ffl["state"],
-        window=window,
         delay_days=2,
         price_mode="close",
-        base_close=base_close_full,
-        base_open=base_open_full,
-        benchmark_close=bench_close_full,
-        benchmark_open=bench_open_full,
-        levered_close=levered_close_full,
-        levered_open=levered_open_full,
-        leverage=3,
-        neutral_weight=NEUTRAL_BENCH_WEIGHT,
+        strategy_close=strategy_segment,
+        strategy_open=strategy_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt1_open = backtest_from_state(
-        dates,
+        qqq_segment,
         ffl["dates"],
         ffl["state"],
-        window=window,
         delay_days=1,
         price_mode="open",
-        base_close=base_close_full,
-        base_open=base_open_full,
-        benchmark_close=bench_close_full,
-        benchmark_open=bench_open_full,
-        levered_close=levered_close_full,
-        levered_open=levered_open_full,
-        leverage=3,
-        neutral_weight=NEUTRAL_BENCH_WEIGHT,
+        prices_open=qqq_open_segment,
+        strategy_close=strategy_segment,
+        strategy_open=strategy_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=bench_open_segment,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt2_open = backtest_from_state(
-        dates,
+        qqq_segment,
         ffl["dates"],
         ffl["state"],
-        window=window,
         delay_days=2,
         price_mode="open",
-        base_close=base_close_full,
-        base_open=base_open_full,
-        benchmark_close=bench_close_full,
-        benchmark_open=bench_open_full,
-        levered_close=levered_close_full,
-        levered_open=levered_open_full,
-        leverage=3,
-        neutral_weight=NEUTRAL_BENCH_WEIGHT,
+        prices_open=qqq_open_segment,
+        strategy_close=strategy_segment,
+        strategy_open=strategy_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=bench_open_segment,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     series_payload: Dict[str, List[float]] = {BASE_SYMBOL: qqq_segment}
-    if bench_segment is not None:
+    if STRATEGY_SYMBOL and strategy_segment:
+        series_payload[STRATEGY_SYMBOL] = strategy_segment
+    if BENCH_SYMBOL and bench_segment:
         series_payload[BENCH_SYMBOL] = bench_segment
-    if levered_segment:
-        series_payload[LEVERED_SYMBOL] = levered_segment
     series_open_payload: Dict[str, List[float]] = {BASE_SYMBOL: qqq_open_segment}
-    if bench_open_segment is not None:
+    if STRATEGY_SYMBOL and strategy_open_segment:
+        series_open_payload[STRATEGY_SYMBOL] = strategy_open_segment
+    if BENCH_SYMBOL and bench_open_segment:
         series_open_payload[BENCH_SYMBOL] = bench_open_segment
-    if levered_open_segment:
-        series_open_payload[LEVERED_SYMBOL] = levered_open_segment
     return {
         "window": window,
         "dates": ffl["dates"],
         "classic": {"score": classic[1], "state": classic[2]},
         "ffl_stab": ffl,
         "fusion": fusion,
-        "benchmark": {"symbol": BASE_SYMBOL, "leveredSymbol": LEVERED_SYMBOL},
-        "leveredSeries": levered_series,
         "series": series_payload,
         "series_open": series_open_payload,
         "stability": [float(r.get("stability", np.nan)) for r in metrics["records"]],
