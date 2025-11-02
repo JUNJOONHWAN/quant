@@ -1260,144 +1260,6 @@ function computeRegimeSegments(dates, state) {
   return areas;
 }
 
-function computeMaxDrawdown(equitySeries) {
-  if (!Array.isArray(equitySeries) || equitySeries.length === 0) {
-    return 0;
-  }
-  let peak = equitySeries[0] || 1;
-  let maxDrawdown = 0;
-  equitySeries.forEach((value) => {
-    const v = Number.isFinite(value) ? value : null;
-    if (!Number.isFinite(v)) {
-      return;
-    }
-    if (v > peak) {
-      peak = v;
-    }
-    const drawdown = peak !== 0 ? (v / peak) - 1 : 0;
-    if (drawdown < maxDrawdown) {
-      maxDrawdown = drawdown;
-    }
-  });
-  return maxDrawdown;
-}
-
-function computeAnnualizedReturn(equitySeries, sampleCount) {
-  if (!Array.isArray(equitySeries) || equitySeries.length === 0) {
-    return 0;
-  }
-  const finalEquity = equitySeries[equitySeries.length - 1];
-  if (!Number.isFinite(finalEquity) || finalEquity <= 0) {
-    return 0;
-  }
-  const years = Math.max(sampleCount / 252, 1e-9);
-  return Math.pow(finalEquity, 1 / years) - 1;
-}
-
-function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
-  const tradeConfig = SIGNAL.trade;
-  const baseSymbol = tradeConfig.baseSymbol;
-  const windowOffset = Math.max(1, Number(state.window) - 1);
-  const firstDate = filteredRecords?.[0]?.date;
-  let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
-  if (baseIdx < 0) baseIdx = 0;
-
-  const dates = Array.isArray(riskSeries?.dates) ? riskSeries.dates : [];
-  if (dates.length === 0) {
-    return null;
-  }
-
-  const prices = state.priceSeries[baseSymbol] || [];
-  const opens = state.priceSeriesOpen?.[baseSymbol] || [];
-
-  const baseReturns = [];
-  for (let idx = 0; idx < dates.length; idx += 1) {
-    const priceIndex = windowOffset + baseIdx + idx;
-    const prevIndex = priceIndex - 1;
-    let openReturn = 0;
-    if (
-      opens[priceIndex] != null
-      && opens[prevIndex] != null
-      && opens[prevIndex] !== 0
-    ) {
-      openReturn = opens[priceIndex] / opens[prevIndex] - 1;
-    } else if (
-      prices[priceIndex] != null
-      && prices[prevIndex] != null
-      && prices[prevIndex] !== 0
-    ) {
-      openReturn = prices[priceIndex] / prices[prevIndex] - 1;
-    }
-    baseReturns.push(openReturn);
-  }
-
-  const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
-    ? riskSeries.executedState
-    : riskSeries.state.map((value, idx) => (idx === 0 ? 0 : riskSeries.state[idx - 1] || 0));
-
-  const stratReturns = executedState.map((regime, idx) => {
-    if (regime > 0) {
-      return leveragedReturn(baseReturns[idx], tradeConfig.leverage);
-    }
-    if (regime < 0) {
-      return 0;
-    }
-    return baseReturns[idx];
-  });
-
-  const equityStrategy = [];
-  const equityBenchmark = [];
-  let eqStrat = 1;
-  let eqBench = 1;
-  for (let i = 0; i < stratReturns.length; i += 1) {
-    const stratRet = Number.isFinite(stratReturns[i]) ? stratReturns[i] : 0;
-    const benchRet = Number.isFinite(baseReturns[i]) ? baseReturns[i] : 0;
-    eqStrat *= 1 + stratRet;
-    eqBench *= 1 + benchRet;
-    equityStrategy.push(Number(eqStrat.toFixed(6)));
-    equityBenchmark.push(Number(eqBench.toFixed(6)));
-  }
-
-  const ret = baseReturns;
-  const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
-  const state1 = riskSeries.state.slice(0, riskSeries.state.length - 1);
-  const hit1 = computeHitRate(state1, fwd1);
-
-  const horizon = 5;
-  const fwd5 = [];
-  for (let i = 0; i < ret.length; i += 1) {
-    let prod = 1;
-    for (let k = 1; k <= horizon && i + k < ret.length; k += 1) {
-      prod *= 1 + ret[i + k];
-    }
-    fwd5.push(prod - 1);
-  }
-  const state5 = riskSeries.state.slice(0, riskSeries.state.length - 1);
-  const hit5 = computeHitRate(state5, fwd5.slice(0, state5.length));
-
-  const maxDrawdownStrategy = computeMaxDrawdown(equityStrategy);
-  const maxDrawdownBenchmark = computeMaxDrawdown(equityBenchmark);
-  const cagrStrategy = computeAnnualizedReturn(equityStrategy, dates.length);
-  const cagrBenchmark = computeAnnualizedReturn(equityBenchmark, dates.length);
-
-  return {
-    dates,
-    executedState,
-    baseReturns,
-    stratReturns,
-    equityStrategy,
-    equityBenchmark,
-    hit1,
-    hit5,
-    maxDrawdownStrategy,
-    maxDrawdownBenchmark,
-    cagrStrategy,
-    cagrBenchmark,
-    cumulativeStrategy: equityStrategy.length > 0 ? equityStrategy[equityStrategy.length - 1] - 1 : 0,
-    cumulativeBenchmark: equityBenchmark.length > 0 ? equityBenchmark[equityBenchmark.length - 1] - 1 : 0,
-  };
-}
-
 function renderBacktest() {
   const metrics = state.metrics[state.window];
   const el = document.getElementById('backtest-chart');
@@ -1422,39 +1284,106 @@ function renderBacktest() {
         : computeRiskSeriesClassic(metrics, filtered));
   if (!series) return;
 
-  const backtest = evaluateBacktestSeries(series, metrics, filtered);
-  if (!backtest) return;
+  const symbol = baseSymbol;
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  // Align filtered to global records to compute price index correctly
+  const firstDate = filtered?.[0]?.date;
+  let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
+  if (baseIdx < 0) baseIdx = 0;
+  const dates = series.dates;
+  const prices = state.priceSeries[symbol] || [];
+  const opens = state.priceSeriesOpen?.[symbol] || [];
+  const baseReturns = [];
+  for (let idx = 0; idx < dates.length; idx += 1) {
+    const priceIndex = windowOffset + baseIdx + idx;
+    const prevIndex = priceIndex - 1;
+    let openReturn = 0;
+    if (opens[priceIndex] != null && opens[prevIndex] != null && opens[prevIndex] !== 0) {
+      openReturn = opens[priceIndex] / opens[prevIndex] - 1;
+    } else if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
+      openReturn = prices[priceIndex] / prices[prevIndex] - 1;
+    }
+    baseReturns.push(openReturn);
+  }
+
+  const executedState = Array.isArray(series.executedState) && series.executedState.length === series.state.length
+    ? series.executedState
+    : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
+  const stratReturns = executedState.map((regime, idx) => {
+    if (regime > 0) {
+      return leveragedReturn(baseReturns[idx], tradeConfig.leverage);
+    }
+    if (regime < 0) {
+      return 0;
+    }
+    return baseReturns[idx];
+  });
+
+  function rollingReturnFromSeriesUI(priceSeries, symbol, index, lookback) {
+    const series = priceSeries?.[symbol];
+    if (!Array.isArray(series) || lookback <= 0 || index - lookback < 0) return null;
+    const end = series[index]; const start = series[index - lookback];
+    if (!Number.isFinite(end) || !Number.isFinite(start) || start === 0) return null;
+    return end / start - 1;
+  }
+
+  // Equity curves
+  const eqStrat = [];
+  const eqBH = [];
+  let s = 1;
+  let b = 1;
+  for (let i = 0; i < stratReturns.length; i += 1) {
+    s *= 1 + (stratReturns[i] || 0);
+    b *= 1 + (baseReturns[i] || 0);
+    eqStrat.push(Number(s.toFixed(6)));
+    eqBH.push(Number(b.toFixed(6)));
+  }
+
+  // Hit rates (1d and 5d)
+  const ret = baseReturns;
+  const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
+  const state1 = series.state.slice(0, series.state.length - 1);
+  const hr1 = computeHitRate(state1, fwd1);
+  const horizon = 5;
+  const fwd5 = [];
+  for (let i = 0; i < ret.length; i += 1) {
+    let prod = 1;
+    for (let k = 1; k <= horizon && i + k < ret.length; k += 1) prod *= 1 + ret[i + k];
+    fwd5.push(prod - 1);
+  }
+  const state5 = series.state.slice(0, series.state.length - 1);
+  const hr5 = computeHitRate(state5, fwd5.slice(0, state5.length));
 
   const chart = charts.backtest || echarts.init(el);
   charts.backtest = chart;
   chart.setOption({
     legend: { data: ['전략', '벤치마크'] },
     tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: backtest.dates, axisLabel: { color: TEXT_AXIS } },
+    xAxis: { type: 'category', data: dates, axisLabel: { color: TEXT_AXIS } },
     yAxis: { type: 'value', scale: true, axisLabel: { color: TEXT_AXIS } },
     series: [
       {
         name: '전략',
         type: 'line',
-        data: backtest.equityStrategy,
+        data: eqStrat,
         smooth: true,
         markArea: {
           silent: true,
           itemStyle: { opacity: 1 },
-          data: computeRegimeSegments(backtest.dates, series.state).map((a) => [
+          data: computeRegimeSegments(dates, series.state).map((a) => [
             { xAxis: a.xAxis },
             { xAxis: a.xAxis2, itemStyle: a.itemStyle, name: a.name },
           ]),
         },
       },
-      { name: '벤치마크', type: 'line', data: backtest.equityBenchmark, smooth: true },
+      { name: '벤치마크', type: 'line', data: eqBH, smooth: true },
     ],
   });
 
   if (stats) {
     const onLabel = tradeConfig.leveredSymbol || `${tradeConfig.leverage}x ${tradeConfig.baseSymbol}`;
     const configNote = `포지션: On=${onLabel} · Neutral=${tradeConfig.baseSymbol} · Off=현금 (1일 지연)`;
-    const out = `히트율(1일): ${(backtest.hit1 * 100).toFixed(1)}% · 히트율(5일): ${(backtest.hit5 * 100).toFixed(1)}% · 전략 누적 ${pct(backtest.cumulativeStrategy)} · 벤치마크 누적 ${pct(backtest.cumulativeBenchmark)} · ${configNote}`;
+    const out = `히트율(1일): ${(hr1 * 100).toFixed(1)}% · 히트율(5일): ${(hr5 * 100).toFixed(1)}% · 전략 누적 ${(pct(eqStrat[eqStrat.length - 1] - 1))} · 벤치마크 누적 ${pct(eqBH[eqBH.length - 1] - 1)} · ${configNote}`;
     stats.textContent = out;
   }
 }
@@ -2940,7 +2869,6 @@ function buildTextReportPayload() {
     : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
       ? computeRiskSeriesFFL(metrics, records)
       : computeRiskSeriesClassic(metrics, records);
-  const backtestSummary = riskSeries ? evaluateBacktestSeries(riskSeries, metrics, records) : null;
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',
@@ -2960,7 +2888,6 @@ function buildTextReportPayload() {
     buildSubIndexSection(records),
     buildRiskScoreSection(riskSeries),
     buildRegimeTimelineSection(riskSeries),
-    buildBacktestSummarySection(backtestSummary, riskSeries),
     buildPriceSection(records),
     buildHeatmapSection(metrics),
     buildPairSection(),
@@ -3198,33 +3125,8 @@ function buildRegimeTimelineSection(riskSeries) {
   return lines;
 }
 
-function buildBacktestSummarySection(backtest, riskSeries) {
-  const lines = ['[5. 백테스트 요약]'];
-  if (!backtest || !Array.isArray(backtest.dates) || backtest.dates.length === 0) {
-    lines.push('- 백테스트 데이터를 계산하지 못했습니다.');
-    return lines;
-  }
-
-  const sampleCount = backtest.dates.length;
-  lines.push(`- 분석 기간: ${backtest.dates[0]} ~ ${backtest.dates[backtest.dates.length - 1]} (${sampleCount}일)`);
-  lines.push(`- 전략 누적 수익률: ${pct(backtest.cumulativeStrategy)} | 벤치마크 누적: ${pct(backtest.cumulativeBenchmark)}`);
-  lines.push(`- 연복리 수익률(CAGR): 전략 ${pct(backtest.cagrStrategy)} | 벤치마크 ${pct(backtest.cagrBenchmark)}`);
-  lines.push(`- 최대 낙폭(MDD): 전략 ${pct(backtest.maxDrawdownStrategy)} | 벤치마크 ${pct(backtest.maxDrawdownBenchmark)}`);
-  lines.push(`- 히트율: 1일 ${(backtest.hit1 * 100).toFixed(1)}% · 5일 ${(backtest.hit5 * 100).toFixed(1)}%`);
-
-  if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
-    const total = riskSeries.state.length;
-    const onCount = riskSeries.state.filter((value) => value > 0).length;
-    const offCount = riskSeries.state.filter((value) => value < 0).length;
-    const neutralCount = total - onCount - offCount;
-    lines.push(`- 레짐 비중(신호 기준): On ${pct(onCount / total)} · Off ${pct(offCount / total)} · Neutral ${pct(neutralCount / total)}`);
-  }
-
-  return lines;
-}
-
 function buildPriceSection(records) {
-  const lines = ['[6. 지수 추이 (자산 가격)]'];
+  const lines = ['[5. 지수 추이 (자산 가격)]'];
   if (!Array.isArray(records) || records.length === 0) {
     lines.push('- 데이터가 없습니다.');
     return lines;
@@ -3254,7 +3156,7 @@ function buildPriceSection(records) {
 }
 
 function buildHeatmapSection(metrics) {
-  const lines = ['[7. 히트맵 매트릭스]'];
+  const lines = ['[6. 히트맵 매트릭스]'];
   if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) {
     lines.push('- 상관행렬 데이터를 찾지 못했습니다.');
     return lines;
@@ -3282,7 +3184,7 @@ function buildHeatmapSection(metrics) {
 }
 
 function buildPairSection() {
-  const lines = ['[8. 기준자산 상관도]'];
+  const lines = ['[7. 기준자산 상관도]'];
   const pair = state.pair || DEFAULT_PAIR;
   const [assetA, assetB] = pair.split('|');
   lines.push(`- 선택한 페어: ${assetA} / ${assetB}`);
