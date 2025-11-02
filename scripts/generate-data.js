@@ -6,6 +6,14 @@
 const fs = require('fs/promises');
 const path = require('path');
 
+function flagEnabled(value) {
+  if (value == null) {
+    return false;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
 const {
   alignSeries,
   computeReturns,
@@ -17,6 +25,7 @@ const {
 } = require('../static_site/assets/metrics');
 
 const API_KEY = process.env.ALPHAVANTAGE_API_KEY;
+const USE_FMP_HISTORY_ONLY = flagEnabled(process.env.USE_FMP_HISTORY_ONLY || process.env.GENERATE_USE_FMP_ONLY);
 const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
 const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
 const HISTORICAL_PATH = path.join(DATA_DIR, 'historical_prices.json');
@@ -46,38 +55,47 @@ async function main() {
     return;
   }
 
-  if (!API_KEY) {
-    console.warn('[generate-data] no API key -> emit no_data placeholder');
-    await emitNoDataPlaceholder();
-    return;
-  }
+  const hasApiKey = Boolean(API_KEY);
+  const historical = await readHistoricalSeries();
+  const cutoffDate = computeCutoffDate(RANGE_YEARS);
+  const useHistoryOnly = USE_FMP_HISTORY_ONLY || !hasApiKey;
 
   try {
-    const historical = await readHistoricalSeries();
-    const assetSeries = [];
-    const cutoffDate = computeCutoffDate(RANGE_YEARS);
-
-    for (let index = 0; index < ASSETS.length; index += 1) {
-      const asset = ASSETS[index];
-      console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
-      const series = await fetchAlphaSeries(asset, cutoffDate);
-      assetSeries.push(series);
-      console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
-
-      if (index < ASSETS.length - 1) {
-        console.log('Waiting to respect Alpha Vantage rate limits...');
-        await delay(REQUEST_DELAY_MS);
+    let mergedSeries;
+    if (useHistoryOnly) {
+      if (!historical || !(historical.map instanceof Map) || historical.map.size === 0) {
+        throw new Error('Historical dataset is unavailable; cannot build precomputed payload without Alpha Vantage data.');
       }
+      if (!hasApiKey) {
+        console.warn('[generate-data] ALPHAVANTAGE_API_KEY missing; using historical/FMP dataset only.');
+      } else if (USE_FMP_HISTORY_ONLY) {
+        console.log('[generate-data] USE_FMP_HISTORY_ONLY enabled; skipping Alpha Vantage fetch.');
+      }
+      mergedSeries = buildSeriesFromHistory(historical, cutoffDate);
+    } else {
+      const assetSeries = [];
+      for (let index = 0; index < ASSETS.length; index += 1) {
+        const asset = ASSETS[index];
+        console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
+        const series = await fetchAlphaSeries(asset, cutoffDate);
+        assetSeries.push(series);
+        console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
+
+        if (index < ASSETS.length - 1) {
+          console.log('Waiting to respect Alpha Vantage rate limits...');
+          await delay(REQUEST_DELAY_MS);
+        }
+      }
+      mergedSeries = mergeSeriesWithHistory(assetSeries, historical, REMOTE_CUTOFF_DATE);
     }
 
-    const mergedSeries = mergeSeriesWithHistory(assetSeries, historical, REMOTE_CUTOFF_DATE);
     const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
     const output = buildOutput(aligned, returns);
     await writeOutput(output);
   } catch (error) {
     console.error(error);
-    await emitNoDataWithReason('Failed to generate dataset from Alpha Vantage. emitting no_data placeholder.', error);
+    await emitNoDataWithReason('Failed to generate dataset from available sources. emitting no_data placeholder.', error);
   }
 }
 
@@ -450,6 +468,29 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
     });
   });
 
+  return merged;
+}
+
+function buildSeriesFromHistory(historical, cutoffDate) {
+  const merged = [];
+  const cutoff = cutoffDate || REMOTE_CUTOFF_DATE;
+  ASSETS.forEach((asset) => {
+    const cached = historical.map.get(asset.symbol);
+    if (!cached) {
+      throw new Error(`Historical dataset missing ${asset.symbol}; cannot build payload.`);
+    }
+    const trimmed = trimSeries(cached, (date) => !cutoff || date >= cutoff);
+    if (trimmed.dates.length < 2) {
+      throw new Error(`${asset.symbol}: insufficient historical samples after cutoff ${cutoff}.`);
+    }
+    merged.push({
+      symbol: asset.symbol,
+      label: asset.label,
+      category: asset.category,
+      dates: trimmed.dates,
+      prices: trimmed.prices,
+    });
+  });
   return merged;
 }
 

@@ -186,7 +186,49 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
   const length = alignedRecords ? alignedRecords.length : allRecords.length - baseIdx; if (length <= 0) return null;
   const slice = allRecords.slice(baseIdx, baseIdx + length); const dates = slice.map((r) => r.date);
   const pairSeries = metrics.pairs?.[SIGNAL.pairKey] || null; const scCorr = pairSeries?.correlation?.slice(baseIdx, baseIdx + length) || new Array(length).fill(null);
-  const safeNeg = slice.map((r) => Number(r.sub?.safeNegative)); const windowOffset = Math.max(1, Number(state.window) - 1); const prices = state.priceSeries || {};
+  const safeNeg = slice.map((r) => Number(r.sub?.safeNegative));
+  const windowOffset = Math.max(1, Number(state.window) - 1);
+  const prices = state.priceSeries || {};
+
+  // --- BearGuard: downside-asymmetry damper (minimal) ---
+  const riskSet = ['QQQ', 'IWM', 'BTC-USD'].filter((symbol) => Array.isArray(prices[symbol]) && prices[symbol].length > 0);
+  const span60Alpha = 2 / (60 + 1);
+  const EPS = 1e-12;
+  const maxLen = riskSet.reduce((acc, symbol) => Math.max(acc, prices[symbol]?.length || 0), 0);
+  const RStar = new Array(maxLen).fill(null);
+  riskSet.forEach((symbol) => {
+    const series = prices[symbol] || [];
+    if (!Array.isArray(series) || series.length === 0) return;
+    let posEwma = null;
+    let negEwma = null;
+    for (let idx = 1; idx < series.length; idx += 1) {
+      const prev = Number(series[idx - 1]);
+      const curr = Number(series[idx]);
+      if (!Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0 || curr <= 0) continue;
+      const ret = Math.log(curr) - Math.log(prev);
+      if (!Number.isFinite(ret)) continue;
+      const posSq = ret > 0 ? ret * ret : 0;
+      const negSq = ret < 0 ? ret * ret : 0;
+      posEwma = posEwma == null ? posSq : (span60Alpha * posSq) + ((1 - span60Alpha) * posEwma);
+      negEwma = negEwma == null ? negSq : (span60Alpha * negSq) + ((1 - span60Alpha) * negEwma);
+      const denom = (posEwma ?? 0) + EPS;
+      const ratioRaw = denom > 0 ? (negEwma ?? 0) / denom : 0;
+      if (!Number.isFinite(ratioRaw)) continue;
+      const ratio = Math.max(0, Math.min(5, ratioRaw));
+      const existing = RStar[idx];
+      RStar[idx] = Number.isFinite(existing) ? Math.max(existing, ratio) : ratio;
+    }
+  });
+  for (let idx = 0; idx < RStar.length; idx += 1) {
+    if (!Number.isFinite(RStar[idx])) RStar[idx] = 1;
+  }
+  function bearDamp(idx, RThr = 1.2, beta = 0.5, gmin = 0.5) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= RStar.length) return 1;
+    const r = Number.isFinite(RStar[idx]) ? RStar[idx] : 1;
+    const x = Math.max(0, r - RThr);
+    return Math.max(gmin, 1 / (1 + beta * x));
+  }
+  // --- end BearGuard ---
 
   const mm = new Array(length).fill(null); const guard = new Array(length).fill(null); const score = new Array(length).fill(null);
   const jFlux = new Array(length).fill(null); const jRiskBeta = new Array(length).fill(null); const fullFlux = new Array(length).fill(null); const fullFluxZ = new Array(length).fill(null);
@@ -237,7 +279,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
       }
     }
     const Jbar = weightSum > 0 ? fluxSum / weightSum : 0; const Jnorm = Math.tanh(Jbar / RISK_CFG_FFL.lambda);
-    jFlux[i] = Number.isFinite(Jnorm) ? Jnorm : null; fluxRaw[i] = weightSum > 0 ? Jbar : null; fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
+    jFlux[i] = Number.isFinite(Jnorm) ? Jnorm * bearDamp(priceIndex) : null; fluxRaw[i] = weightSum > 0 ? Jbar : null; fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
     if (i > 0 && Number.isFinite(jFlux[i]) && Number.isFinite(jFlux[i - 1])) fluxSlope[i] = jFlux[i] - jFlux[i - 1]; else fluxSlope[i] = null;
 
     const fraw = frobeniusDiff(matrix, prevMatrix); prevMatrix = matrix; fullFlux[i] = Number.isFinite(fraw) ? fraw : null;

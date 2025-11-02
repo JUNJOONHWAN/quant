@@ -202,6 +202,47 @@ function computeRiskSeriesFFL(metrics, recordsOverride, prices) {
   const safeNeg = slice.map((r) => Number(r.sub?.safeNegative) || 0);
 
   const windowOffset = Math.max(1, WINDOW - 1);
+  const priceSeries = prices || {};
+
+  // --- BearGuard: downside-asymmetry damper (minimal) ---
+  const riskSet = ['QQQ', 'IWM', 'BTC-USD'].filter((symbol) => Array.isArray(priceSeries[symbol]) && priceSeries[symbol].length > 0);
+  const span60Alpha = 2 / (60 + 1);
+  const EPS = 1e-12;
+  const maxLen = riskSet.reduce((acc, symbol) => Math.max(acc, priceSeries[symbol]?.length || 0), 0);
+  const RStar = new Array(maxLen).fill(null);
+  riskSet.forEach((symbol) => {
+    const series = priceSeries[symbol] || [];
+    if (!Array.isArray(series) || series.length === 0) return;
+    let posEwma = null;
+    let negEwma = null;
+    for (let idx = 1; idx < series.length; idx += 1) {
+      const prev = Number(series[idx - 1]);
+      const curr = Number(series[idx]);
+      if (!Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0 || curr <= 0) continue;
+      const ret = Math.log(curr) - Math.log(prev);
+      if (!Number.isFinite(ret)) continue;
+      const posSq = ret > 0 ? ret * ret : 0;
+      const negSq = ret < 0 ? ret * ret : 0;
+      posEwma = posEwma == null ? posSq : (span60Alpha * posSq) + ((1 - span60Alpha) * posEwma);
+      negEwma = negEwma == null ? negSq : (span60Alpha * negSq) + ((1 - span60Alpha) * negEwma);
+      const denom = (posEwma ?? 0) + EPS;
+      const ratioRaw = denom > 0 ? (negEwma ?? 0) / denom : 0;
+      if (!Number.isFinite(ratioRaw)) continue;
+      const ratio = Math.max(0, Math.min(5, ratioRaw));
+      const existing = RStar[idx];
+      RStar[idx] = Number.isFinite(existing) ? Math.max(existing, ratio) : ratio;
+    }
+  });
+  for (let idx = 0; idx < RStar.length; idx += 1) {
+    if (!Number.isFinite(RStar[idx])) RStar[idx] = 1;
+  }
+  function bearDamp(idx, RThr = 1.2, beta = 0.5, gmin = 0.5) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= RStar.length) return 1;
+    const r = Number.isFinite(RStar[idx]) ? RStar[idx] : 1;
+    const x = Math.max(0, r - RThr);
+    return Math.max(gmin, 1 / (1 + beta * x));
+  }
+  // --- end BearGuard ---
   const mm = new Array(length).fill(null); const guard = new Array(length).fill(null); const score = new Array(length).fill(null);
   const jFlux = new Array(length).fill(null); const fullFlux = new Array(length).fill(null); const fullFluxZ = new Array(length).fill(null); const mmTrend = new Array(length).fill(null); const fluxSlope = new Array(length).fill(null);
   const diffusionScore = new Array(length).fill(null); const comboMomentum = new Array(length).fill(null); const breadth = new Array(length).fill(null); const vPC1 = new Array(length).fill(null); const kappa = new Array(length).fill(null);
@@ -212,7 +253,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride, prices) {
     const record = allRecords[baseIdx + i]; const matrix = record?.matrix;
     if (Array.isArray(matrix) && matrix.length > 0) { const lambda1 = MM.topEigenvalue(matrix) || 0; mm[i] = lambda1 / (matrix.length || 1); }
     if (i > 0 && Number.isFinite(mm[i]) && Number.isFinite(mm[i - 1])) mmTrend[i] = mm[i] - mm[i - 1]; else mmTrend[i] = null;
-    const priceIndex = baseIdx + i + windowOffset; const zr = {}; labels.forEach((symbol) => { zr[symbol] = zMomentumFromSeries(prices[symbol], priceIndex, RISK_CFG_FFL.lookbacks.momentum, RISK_CFG_FFL.lookbacks.vol, RISK_CFG_FFL.zSat); });
+    const priceIndex = baseIdx + i + windowOffset; const zr = {}; labels.forEach((symbol) => { zr[symbol] = zMomentumFromSeries(priceSeries[symbol], priceIndex, RISK_CFG_FFL.lookbacks.momentum, RISK_CFG_FFL.lookbacks.vol, RISK_CFG_FFL.zSat); });
     let weightSum = 0; let fluxSum = 0; let absSum = 0; let apdfWeighted = 0; let pconWeighted = 0; let weightsAll = 0;
     const CLUSTERS = { risk: ['IWM', 'SPY', 'BTC-USD'], safe: ['TLT', 'GLD'] };
     CLUSTERS.safe.forEach((safeSymbol) => {
@@ -227,7 +268,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride, prices) {
       });
     });
     const Jbar = weightSum > 0 ? fluxSum / weightSum : 0; const Jnorm = Math.tanh(Jbar / RISK_CFG_FFL.lambda);
-    jFlux[i] = Number.isFinite(Jnorm) ? Jnorm : null; fluxRaw[i] = weightSum > 0 ? Jbar : null; fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
+    jFlux[i] = Number.isFinite(Jnorm) ? Jnorm * bearDamp(priceIndex) : null; fluxRaw[i] = weightSum > 0 ? Jbar : null; fluxIntensity[i] = weightSum > 0 ? absSum / weightSum : null;
     if (i > 0 && Number.isFinite(jFlux[i]) && Number.isFinite(jFlux[i - 1])) fluxSlope[i] = jFlux[i] - jFlux[i - 1]; else fluxSlope[i] = null;
     const fraw = frobeniusDiff(matrix, prevMatrix); prevMatrix = matrix; fullFlux[i] = Number.isFinite(fraw) ? fraw : null; const z = rollingZScore(fullFlux, i, Math.min(63, Math.max(15, Math.floor(length / 4)))); fullFluxZ[i] = Number.isFinite(z) ? z : null;
     const apdfRaw = weightsAll > 0 ? apdfWeighted / weightsAll : 0; apdf[i] = Number.isFinite(apdfRaw) ? Math.tanh(apdfRaw / (RISK_CFG_FFL.lambda || 0.25)) : null; pcon[i] = weightsAll > 0 ? Math.max(0, Math.min(1, pconWeighted / weightsAll)) : null;
@@ -334,4 +375,3 @@ async function main() {
 }
 
 if (require.main === module) { main().catch((err) => { console.error(err); process.exit(1); }); }
-
