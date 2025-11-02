@@ -2937,9 +2937,11 @@ function buildTextReportPayload() {
   const rangeText = rangeLabel || `${state.range}일`;
   const riskSeries = state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, records)
-      : computeRiskSeriesClassic(metrics, records);
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, records)
+      : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, records)
+        : computeRiskSeriesClassic(metrics, records);
   const backtestSummary = riskSeries ? evaluateBacktestSeries(riskSeries, metrics, records) : null;
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
