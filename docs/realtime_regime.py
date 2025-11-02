@@ -36,26 +36,76 @@ for sym in ["IWM", "SPY", "TLT", "GLD", "BTC-USD"]:
         _all_symbols_seed.append(sym)
 ALL_SYMBOLS = _all_symbols_seed
 SIGNAL_SYMBOLS = ["IWM", "SPY", "TLT", "GLD", "BTC-USD"]
+CLUSTERS = {
+    "risk": ["IWM", "SPY", "BTC-USD"],
+    "safe": ["TLT", "GLD"],
+}
+SIGNAL_PAIR_KEY = "IWM|BTC-USD"
 
 # Window options
 WINDOWS = [20, 30, 60]
 
+# Historical coverage settings (ensure enough lead-in for rolling windows and parity with JS)
+MIN_HISTORY_YEARS = 6  # At least ~2019 baseline
+MIN_HISTORY_START = pd.Timestamp("2019-01-01")
+MIN_HISTORY_LEAD_DAYS = 365  # extra buffer so indicators have lookback runway
+
 # FFL baseline knobs (subset, aligned with JS defaults where practical)
 RISK_CFG_FFL = {
-    "lookbacks": {"momentum": 10, "vol": 20},
+    "lookbacks": {"momentum": 10, "vol": 20, "breadth": 5},
     "p": 1.5,
     "zSat": 2.0,
     "lambda": 0.25,
     "thresholds": {
-        "scoreOn": 0.60,
-        "scoreOff": 0.40,
         "jOn": +0.10,
         "jOff": -0.08,
+        "scoreOn": 0.60,
+        "scoreOff": 0.40,
         "breadthOn": 0.50,
         "mmFragile": 0.88,
         "mmOff": 0.96,
+        "pconOn": 0.55,
+        "pconOff": 0.40,
+        "mmHi": 0.90,
+        "downAll": 0.60,
+        "corrConeDays": 5,
+        "driftMinDays": 3,
+        "driftCool": 2,
+        "offMinDays": 2,
         "vOn": +0.05,
         "vOff": -0.05,
+        "kOn": 0.60,
+    },
+    "kLambda": 1.0,
+    "exp": {
+        "lam": 0.75,
+        "rOn": 0.76,
+        "rOff": -0.05,
+        "breadth1dMin": 0.45,
+        "d0AnyPos": True,
+        "d0BothPosHiCorr": False,
+        "ti": {"win": 52, "onK": 0.81, "offK": 0.37, "hiCorrScale": 1.25, "strongK": 1.5},
+        "lev": {"r0": 0.30, "r1": 1.05, "min": 1.0, "max": 3.0, "damp": 3.0},
+    },
+    "expTune": {
+        "macroOn": 0.514,
+        "macroOff": 0.371,
+        "qOn": 0.715,
+        "qOff": 0.244,
+        "aS": 0.187,
+        "aJ": 0.095,
+        "bS": 0.106,
+        "bJ": 0.058,
+        "gSPos": 0.052,
+        "gSNeg": 0.065,
+        "confirmOn": 2,
+        "confirmOff": 1,
+        "hazardHigh": 0.513,
+        "hazardDrop": 0.033,
+        "hazardLookback": 5,
+        "wC": 0.5,
+        "wF": 0.3,
+        "wS": 0.2,
     },
     "stabTune": {
         "fast": 21,
@@ -66,6 +116,18 @@ RISK_CFG_FFL = {
         "slopeMin": 0.0200,
         "neutralLo": 0.30,
         "neutralHi": 0.40,
+        "lagUp": 3,
+        "lagDown": 4,
+        "onFluxEase": 0.02,
+        "confirmOnMin": 2,
+        "leadOnWindow": 6,
+        "downGrace": 6,
+        "hazardWindow": 9,
+        "offFluxTighten": 0.03,
+        "confirmOffMin": 1,
+        "onOverrideMargin": 0.01,
+        "upOffHarden": 0.02,
+        "upConfirmOffMin": 2,
     },
 }
 
@@ -98,6 +160,66 @@ def ema(seq: List[float], n: int) -> List[float]:
     return out
 
 
+def clamp01(value: Optional[float], default: float = 0.0) -> float:
+    if value is None or not np.isfinite(value):
+        return default
+    return float(min(1.0, max(0.0, value)))
+
+
+def normalize_range(value: Optional[float], lo: float, hi: float) -> float:
+    if value is None or not np.isfinite(value):
+        return 0.0
+    if hi <= lo:
+        return 0.0
+    return float(min(1.0, max(0.0, (value - lo) / (hi - lo))))
+
+
+def sigmoid(value: Optional[float], k: float = 0.85) -> float:
+    if value is None or not np.isfinite(value):
+        return 1.0
+    return float(1.0 / (1.0 + math.exp(-k * value)))
+
+
+def safe_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        num = float(value)
+        return num if np.isfinite(num) else default
+    except Exception:
+        return default
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    arr = sorted(values)
+    n = len(arr)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(arr[mid])
+    return float(0.5 * (arr[mid - 1] + arr[mid]))
+
+
+def rolling_sigma_mad(series: List[Optional[float]], end: int, window: int) -> Optional[float]:
+    if window <= 0 or end < 0:
+        return None
+    xs: List[float] = []
+    start = max(0, end - window + 1)
+    for idx in range(start, end + 1):
+        val = series[idx]
+        if val is not None and np.isfinite(val):
+            xs.append(float(val))
+    if len(xs) < 5:
+        return None
+    med = _median(xs)
+    if med is None:
+        return None
+    deviations = [abs(x - med) for x in xs]
+    mad = _median(deviations)
+    if mad is None or mad <= 0:
+        return None
+    return float(1.4826 * mad)
+
+
 def to_returns(prices: List[float]) -> List[float]:
     arr: List[float] = []
     for i in range(1, len(prices)):
@@ -107,6 +229,16 @@ def to_returns(prices: List[float]) -> List[float]:
         else:
             arr.append(0.0)
     return arr
+
+
+def top_eigenvalue(mat: np.ndarray) -> float:
+    try:
+        vals = np.linalg.eigvalsh(mat)
+        if vals.size == 0:
+            return 0.0
+        return float(np.max(vals))
+    except Exception:
+        return 0.0
 
 
 def rolling_corr_matrix(ret_mat: np.ndarray) -> np.ndarray:
@@ -284,7 +416,10 @@ def fetch_daily_history_fmp(symbols: List[str], from_date: str, api_key: str) ->
         if not rows:
             continue
         df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"])
+        # Normalize to tz-naive UTC date to avoid tz-aware/naive comparisons downstream
+        dt = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        dt = dt.dt.tz_convert(None).dt.normalize()
+        df["date"] = dt
         df = df.set_index("date").sort_index()
         out[sym] = df
     return out
@@ -358,7 +493,16 @@ def _align_by_intersection(series_map: Dict[str, pd.Series], keys: List[str]) ->
         if s is None or s.empty:
             continue
         # normalize index to naive midnight
-        idx = pd.to_datetime(s.index).tz_localize(None).normalize()
+        idx = pd.to_datetime(s.index)
+        # Robust tz handling: drop tz if present, otherwise no-op
+        try:
+            idx = idx.tz_localize(None)
+        except Exception:
+            try:
+                idx = idx.tz_convert(None)
+            except Exception:
+                pass
+        idx = idx.normalize()
         ss = pd.Series(s.values, index=idx)
         normed[k] = ss.sort_index()
         inter = idx if inter is None else inter.intersection(idx)
@@ -395,7 +539,9 @@ def compute_window_metrics(prices: Dict[str, List[float]], dates: List[pd.Timest
     """JS parity:
     - returns are computed on price transitions (length = len(dates)-1)
     - rolling window is applied over returns indexes [start..end]
-    - record date = dates[end+1]
+    - record date = dates[end] (aligns with analysis_data/app.js and precomputed.json)
+      NOTE: Previously this used dates[end+1], which shifted Python one day ahead
+      versus the front-end and precomputed, causing Classic/FFL misalignment.
     """
     idx = {s: i for i, s in enumerate(SIGNAL_SYMBOLS)}
     series = {s: prices[s] for s in SIGNAL_SYMBOLS}
@@ -418,9 +564,9 @@ def compute_window_metrics(prices: Dict[str, List[float]], dates: List[pd.Timest
                     mat[a, b] = np.corrcoef(ra, rb)[0, 1]
         stab = stability_index(mat)
         stability_vals.append(stab)
+        # JS sets record.date to analysisDates[endIndex], which corresponds to prices[end+1].
         records.append({
-            # record date aligns to returns index end -> prices index end+1
-            "date": dates[end + 1].strftime("%Y-%m-%d"),
+            "date": dates[end + 1].strftime("%Y-%m-%d") if (end + 1) < len(dates) else dates[-1].strftime("%Y-%m-%d"),
             "stability": stab,
             "sub": sub_indices(mat),
             "matrix": mat,
@@ -515,28 +661,58 @@ def rolling_return(series: List[float], idx: int, lookback: int) -> Optional[flo
 
 
 def compute_ffl(prices: Dict[str, List[float]], dates: List[pd.Timestamp], metrics: Dict[str, Any], window: int, variant: str = "stab") -> Dict[str, Any]:
-    # Port of computeRiskSeriesFFL with classic/exp/stab variants (simplified parity where possible)
-    recs = metrics["records"]
-    n = len(recs)
+    recs = metrics.get("records") or []
+    length = len(recs)
+    if length == 0:
+        return {}
+
     labels = SIGNAL_SYMBOLS
-    idx_map = {s: i for i, s in enumerate(labels)}
-    window_offset = window - 1
-    # z-momentum per asset for entire date range
-    k = RISK_CFG_FFL["lookbacks"]["momentum"]
-    v = RISK_CFG_FFL["lookbacks"]["vol"]
-    z: Dict[str, List[Optional[float]]] = {s: [None] * len(dates) for s in labels}
-    for s in labels:
-        series = prices[s]
-        for i in range(len(dates)):
-            z[s][i] = z_momentum(series, i, k, v, RISK_CFG_FFL["zSat"])
-    # --- BearGuard: downside-asymmetry damper ---
+    idx_map = {symbol: idx for idx, symbol in enumerate(labels)}
+    window_offset = max(1, window - 1)
+
+    lookbacks = RISK_CFG_FFL.get("lookbacks", {})
+    mom_lb = int(lookbacks.get("momentum", 10))
+    vol_lb = int(lookbacks.get("vol", 20))
+    z_sat = float(RISK_CFG_FFL.get("zSat", 2.0))
+    p_power = float(RISK_CFG_FFL.get("p", 1.5))
+    lambda_flux = float(RISK_CFG_FFL.get("lambda", 0.25))
+    k_lambda = float(RISK_CFG_FFL.get("kLambda", 1.0))
+
+    price_len = len(dates)
+    z_cache: Dict[str, Dict[int, Optional[float]]] = {symbol: {} for symbol in labels}
+
+    def z_value(symbol: str, idx: int) -> Optional[float]:
+        cache = z_cache[symbol]
+        if idx in cache:
+            return cache[idx]
+        series = prices.get(symbol)
+        if not isinstance(series, list) or idx < 0 or idx >= len(series):
+            cache[idx] = None
+            return None
+        value = z_momentum(series, idx, mom_lb, vol_lb, z_sat)
+        cache[idx] = value
+        return value
+
+    pair_series = (metrics.get("pairs") or {}).get(SIGNAL_PAIR_KEY)
+    correlations = pair_series.get("correlation") if isinstance(pair_series, dict) else None
+    sc_corr: List[float] = []
+    if correlations:
+        for i in range(length):
+            value = correlations[i] if i < len(correlations) else None
+            sc_corr.append(safe_float(value, float("nan")))
+    else:
+        sc_corr = [float("nan")] * length
+
+    safe_neg_series = [safe_float(rec.get("sub", {}).get("safeNegative", 0.0), 0.0) for rec in recs]
+    dates_str = [rec.get("date") for rec in recs]
+
     dates_idx = pd.to_datetime(pd.Index(dates))
     risk_candidates = [BASE_SYMBOL, "IWM", "BTC-USD"]
-    risk_set = [s for s in risk_candidates if s in prices]
+    risk_set = [sym for sym in risk_candidates if sym in prices]
     r_star_series: Optional[pd.Series] = None
     if risk_set:
         for sym in risk_set:
-            px = pd.Series(prices[sym], index=dates_idx)
+            px = pd.Series(prices.get(sym, []), index=dates_idx)
             log_ret = np.log(px).diff()
             pos2 = (log_ret.clip(lower=0.0) ** 2).ewm(span=60, adjust=False).mean()
             neg2 = (log_ret.clip(upper=0.0) ** 2).ewm(span=60, adjust=False).mean()
@@ -551,414 +727,563 @@ def compute_ffl(prices: Dict[str, List[float]], dates: List[pd.Timestamp], metri
         r_star_series = r_star_series.reindex(dates_idx).fillna(1.0)
     R_star = r_star_series.values
 
-    def _bear_damp(idx: int, R_thr: float = 1.2, beta: float = 0.5, gmin: float = 0.5) -> float:
+    def bear_damp(idx: int, r_thr: float = 1.2, beta: float = 0.5, gmin: float = 0.5) -> float:
         if 0 <= idx < len(R_star):
-            x = max(0.0, float(R_star[idx]) - R_thr)
-            return max(gmin, 1.0 / (1.0 + beta * x))
+            x_val = max(0.0, float(R_star[idx]) - r_thr)
+            return max(gmin, 1.0 / (1.0 + beta * x_val))
         return 1.0
-    # --- end BearGuard ---
-    # Stability slope z for STAB/EXP rules
-    Svals = [float(r.get("stability", np.nan)) for r in recs]
-    s_fast = ema(Svals, RISK_CFG_FFL["stabTune"]["fast"])
-    s_slow = ema(Svals, RISK_CFG_FFL["stabTune"]["slow"])
-    s_slope = [((s_fast[i] - s_slow[i]) if np.isfinite(s_fast[i]) and np.isfinite(s_slow[i]) else np.nan) for i in range(n)]
-    s_z: List[Optional[float]] = [None] * n
-    for i in range(n):
-        s_z[i] = rolling_z(s_slope, i, RISK_CFG_FFL["stabTune"]["zWin"])
-    # Iterate records for flux/guard metrics
-    mm: List[Optional[float]] = [None] * n
-    mm_trend: List[Optional[float]] = [None] * n
-    jflux: List[Optional[float]] = [None] * n
-    flux_raw: List[Optional[float]] = [None] * n
-    flux_intensity: List[Optional[float]] = [None] * n
-    flux_slope: List[Optional[float]] = [None] * n
-    guard: List[Optional[float]] = [None] * n
-    score: List[Optional[float]] = [None] * n
-    apdf: List[Optional[float]] = [None] * n
-    pcon: List[Optional[float]] = [None] * n
-    vpc1: List[Optional[float]] = [None] * n
-    kappa: List[Optional[float]] = [None] * n
-    risk_beta_flux: List[Optional[float]] = [None] * n
-    co_down_all: List[Optional[float]] = [None] * n
-    combo_mom: List[Optional[float]] = [None] * n
-    breadth: List[Optional[float]] = [None] * n
+
+    mm: List[Optional[float]] = [None] * length
+    mm_trend: List[Optional[float]] = [None] * length
+    jflux: List[Optional[float]] = [None] * length
+    risk_beta_flux: List[Optional[float]] = [None] * length
+    flux_raw: List[Optional[float]] = [None] * length
+    flux_intensity: List[Optional[float]] = [None] * length
+    flux_slope: List[Optional[float]] = [None] * length
+    guard: List[Optional[float]] = [None] * length
+    score: List[Optional[float]] = [None] * length
+    apdf: List[Optional[float]] = [None] * length
+    pcon: List[Optional[float]] = [None] * length
+    vpc1: List[Optional[float]] = [None] * length
+    kappa: List[Optional[float]] = [None] * length
+    co_down_all: List[Optional[float]] = [None] * length
+    combo_mom: List[Optional[float]] = [None] * length
+    breadth: List[Optional[float]] = [None] * length
+    diffusion_scores: List[Optional[float]] = [None] * length
+    full_flux: List[Optional[float]] = [None] * length
+    full_flux_z: List[Optional[float]] = [None] * length
+    far: List[Optional[float]] = [None] * length
+    fragile: List[bool] = [False] * length
+
+    full_flux_window = min(63, max(15, length // 4 if length // 4 else 15))
+
     prev_mat: Optional[np.ndarray] = None
-    for i, r in enumerate(recs):
-        mat = r["matrix"]
-        # Absorption (market mode)
-        mm[i] = top_eigenvalue_ratio(mat)
-        mm_trend[i] = (mm[i] - mm[i - 1]) if i > 0 and np.isfinite(mm[i]) and np.isfinite(mm[i - 1]) else None
-        # Flux accumulators
-        p = RISK_CFG_FFL["p"]
-        num = 0.0
-        den = 0.0
+    for i, rec in enumerate(recs):
+        matrix_raw = rec.get("matrix")
+        matrix: Optional[np.ndarray]
+        if isinstance(matrix_raw, np.ndarray):
+            matrix = matrix_raw.astype(float)
+        elif isinstance(matrix_raw, (list, tuple)):
+            try:
+                matrix = np.array(matrix_raw, dtype=float)
+            except Exception:
+                matrix = None
+        else:
+            matrix = None
+        if matrix is not None and matrix.ndim != 2:
+            matrix = None
+        if matrix is not None and matrix.shape[0] != len(labels):
+            try:
+                matrix = np.array(matrix[:len(labels), :len(labels)], dtype=float)
+            except Exception:
+                matrix = None
+
+        mm_val = None
+        if matrix is not None and matrix.size > 0:
+            mm_val = top_eigenvalue(matrix) / max(1, matrix.shape[0])
+        mm[i] = mm_val if mm_val is not None and np.isfinite(mm_val) else None
+        if i > 0 and mm[i] is not None and mm[i - 1] is not None:
+            mm_trend[i] = float(mm[i] - mm[i - 1])
+        else:
+            mm_trend[i] = None
+
+        price_index = window_offset + i
+        zr: Dict[str, Optional[float]] = {symbol: z_value(symbol, price_index) for symbol in labels}
+
+        weight_sum = 0.0
+        flux_sum = 0.0
         abs_sum = 0.0
-        apdf_w = 0.0
-        pcon_w = 0.0
-        w_all = 0.0
-        # risk-safe pairs
-        for s_safe in SAFE_SYMBOLS:
-            for s_risk in RISK_SYMBOLS:
-                ia = idx_map[s_safe]; ib = idx_map[s_risk]
-                coef = float(mat[ia, ib]) if np.isfinite(mat[ia, ib]) else 0.0
-                w = abs(coef) ** p
-                # JS mapping: record i corresponds to price index (window_offset + i + 1)
-                pi = window_offset + i + 1
-                zi = z[s_risk][pi] if pi < len(dates) else None
-                zs = z[s_safe][pi] if pi < len(dates) else None
-                if zi is None or zs is None:
+        apdf_weighted = 0.0
+        pcon_weighted = 0.0
+        weights_all = 0.0
+
+        if matrix is not None:
+            rows, cols = matrix.shape
+            for safe_sym in CLUSTERS["safe"]:
+                ia = idx_map[safe_sym]
+                if ia >= rows:
                     continue
-                diff = float(zi) - float(zs)
-                num += w * diff
-                den += w
-                abs_sum += w * abs(diff)
-                apdf_w += w * (float(zi) - float(zs))
-                pcon_w += w * (1.0 if float(zi) > float(zs) else 0.0)
-                w_all += w
-        # risk-risk pairs (APDF/PCON)
-        for a in range(len(RISK_SYMBOLS)):
-            for b in range(a + 1, len(RISK_SYMBOLS)):
-                ia = idx_map[RISK_SYMBOLS[a]]; ib = idx_map[RISK_SYMBOLS[b]]
-                coef = float(mat[ia, ib]) if np.isfinite(mat[ia, ib]) else 0.0
-                w = abs(coef) ** p
-                pi = window_offset + i + 1
-                za = z[RISK_SYMBOLS[a]][pi] if pi < len(dates) else None
-                zb = z[RISK_SYMBOLS[b]][pi] if pi < len(dates) else None
-                if za is None or zb is None:
+                for risk_sym in CLUSTERS["risk"]:
+                    ib = idx_map[risk_sym]
+                    if ib >= cols:
+                        continue
+                    coef = matrix[ia, ib]
+                    if not np.isfinite(coef):
+                        continue
+                    weight = abs(coef) ** p_power
+                    if weight <= 0:
+                        continue
+                    s_val = zr.get(safe_sym)
+                    r_val = zr.get(risk_sym)
+                    s_norm = float(s_val) if s_val is not None and np.isfinite(s_val) else 0.0
+                    r_norm = float(r_val) if r_val is not None and np.isfinite(r_val) else 0.0
+                    diff = r_norm - s_norm
+                    weight_sum += weight
+                    flux_sum += weight * diff
+                    abs_sum += weight * abs(diff)
+                    apdf_weighted += weight * diff
+                    pcon_weighted += weight * (1.0 if r_norm > s_norm else 0.0)
+                    weights_all += weight
+            for ai in range(len(CLUSTERS["risk"])):
+                sym_a = CLUSTERS["risk"][ai]
+                ia = idx_map[sym_a]
+                if ia >= rows:
                     continue
-                apdf_w += w * (0.5 * (float(za) + float(zb)))
-                pcon_w += w * (1.0 if (float(za) > 0 and float(zb) > 0) else 0.0)
-                w_all += w
-        # safe-safe pairs (APDF/PCON)
-        for a in range(len(SAFE_SYMBOLS)):
-            for b in range(a + 1, len(SAFE_SYMBOLS)):
-                ia = idx_map[SAFE_SYMBOLS[a]]; ib = idx_map[SAFE_SYMBOLS[b]]
-                coef = float(mat[ia, ib]) if np.isfinite(mat[ia, ib]) else 0.0
-                w = abs(coef) ** p
-                pi = window_offset + i + 1
-                za = z[SAFE_SYMBOLS[a]][pi] if pi < len(dates) else None
-                zb = z[SAFE_SYMBOLS[b]][pi] if pi < len(dates) else None
-                if za is None or zb is None:
+                for bi in range(ai + 1, len(CLUSTERS["risk"])):
+                    sym_b = CLUSTERS["risk"][bi]
+                    ib = idx_map[sym_b]
+                    if ib >= cols:
+                        continue
+                    coef = matrix[ia, ib]
+                    if not np.isfinite(coef):
+                        continue
+                    weight = abs(coef) ** p_power
+                    if weight <= 0:
+                        continue
+                    a_norm = float(zr.get(sym_a)) if zr.get(sym_a) is not None and np.isfinite(zr.get(sym_a)) else 0.0
+                    b_norm = float(zr.get(sym_b)) if zr.get(sym_b) is not None and np.isfinite(zr.get(sym_b)) else 0.0
+                    apdf_weighted += weight * (0.5 * (a_norm + b_norm))
+                    pcon_weighted += weight * (1.0 if (a_norm > 0 and b_norm > 0) else 0.0)
+                    weights_all += weight
+            for ai in range(len(CLUSTERS["safe"])):
+                sym_a = CLUSTERS["safe"][ai]
+                ia = idx_map[sym_a]
+                if ia >= rows:
                     continue
-                apdf_w += w * (-0.5 * (float(za) + float(zb)))
-                pcon_w += w * (1.0 if (float(za) <= 0 and float(zb) <= 0) else 0.0)
-                w_all += w
-        jbar = (num / den) if den > 0 else 0.0
-        jn = _tanh_clip(jbar, RISK_CFG_FFL["lambda"]) if den > 0 else 0.0
-        jflux[i] = jn * _bear_damp(window_offset + i)
-        flux_raw[i] = (jbar if den > 0 else 0.0)
-        flux_intensity[i] = (abs_sum / den) if den > 0 else 0.0
-        flux_slope[i] = (jflux[i] - jflux[i - 1]) if i > 0 and jflux[i] is not None and jflux[i - 1] is not None else None
-        # APDF/PCON finalization
-        apdf[i] = float(np.tanh((apdf_w / w_all) / (RISK_CFG_FFL["lambda"] or 0.25))) if w_all > 0 else None
-        pcon[i] = float(min(1.0, max(0.0, pcon_w / w_all))) if w_all > 0 else None
-        # v_PC1
-        try:
-            e1 = top_eigenvector(mat)
-            if e1 is not None:
-                numv = 0.0; denv = 0.0
-                for ksym, wv in zip(labels, e1):
-                    pi = window_offset + i + 1
-                    zi = z[ksym][pi] if pi < len(dates) else None
-                    zi = float(zi) if zi is not None and np.isfinite(zi) else 0.0
-                    numv += float(wv) * zi
-                    denv += abs(float(wv))
-                vproj = (numv / denv) if denv > 0 else 0.0
-                vpc1[i] = float(np.tanh(vproj / 0.5))
+                for bi in range(ai + 1, len(CLUSTERS["safe"])):
+                    sym_b = CLUSTERS["safe"][bi]
+                    ib = idx_map[sym_b]
+                    if ib >= cols:
+                        continue
+                    coef = matrix[ia, ib]
+                    if not np.isfinite(coef):
+                        continue
+                    weight = abs(coef) ** p_power
+                    if weight <= 0:
+                        continue
+                    a_norm = float(zr.get(sym_a)) if zr.get(sym_a) is not None and np.isfinite(zr.get(sym_a)) else 0.0
+                    b_norm = float(zr.get(sym_b)) if zr.get(sym_b) is not None and np.isfinite(zr.get(sym_b)) else 0.0
+                    apdf_weighted += weight * (-0.5 * (a_norm + b_norm))
+                    pcon_weighted += weight * (1.0 if (a_norm <= 0 and b_norm <= 0) else 0.0)
+                    weights_all += weight
+        if weight_sum > 0:
+            jbar = flux_sum / weight_sum
+            jnorm = _tanh_clip(jbar, lambda_flux)
+        else:
+            jbar = 0.0
+            jnorm = 0.0
+        jflux_val = jnorm * bear_damp(price_index)
+        jflux[i] = jflux_val
+        flux_raw[i] = jbar if weight_sum > 0 else 0.0
+        flux_intensity[i] = abs_sum / weight_sum if weight_sum > 0 else 0.0
+        if i > 0 and jflux_val is not None and jflux[i - 1] is not None:
+            flux_slope[i] = jflux_val - jflux[i - 1]
+        else:
+            flux_slope[i] = None
+
+        matrix_for_diff = matrix.copy() if matrix is not None else None
+        prev_matrix = prev_mat.copy() if prev_mat is not None else None
+        full_flux_val = frob_diff(matrix_for_diff, prev_matrix) if matrix_for_diff is not None else None
+        full_flux[i] = full_flux_val if full_flux_val is not None and np.isfinite(full_flux_val) else None
+        z_full = rolling_z(full_flux, i, full_flux_window)
+        full_flux_z[i] = z_full if z_full is not None and np.isfinite(z_full) else None
+
+        if weights_all > 0:
+            apdf_val = math.tanh((apdf_weighted / weights_all) / (lambda_flux or 0.25))
+            apdf[i] = apdf_val
+            pcon_val = pcon_weighted / weights_all
+            pcon[i] = clamp01(pcon_val)
+        else:
+            apdf[i] = None
+            pcon[i] = None
+
+        if matrix_for_diff is not None:
+            try:
+                eig_vec = top_eigenvector(matrix_for_diff)
+            except Exception:
+                eig_vec = None
+            if eig_vec is not None:
+                num_proj = 0.0
+                den_proj = 0.0
+                for sym, weight in zip(labels, eig_vec):
+                    z_val = z_value(sym, price_index)
+                    z_norm = float(z_val) if z_val is not None and np.isfinite(z_val) else 0.0
+                    num_proj += float(weight) * z_norm
+                    den_proj += abs(float(weight))
+                vproj = num_proj / den_proj if den_proj > 0 else 0.0
+                vpc1[i] = math.tanh(vproj / 0.5)
             else:
                 vpc1[i] = None
-        except Exception:
+        else:
             vpc1[i] = None
-        # coDownAll / combo / breadth
-        all_z = []
-        risk_z = []
-        for s in labels:
-            pi = window_offset + i + 1
-            zi = z[s][pi] if pi < len(dates) else None
-            if zi is not None and np.isfinite(zi):
-                all_z.append(float(zi))
-        for s in RISK_SYMBOLS:
-            pi = window_offset + i + 1
-            zi = z[s][pi] if pi < len(dates) else None
-            if zi is not None and np.isfinite(zi):
-                risk_z.append(float(zi))
-        co_down_all[i] = (sum(1 for v in all_z if v < 0) / len(all_z)) if all_z else None
-        combo_mom[i] = (float(np.mean(risk_z)) if risk_z else None)
-        breadth[i] = (sum(1 for v in risk_z if v > 0) / len(risk_z)) if risk_z else None
-        # guard
-        safe_neg = float(r.get("sub", {}).get("safeNegative", 0.0))
-        mm_pen = 0.0 if not np.isfinite(mm[i]) else min(1.0, max(0.0, (mm[i] - 0.85) / (0.97 - 0.85)))
-        safe_pen = min(1.0, max(0.0, (safe_neg - 0.35) / (0.60 - 0.35)))
-        delta_pen = 0.0
-        if np.isfinite(r.get("delta", np.nan)):
-            delta_pen = min(1.0, max(0.0, max(0.0, -float(r["delta"])) / (0.05 - 0.015)))
-        zf = rolling_z(metrics.get("fullFlux", []), i, min(63, max(15, n // 4)))
-        flux_guard = 1 / (1 + math.exp(-0.85 * zf)) if zf is not None else 1.0
+
+        all_z: List[float] = []
+        risk_z: List[float] = []
+        for sym in labels:
+            val = z_value(sym, price_index)
+            if val is not None and np.isfinite(val):
+                all_z.append(float(val))
+        for sym in CLUSTERS["risk"]:
+            val = z_value(sym, price_index)
+            if val is not None and np.isfinite(val):
+                risk_z.append(float(val))
+        co_down_all[i] = (sum(1 for value in all_z if value < 0) / len(all_z)) if all_z else None
+        combo_mom[i] = float(np.mean(risk_z)) if risk_z else None
+        breadth[i] = (sum(1 for value in risk_z if value > 0) / len(risk_z)) if risk_z else None
+
+        mm_pen = normalize_range(mm_val, 0.85, 0.97)
+        safe_pen = normalize_range(safe_neg_series[i], 0.35, 0.60)
+        delta_val = safe_float(rec.get("delta"), float("nan"))
+        delta_pen = normalize_range(max(0.0, -delta_val) if np.isfinite(delta_val) else 0.0, 0.015, 0.05)
+        flux_guard = sigmoid(full_flux_z[i], 0.85)
         guard_val = 0.4 * mm_pen + 0.2 * safe_pen + 0.2 * delta_pen + 0.2 * flux_guard
-        guard[i] = float(guard_val)
-        # flux score components
-        flux_score = 0.5 * (1 + (jflux[i] if jflux[i] is not None else 0.0))
-        combo_norm = 0.5 * (1 + (combo_mom[i] if combo_mom[i] is not None else 0.0))
-        breadth_norm = (breadth[i] if breadth[i] is not None else 0.0)
-        guard_relief = max(0.0, 1.0 - guard_val)
-        score[i] = float(0.5 * flux_score + 0.2 * combo_norm + 0.2 * breadth_norm + 0.1 * guard_relief)
-        # risk beta flux (requires prev mat)
-        if prev_mat is not None:
+        guard[i] = guard_val
+
+        flux_score = 0.5 * (1.0 + (jflux_val if jflux_val is not None else 0.0)) if jflux_val is not None else None
+        combo_norm = clamp01(0.5 * ((combo_mom[i] if combo_mom[i] is not None else 0.0) + 1.0)) if combo_mom[i] is not None else None
+        breadth_norm = clamp01(breadth[i]) if breadth[i] is not None else None
+        guard_relief = clamp01(1.0 - guard_val)
+        components: List[Tuple[float, float]] = []
+        if flux_score is not None:
+            components.append((0.5, float(flux_score)))
+        if combo_norm is not None:
+            components.append((0.2, float(combo_norm)))
+        if breadth_norm is not None:
+            components.append((0.2, float(breadth_norm)))
+        if guard_relief is not None:
+            components.append((0.1, float(guard_relief)))
+        if components:
+            total_weight = sum(weight for weight, _ in components)
+            aggregated = sum(weight * value for weight, value in components) / total_weight if total_weight > 0 else (flux_score or 0.5)
+        else:
+            aggregated = flux_score if flux_score is not None else 0.5
+        score[i] = float(aggregated)
+
+        mt = max(0.0, mm_trend[i]) if mm_trend[i] is not None and np.isfinite(mm_trend[i]) else 0.0
+        fs_neg = max(0.0, -(flux_slope[i] if flux_slope[i] is not None and np.isfinite(flux_slope[i]) else 0.0))
+        diff_val = (jflux_val if jflux_val is not None else 0.0) - (0.50 * mt) - (0.15 * fs_neg)
+        diffusion_scores[i] = diff_val
+
+        if prev_mat is not None and matrix_for_diff is not None:
             rbw = 0.0
             rbsum = 0.0
-            for a in range(len(RISK_SYMBOLS)):
-                for b in range(a + 1, len(RISK_SYMBOLS)):
-                    ia = idx_map[RISK_SYMBOLS[a]]; ib = idx_map[RISK_SYMBOLS[b]]
-                    curr = float(mat[ia, ib]) if np.isfinite(mat[ia, ib]) else None
-                    prev = float(prev_mat[ia, ib]) if np.isfinite(prev_mat[ia, ib]) else None
-                    if curr is None or prev is None:
+            rows_prev, cols_prev = prev_mat.shape
+            for ai, sym_a in enumerate(CLUSTERS["risk"]):
+                ia = idx_map[sym_a]
+                if ia >= matrix_for_diff.shape[0] or ia >= rows_prev:
+                    continue
+                for bi in range(ai + 1, len(CLUSTERS["risk"])):
+                    sym_b = CLUSTERS["risk"][bi]
+                    ib = idx_map[sym_b]
+                    if ib >= matrix_for_diff.shape[1] or ib >= cols_prev:
                         continue
-                    delta = curr - prev
-                    w = abs(curr) ** p
+                    curr = matrix_for_diff[ia, ib]
+                    prev_val = prev_mat[ia, ib]
+                    if not np.isfinite(curr) or not np.isfinite(prev_val):
+                        continue
+                    delta = curr - prev_val
+                    weight = abs(curr) ** p_power
+                    if weight <= 0:
+                        continue
                     dir_sum = 0.0
-                    za = z[RISK_SYMBOLS[a]][window_offset + i]
-                    zb = z[RISK_SYMBOLS[b]][window_offset + i]
-                    if za is not None:
+                    za = zr.get(sym_a)
+                    zb = zr.get(sym_b)
+                    if za is not None and np.isfinite(za):
                         dir_sum += float(za)
-                    if zb is not None:
+                    if zb is not None and np.isfinite(zb):
                         dir_sum += float(zb)
                     dir_sign = 1.0 if dir_sum >= 0 else -1.0
-                    rbw += w
-                    rbsum += w * delta * dir_sign
+                    rbw += weight
+                    rbsum += weight * delta * dir_sign
             rb_bar = (rbsum / rbw) if rbw > 0 else 0.0
-            risk_beta_flux[i] = float(np.tanh(rb_bar / (RISK_CFG_FFL["lambda"] or 0.25)))
+            risk_beta_flux[i] = float(np.tanh(rb_bar / (lambda_flux or 0.25)))
         else:
             risk_beta_flux[i] = None
-        prev_mat = mat
-    # dynamic thresholds (variant != classic)
-    th = RISK_CFG_FFL["thresholds"]
+
+        prev_mat = matrix_for_diff.copy() if matrix_for_diff is not None else None
+
+    thresholds = RISK_CFG_FFL.get("thresholds", {})
     valid_flux = [float(x) for x in jflux if x is not None and np.isfinite(x)]
     valid_score = [float(x) for x in score if x is not None and np.isfinite(x)]
-    dyn_on_flux = th["jOn"]
-    dyn_off_flux = th["jOff"]
-    dyn_on_score = th["scoreOn"]
-    dyn_off_score = th["scoreOff"]
+    dyn_on_flux = float(thresholds.get("jOn", 0.10))
+    dyn_off_flux = float(thresholds.get("jOff", -0.08))
+    dyn_on_score = float(thresholds.get("scoreOn", 0.60))
+    dyn_off_score = float(thresholds.get("scoreOff", 0.40))
+
+    exp_tune = RISK_CFG_FFL.get("expTune", {})
+    q_on = float(exp_tune.get("qOn", 0.715))
+    q_off = float(exp_tune.get("qOff", 0.244))
+
     if variant != "classic" and len(valid_flux) >= 50:
-        dyn_on_flux = max(th["jOn"], quantile(valid_flux, 0.715))
-        dyn_off_flux = min(th["jOff"], quantile(valid_flux, 0.244))
+        dyn_on_flux = max(dyn_on_flux, quantile(valid_flux, q_on))
+        dyn_off_flux = min(dyn_off_flux, quantile(valid_flux, q_off))
     if variant != "classic" and len(valid_score) >= 50:
-        dyn_on_score = max(th["scoreOn"], quantile(valid_score, 0.75))
-        dyn_off_score = min(th["scoreOff"], quantile(valid_score, 0.25))
-    # state machine
-    state: List[int] = []
-    prev = 0
-    drift_seq = 0
-    drift_cool = 0
-    in_drift = False
-    def bench_ret(sym: str, i_local: int, lb: int) -> Optional[float]:
-        idx = window_offset + i_local
-        return rolling_return(prices[sym], idx, lb)
-    for i in range(n):
-        mmv = mm[i] if (mm[i] is not None and np.isfinite(mm[i])) else 0.0
-        gv = guard[i] if guard[i] is not None else 1.0
-        jv = jflux[i] if jflux[i] is not None else 0.0
-        sc = score[i] if score[i] is not None else 0.5
-        combo = combo_mom[i] if combo_mom[i] is not None else 0.0
-        br = breadth[i] if breadth[i] is not None else 0.0
-        # hi-corr bear & drift
-        b10 = bench_ret(BASE_SYMBOL, i, 10)
-        b20 = bench_ret(BASE_SYMBOL, i, 20)
-        hi_corr_bear = (mmv >= 0.90) and ((b10 if b10 is not None else -1e-9) <= 0)
-        hi_corr_drift = ((co_down_all[i] is not None and co_down_all[i] >= 0.60 and jv <= 0) or (mmv >= 0.90 and (b20 if b20 is not None else -1e-9) <= 0))
-        if hi_corr_drift:
-            drift_seq += 1; drift_cool = 0
+        dyn_on_score = max(dyn_on_score, quantile(valid_score, 0.75))
+        dyn_off_score = min(dyn_off_score, quantile(valid_score, 0.25))
+
+    stab_cfg = RISK_CFG_FFL.get("stabTune", {})
+    s_fast_n = int(stab_cfg.get("fast", 21))
+    s_slow_n = int(stab_cfg.get("slow", 63))
+    s_z_win = int(stab_cfg.get("zWin", 126))
+    s_neutral_lo = float(stab_cfg.get("neutralLo", 0.30))
+    s_neutral_hi = float(stab_cfg.get("neutralHi", 0.40))
+    s_min = float(stab_cfg.get("slopeMin", 0.02))
+    s_z_up = float(stab_cfg.get("zUp", 2.50))
+    s_z_down = float(stab_cfg.get("zDown", 2.50))
+
+    Sseries = [safe_float(rec.get("stability"), 0.0) for rec in recs]
+    s_ema_fast = ema(Sseries, s_fast_n)
+    s_ema_slow = ema(Sseries, s_slow_n)
+    s_slope: List[Optional[float]] = [None] * length
+    s_sigma: List[Optional[float]] = [None] * length
+    s_z_values: List[Optional[float]] = [None] * length
+    s_up_seq_values: List[int] = [0] * length
+    s_down_seq_values: List[int] = [0] * length
+    up_seq = 0
+    down_seq = 0
+    for i in range(length):
+        v_fast = s_ema_fast[i] if np.isfinite(s_ema_fast[i]) else None
+        v_slow = s_ema_slow[i] if np.isfinite(s_ema_slow[i]) else None
+        slope = (v_fast - v_slow) if (v_fast is not None and v_slow is not None) else None
+        s_slope[i] = slope
+        sigma = rolling_sigma_mad(s_slope, i, s_z_win)
+        s_sigma[i] = sigma
+        if slope is not None and sigma is not None and sigma > 0 and np.isfinite(slope):
+            z_val = slope / sigma
         else:
-            drift_seq = 0; drift_cool += 1
-        if drift_seq >= (RISK_CFG_FFL["thresholds"].get("driftMinDays", 3)):
-            in_drift = True
-        if in_drift and drift_cool >= (RISK_CFG_FFL["thresholds"].get("driftCool", 2)):
-            in_drift = False
-        # EXP veto/booster placeholders (parity close; full EXP timing can be added)
-        exp_ok_on = True
-        exp_force_off = False
-        # main gates
-        pcon_ok = (pcon[i] is None) or (pcon[i] >= (RISK_CFG_FFL.get("thresholds", {}).get("pconOn", 0.55))) or (jv >= dyn_on_flux + 0.07)
-        apdf_ok = (apdf[i] is None) or (apdf[i] >= -0.05)
-        dyn_on_adj = dyn_on_flux + (0.05 if mmv >= 0.94 else (0.03 if mmv >= 0.90 else 0.0))
-        stricter = (not hi_corr_bear) or ( (jv >= dyn_on_adj + 0.05) and ((pcon[i] or 1.0) >= 0.65) and ((apdf[i] or 0.0) >= 0.0) and (combo >= 0.10) )
-        on_main = (jv >= dyn_on_adj) and pcon_ok and apdf_ok and stricter and (gv < 0.95) and (mmv < th["mmOff"]) and (br >= (th.get("breadthOn", 0.5) * 0.6)) and exp_ok_on
-        # alt/strong on
-        on_alt = (not hi_corr_bear) and (risk_beta_flux[i] is not None and risk_beta_flux[i] >= 0.06) and (combo >= 0.10) and (gv < 0.90)
-        kappa_val = None
-        if vpc1[i] is not None and jflux[i] is not None:
-            lam = 1.0
-            kappa_val = abs(jflux[i]) / (abs(vpc1[i]) * lam + 1e-6)
-            kappa[i] = kappa_val
-        strong_on = (jv >= dyn_on_adj + 0.03) and ((kappa_val is None) or (kappa_val >= 0.60)) and ((pcon[i] or 1.0) >= 0.65) and ((vpc1[i] or 0.0) >= th.get("vOn", 0.05)) and (gv < 0.95) and (mmv < th["mmOff"])
+            z_val = None
+        s_z_values[i] = z_val
+        up_cond = z_val is not None and np.isfinite(z_val) and slope is not None and slope >= s_min and z_val >= s_z_up
+        down_cond = z_val is not None and np.isfinite(z_val) and slope is not None and slope <= -s_min and z_val <= -s_z_down
+        up_seq = up_seq + 1 if up_cond else 0
+        down_seq = down_seq + 1 if down_cond else 0
+        s_up_seq_values[i] = up_seq
+        s_down_seq_values[i] = down_seq
+
+    state: List[int] = [0] * length
+    on_cand = 0
+    off_cand = 0
+    prev_state = 0
+    drift_seq = 0
+    drift_cooldown = 0
+    in_drift_epoch = False
+    stab_neutral_run = 0
+    s_down_run = 0
+
+    for i in range(length):
+        flux_val = jflux[i] if jflux[i] is not None else 0.0
+        diff_val = diffusion_scores[i] if diffusion_scores[i] is not None else flux_val
+        score_val = score[i] if score[i] is not None else 0.5
+        mm_val = mm[i] if mm[i] is not None else 0.0
+        combo_val = combo_mom[i]
+        breadth_val = breadth[i]
+        guard_val = guard[i] if guard[i] is not None else 1.0
+        vpc1_val = vpc1[i] if vpc1[i] is not None else 0.0
+
+        if flux_val is not None and np.isfinite(flux_val) and np.isfinite(diff_val) and np.isfinite(vpc1_val):
+            kappa_val = abs(diff_val) / (abs(diff_val) + k_lambda * abs(vpc1_val) + 1e-6)
+        else:
+            kappa_val = None
+        kappa[i] = kappa_val
+
+        guard_soft = 0.95
+        guard_hard = 0.98
+        breadth_gate = (breadth_val if breadth_val is not None and np.isfinite(breadth_val) else 0.0) >= (thresholds.get("breadthOn", 0.5) * 0.6)
+
+        s_val_now = s_slope[i] if s_slope[i] is not None and np.isfinite(s_slope[i]) else None
+        s_z_now = s_z_values[i] if s_z_values[i] is not None and np.isfinite(s_z_values[i]) else None
+        if variant == "stab":
+            if s_val_now is not None and s_val_now < -max(1e-6, s_min):
+                s_down_run += 1
+            else:
+                s_down_run = 0
+        stab_up_trend = variant == "stab" and s_val_now is not None and s_val_now > 0
+        stab_plunge = variant == "stab" and s_val_now is not None and s_z_now is not None and s_z_now <= -s_z_down and s_val_now < 0
+
+        pcon_val = pcon[i]
+        apdf_val = apdf[i]
+        pcon_ok_base = (pcon_val is None) or (pcon_val >= thresholds.get("pconOn", 0.55))
+        apdf_ok = (apdf_val is None) or (apdf_val >= -0.05)
+        pcon_ok = pcon_ok_base or (diff_val >= (dyn_on_flux + 0.07))
+
+        idx_price = window_offset + i
+        bench_returns = prices.get(BASE_SYMBOL, [])
+        bench10 = rolling_return(bench_returns, idx_price, 10) if isinstance(bench_returns, list) else None
+        bench20 = rolling_return(bench_returns, idx_price, 20) if isinstance(bench_returns, list) else None
+        hi_corr_bear = (mm_val >= 0.90) and ((bench10 if bench10 is not None else -1e-9) <= 0)
+        co_down_val = co_down_all[i]
+        hi_corr_drift = ((co_down_val is not None and co_down_val >= thresholds.get("downAll", 0.60) and flux_val <= 0) or
+                         ((mm_val >= thresholds.get("mmHi", 0.90)) and ((bench20 if bench20 is not None else -1e-9) <= 0)))
+
+        if hi_corr_drift:
+            drift_seq += 1
+            drift_cooldown = 0
+        else:
+            drift_seq = 0
+            drift_cooldown += 1
+        if drift_seq >= int(thresholds.get("driftMinDays", 3)):
+            in_drift_epoch = True
+        if in_drift_epoch and drift_cooldown >= int(thresholds.get("driftCool", 2)):
+            in_drift_epoch = False
+
+        dyn_on_adj = dyn_on_flux + (0.05 if mm_val >= 0.94 else (0.03 if mm_val >= 0.90 else 0.0))
+        stricter = (not hi_corr_bear) or (
+            (diff_val >= dyn_on_adj + 0.05) and
+            (pcon_val is None or pcon_val >= 0.65) and
+            (apdf_val is None or apdf_val >= 0.0) and
+            (combo_val is None or combo_val >= 0.10)
+        )
+        on_main = (
+            (diff_val >= dyn_on_adj) and
+            pcon_ok and apdf_ok and stricter and breadth_gate and
+            guard_val < guard_soft and mm_val < thresholds.get("mmOff", 0.96)
+        )
+        on_alt = (
+            (not hi_corr_bear) and
+            (risk_beta_flux[i] is not None and risk_beta_flux[i] >= 0.06) and
+            (combo_val is None or combo_val >= 0.10) and
+            guard_val < 0.90
+        )
+        strong_on = (
+            (diff_val >= dyn_on_adj + 0.03) and
+            ((kappa_val is None) or (kappa_val >= thresholds.get("kOn", 0.60))) and
+            (pcon_val is None or pcon_val >= 0.65) and
+            (vpc1_val >= thresholds.get("vOn", 0.05)) and
+            guard_val < guard_soft and
+            mm_val < thresholds.get("mmOff", 0.96)
+        )
         on_raw = (on_main or on_alt or strong_on) and (not hi_corr_drift)
-        # off gates
-        guard_only = ((gv >= 0.98) or (mmv >= th["mmOff"])) and not (jv <= dyn_off_flux)
-        off_by_rel = (((vpc1[i] or 0.0) <= th.get("vOff", -0.05)) and (abs(vpc1[i] or 0.0) >= 0.05)) or ((jv <= dyn_off_flux) and ((kappa_val or 0.0) < 0.55)) or exp_force_off
-        off_raw = off_by_rel or (jv <= dyn_off_flux) or guard_only or ((pcon[i] or 1.0) <= (RISK_CFG_FFL.get("thresholds", {}).get("pconOff", 0.40)) and mmv >= 0.92)
-        # decisions
-        decided = prev
-        if in_drift:
+
+        guard_only = ((guard_val >= guard_hard) or (mm_val >= thresholds.get("mmOff", 0.96))) and not (diff_val <= dyn_off_flux)
+        off_by_rel = (
+            ((vpc1_val <= thresholds.get("vOff", -0.05)) and (abs(vpc1_val) >= 0.05)) or
+            (diff_val <= dyn_off_flux and (kappa_val is None or kappa_val < 0.55))
+        )
+        off_raw = (
+            off_by_rel or
+            (diff_val <= dyn_off_flux) or
+            guard_only or
+            ((pcon_val is not None and pcon_val <= thresholds.get("pconOff", 0.40)) and mm_val >= 0.92)
+        )
+
+        risk3 = None
+        idx_three = idx_price
+        returns_list = []
+        for sym in CLUSTERS["risk"]:
+            series = prices.get(sym, [])
+            ret = rolling_return(series, idx_three, 3) if isinstance(series, list) else None
+            if ret is not None and np.isfinite(ret):
+                returns_list.append(ret)
+        if returns_list:
+            risk3 = sum(returns_list) / len(returns_list)
+        block_on_high_corr_down = risk3 is not None and risk3 <= 0 and mm_val >= 0.90
+
+        raw_on = (on_raw and not block_on_high_corr_down)
+        raw_off = off_raw
+        if variant == "stab":
+            if stab_up_trend:
+                raw_off = False
+            if stab_plunge:
+                raw_off = True
+            lag_down = int(stab_cfg.get("lagDown", 4))
+            if not stab_up_trend and not stab_plunge and s_down_run >= max(1, lag_down):
+                raw_off = True
+
+        hi_corr_risk = (mm_val >= 0.90) or ((mm_trend[i] or 0) > 0.005) or ((full_flux_z[i] or 0) >= 1.5)
+        accel = (flux_slope[i] or 0) > 0 and (mm_trend[i] or 0) <= 0
+        strong_pcon = pcon_val is not None and pcon_val >= 0.68
+        confirm_on_days = 1 if strong_on else (3 if hi_corr_risk else (1 if strong_pcon or accel else 2))
+
+        on_cand = on_cand + 1 if raw_on else 0
+        off_cand = off_cand + 1 if raw_off else 0
+
+        if variant == "stab":
+            s_now = Sseries[i] if np.isfinite(Sseries[i]) else None
+            slope_abs = abs(s_slope[i]) if s_slope[i] is not None and np.isfinite(s_slope[i]) else None
+            flux_abs = abs(jflux[i]) if jflux[i] is not None and np.isfinite(jflux[i]) else None
+            mid_band = s_now is not None and s_neutral_lo <= s_now <= s_neutral_hi
+            tiny_slope = slope_abs is not None and slope_abs < 0.005
+            tiny_flux = flux_abs is not None and flux_abs < 0.03
+            if mid_band and tiny_slope and tiny_flux:
+                stab_neutral_run += 1
+            else:
+                stab_neutral_run = 0
+
+        decided = prev_state
+        if in_drift_epoch:
             decided = -1
         else:
-            if prev == 1:
-                decided = -1 if off_raw else 1
-            elif prev == -1:
-                decided = 1 if on_raw else -1
+            if prev_state == 1:
+                if raw_off:
+                    lag_up = max(1, int(stab_cfg.get("lagUp", 3)))
+                    up_lead_active = (s_up_seq_values[i] >= lag_up)
+                    if variant == "stab" and up_lead_active:
+                        need = max(1, int(stab_cfg.get("upConfirmOffMin", 2)))
+                        decided = -1 if off_cand >= need else 1
+                    else:
+                        decided = -1
+                else:
+                    decided = 1
+            elif prev_state == -1:
+                decided = 1 if on_cand >= confirm_on_days else -1
             else:
-                decided = -1 if off_raw else (1 if on_raw else 0)
-        state.append(decided)
-        prev = decided
+                if off_cand >= 1:
+                    decided = -1
+                elif on_cand >= confirm_on_days:
+                    decided = 1
+                else:
+                    decided = 0
+
+        if variant == "stab" and stab_neutral_run >= 2:
+            decided = 0
+
+        state[i] = decided
+        prev_state = decided
+
+        fragile[i] = decided >= 0 and (guard_val >= thresholds.get("mmFragile", 0.88) or (guard_val >= guard_soft and guard_val < guard_hard))
+        if mm_val > 0:
+            far[i] = abs(jflux[i]) / (mm_val + 1e-9) if jflux[i] is not None else None
+        else:
+            far[i] = None
+
     executed_state = [0] + state[:-1]
-    return {
-        "dates": [r["date"] for r in recs],
+
+    result = {
+        "dates": dates_str,
         "score": score,
+        "riskScore": score,
         "state": state,
         "executedState": executed_state,
-        "mm": mm,
-        "mmTrend": mm_trend,
+        "executed_state": executed_state,
+        "fragile": fragile,
         "guard": guard,
+        "mm": mm,
+        "far": far,
         "fflFlux": jflux,
-        "fluxIntensity": flux_intensity,
-        "fluxSlope": flux_slope,
         "riskBetaFlux": risk_beta_flux,
         "apdf": apdf,
         "pcon": pcon,
-        "vPC1": vpc1,
-        "kappa": kappa,
+        "diffusionScore": diffusion_scores,
+        "fluxSlope": flux_slope,
+        "mmTrend": mm_trend,
+        "fullFlux": full_flux,
+        "fullFluxZ": full_flux_z,
         "fluxRaw": flux_raw,
-        "coDownAll": co_down_all,
+        "fluxIntensity": flux_intensity,
         "comboMomentum": combo_mom,
         "breadth": breadth,
-        "stabZ": s_z,
+        "vPC1": vpc1,
+        "kappa": kappa,
+        "coDownAll": co_down_all,
+        "scCorr": sc_corr,
+        "safeNeg": safe_neg_series,
         "diagnostics": {
             "fluxThresholds": {"on": dyn_on_flux, "off": dyn_off_flux},
             "scoreThresholds": {"on": dyn_on_score, "off": dyn_off_score},
+            "scoreLatest": score[-1] if score else None,
         },
     }
-    recs = metrics["records"]
-    full_flux = metrics.get("fullFlux", [])
-    idx_map = {s: i for i, s in enumerate(SIGNAL_SYMBOLS)}
-    window_offset = window - 1
-    # z-momentum per asset
-    k = RISK_CFG_FFL["lookbacks"]["momentum"]
-    v = RISK_CFG_FFL["lookbacks"]["vol"]
-    z: Dict[str, List[Optional[float]]] = {s: [None] * len(dates) for s in SIGNAL_SYMBOLS}
-    for s in SIGNAL_SYMBOLS:
-        series = prices[s]
-        for i in range(len(dates)):
-            idx = i
-            val = z_momentum(series, idx, k, v, RISK_CFG_FFL["zSat"])
-            z[s][i] = val
-    # mm, guard pieces, flux
-    mm: List[Optional[float]] = [None] * len(recs)
-    jflux: List[Optional[float]] = [None] * len(recs)
-    fint: List[Optional[float]] = [None] * len(recs)
-    guard: List[Optional[float]] = [None] * len(recs)
-    score: List[Optional[float]] = [None] * len(recs)
-    # stability slope z (stab tune)
-    Svals = [float(r.get("stability", np.nan)) for r in recs]
-    S_fast = ema(Svals, RISK_CFG_FFL["stabTune"]["fast"])
-    S_slow = ema(Svals, RISK_CFG_FFL["stabTune"]["slow"])
-    S_slope = [((S_fast[i] - S_slow[i]) if np.isfinite(S_fast[i]) and np.isfinite(S_slow[i]) else np.nan) for i in range(len(recs))]
-    S_z: List[Optional[float]] = [None] * len(recs)
-    for i in range(len(recs)):
-        S_z[i] = rolling_z(S_slope, i, RISK_CFG_FFL["stabTune"]["zWin"])
-    # compute per record
-    prev_mat: Optional[np.ndarray] = None
-    for i, r in enumerate(recs):
-        mat = r["matrix"]
-        mm[i] = top_eigenvalue_ratio(mat)
-        # directional flux using risk-safe pairs weighted by |coef|^p
-        p = RISK_CFG_FFL["p"]
-        num = 0.0
-        den = 0.0
-        abs_sum = 0.0
-        for s_safe in SAFE_SYMBOLS:
-            for s_risk in RISK_SYMBOLS:
-                ia = idx_map[s_safe]
-                ib = idx_map[s_risk]
-                coef = float(mat[ia, ib]) if np.isfinite(mat[ia, ib]) else 0.0
-                w = abs(coef) ** p
-                zr = z[s_risk][window_offset + i] if window_offset + i < len(dates) else None
-                zs = z[s_safe][window_offset + i] if window_offset + i < len(dates) else None
-                if not (zr is None or zs is None):
-                    diff = float(zr) - float(zs)
-                    num += w * diff
-                    den += w
-                    abs_sum += w * abs(diff)
-        jbar = (num / den) if den > 0 else 0.0
-        jn = _tanh_clip(jbar, RISK_CFG_FFL["lambda"]) if den > 0 else 0.0
-        jflux[i] = jn * _bear_damp(window_offset + i)
-        fint[i] = (abs_sum / den) if den > 0 else 0.0
-        # guard components
-        safe_neg = float(r["sub"].get("safeNegative", 0.0))
-        mm_pen = 0.0 if not np.isfinite(mm[i]) else min(1.0, max(0.0, (mm[i] - 0.85) / (0.97 - 0.85)))
-        safe_pen = min(1.0, max(0.0, (safe_neg - 0.35) / (0.60 - 0.35)))
-        delta_pen = 0.0
-        if np.isfinite(r.get("delta", np.nan)):
-            delta_pen = min(1.0, max(0.0, max(0.0, -float(r["delta"])) / (0.05 - 0.015)))
-        flux_guard = None
-        if i < len(full_flux) and full_flux[i] is not None:
-            zf = rolling_z(full_flux, i, min(63, max(15, len(recs)//4)))
-            flux_guard = 1 / (1 + math.exp(-0.85 * zf)) if zf is not None else None
-        guard_val = 0.4 * mm_pen + 0.2 * safe_pen + 0.2 * delta_pen + 0.2 * (flux_guard if flux_guard is not None else 1.0)
-        guard[i] = float(guard_val)
-        # display score (blend)
-        breadth = None
-        risk_zs = []
-        for sym in RISK_SYMBOLS:
-            zi = z[sym][window_offset + i] if window_offset + i < len(dates) else None
-            if zi is not None and np.isfinite(zi):
-                risk_zs.append(zi)
-        if risk_zs:
-            breadth = sum(1 for v in risk_zs if v > 0) / len(risk_zs)
-        combo = float(np.mean(risk_zs)) if risk_zs else 0.0
-        flux_score = 0.5 * (1 + (jn if jn is not None else 0.0))
-        combo_norm = 0.5 * (1 + combo)
-        breadth_norm = breadth if breadth is not None else 0.0
-        guard_relief = max(0.0, 1.0 - guard_val)
-        score[i] = float(0.5 * flux_score + 0.2 * combo_norm + 0.2 * breadth_norm + 0.1 * guard_relief)
-    # state machine (stab simplified)
-    th = RISK_CFG_FFL["thresholds"]
-    state: List[int] = []
-    prev = 0
-    for i in range(len(recs)):
-        bready = True  # breadth gate simplified (computed in score)
-        mmv = mm[i] if np.isfinite(mm[i]) else 0.0
-        jn = jflux[i] if jflux[i] is not None else 0.0
-        gv = guard[i] if guard[i] is not None else 1.0
-        slope = S_slope[i]
-        zsig = S_z[i]
-        stab_up = (np.isfinite(slope) and np.isfinite(zsig) and slope > RISK_CFG_FFL["stabTune"]["slopeMin"] and zsig >= RISK_CFG_FFL["stabTune"]["zUp"])  # monthly uptrend
-        stab_plunge = (np.isfinite(slope) and np.isfinite(zsig) and slope < -RISK_CFG_FFL["stabTune"]["slopeMin"] and zsig <= -RISK_CFG_FFL["stabTune"]["zDown"])  # monthly downshock
-        # gates
-        on_gate = (jn >= th["jOn"]) and (gv < 0.95) and (mmv < th["mmOff"]) and bready
-        off_gate = (jn <= th["jOff"]) or (mmv >= th["mmOff"]) or (gv >= 1.0)
-        # stab overrides
-        if stab_plunge:
-            state.append(-1)
-        elif prev == 1 and stab_up and not off_gate:
-            state.append(1)
-        else:
-            if on_gate:
-                state.append(1)
-            elif off_gate:
-                state.append(-1)
-            else:
-                state.append(0)
-        prev = state[-1]
-    exec_state = [0] + state[:-1]
-    return RegimeSeries(
-        dates=[r["date"] for r in recs],
-        score=[(s if s is not None else np.nan) for s in score],
-        state=state,
-        executed_state=exec_state,
-        mm=mm,
-        guard=guard,
-        jflux=jflux,
-        fint=fint,
-    )
-
+    return result
 
 def compute_fusion(classic: Tuple[List[str], List[float], List[int], List[float], List[float]],
                    ffl: Dict[str, Any],
@@ -1221,7 +1546,13 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
     """
     if window not in WINDOWS:
         window = 30
-    from_date = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=365 * years + 10)
+    effective_years = max(years, MIN_HISTORY_YEARS)
+    # Use tz-naive UTC date to avoid tz-aware vs tz-naive comparisons
+    from datetime import datetime
+    today_utc_naive = pd.Timestamp(datetime.utcnow().date())  # naive UTC calendar day
+    from_date = today_utc_naive - pd.Timedelta(days=365 * effective_years + MIN_HISTORY_LEAD_DAYS)
+    if from_date > MIN_HISTORY_START:
+        from_date = MIN_HISTORY_START
     from_str = from_date.strftime("%Y-%m-%d")
     api_key = os.getenv("FMP_API_KEY", "")
     if not api_key:
@@ -1230,7 +1561,6 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
     hist_frames = fetch_daily_history_fmp(ALL_SYMBOLS, from_str, api_key)
     close_map: Dict[str, pd.Series] = {}
     open_map: Dict[str, pd.Series] = {}
-    idx_union: Optional[pd.Index] = None
     for sym in ALL_SYMBOLS:
         df = hist_frames.get(sym)
         if df is None or df.empty:
@@ -1245,37 +1575,27 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         open_series = open_series.fillna(close_series)
         close_map[sym] = close_series
         open_map[sym] = open_series
-        idx_union = close_series.index if idx_union is None else idx_union.union(close_series.index)
-    if idx_union is None or len(idx_union) < window + 5:
-        raise RuntimeError("Insufficient historical data from FMP")
-    idx_union = idx_union.sort_values()
-    # 2) Forward-fill gaps and apply realtime patch (close prices only)
-    aligned_close: Dict[str, pd.Series] = {}
-    aligned_open: Dict[str, pd.Series] = {}
-    for sym in ALL_SYMBOLS:
-        base_close = close_map.get(sym, pd.Series(dtype=float)).reindex(idx_union).ffill()
-        if base_close.isna().all():
-            raise RuntimeError(f"Insufficient data for {sym}")
-        aligned_close[sym] = base_close
-        base_open = open_map.get(sym, pd.Series(dtype=float)).reindex(idx_union)
-        base_open = base_open.ffill().fillna(base_close)
-        aligned_open[sym] = base_open
+    # 2) Apply realtime patch on raw close_map (before alignment).
+    patched_close_map = close_map
     if use_realtime:
         try:
             quotes = fetch_realtime_quotes_fmp(ALL_SYMBOLS, api_key)
-            aligned_close = patch_with_realtime_last_price(aligned_close, quotes)
+            patched_close_map = patch_with_realtime_last_price(close_map, quotes)
         except Exception:
             # best-effort; keep daily
-            pass
-    # 3) Align by intersection like JS (drop weekends introduced by BTC series)
-    inter_dates, inter_series_close = _align_by_intersection(aligned_close, ALL_SYMBOLS)
+            patched_close_map = close_map
+    # 3) Align by intersection like JS (only dates that actually exist for all symbols).
+    #    This naturally removes BTC 주말/공휴일 인덱스와 ETF 휴장일을 제외해 precomputed와 동일한 표본을 구성.
+    inter_dates, inter_series_close = _align_by_intersection(patched_close_map, ALL_SYMBOLS)
     if not inter_dates or len(inter_dates) < window + 5:
         raise RuntimeError("Insufficient intersected history after alignment")
     idx_inter = pd.Index(inter_dates)
-    inter_series_open: Dict[str, pd.Series] = {
-        sym: aligned_open[sym].reindex(idx_inter).ffill().fillna(inter_series_close[sym])
-        for sym in ALL_SYMBOLS
-    }
+    # Reindex opens to the same intersection; fill gaps with corresponding close.
+    inter_series_open: Dict[str, pd.Series] = {}
+    for sym in ALL_SYMBOLS:
+        base_open = open_map.get(sym, pd.Series(dtype=float))
+        aligned_open = base_open.reindex(idx_inter).ffill()
+        inter_series_open[sym] = aligned_open.fillna(inter_series_close[sym])
     dates = [d.strftime("%Y-%m-%d") for d in inter_dates]
     prices = {s: inter_series_close[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_close}
     prices_open = {s: inter_series_open[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_open}
