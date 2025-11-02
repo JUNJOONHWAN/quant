@@ -1427,8 +1427,6 @@ function computeRiskSeriesEnhanced(metrics, recordsOverride) {
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const prices = state.priceSeries || {};
   const bearDamp = createBearDamp(prices);
-
-  const bearDamp = createBearDamp(prices);
   const stockSeries = prices[SIGNAL.primaryStock] || [];
   const btcSeries = prices['BTC-USD'] || [];
 
@@ -1748,6 +1746,7 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
 
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const prices = state.priceSeries || {};
+  const bearDamp = createBearDamp(prices);
 
   const mm = new Array(length).fill(null);
   const guard = new Array(length).fill(null);
