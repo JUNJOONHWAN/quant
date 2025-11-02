@@ -12,9 +12,26 @@ import requests
 # --- Minimal, compatibility-first realtime regime engine (FMP-backed) ---
 
 # Symbols and clusters (match front-end JS defaults)
+BASE_SYMBOL = "QQQ"
+_bench_sym_env = os.getenv("REGIME_BENCH_SYMBOL", "TQQQ")
+BENCH_SYMBOL = (_bench_sym_env or "TQQQ").upper()
+try:
+    NEUTRAL_BENCH_WEIGHT = float(os.getenv("REGIME_NEUTRAL_BENCH_WEIGHT", "0.33"))
+except ValueError:
+    NEUTRAL_BENCH_WEIGHT = 0.33
+try:
+    RISK_ON_BENCH_WEIGHT = float(os.getenv("REGIME_RISK_ON_BENCH_WEIGHT", "1.0"))
+except ValueError:
+    RISK_ON_BENCH_WEIGHT = 1.0
 RISK_SYMBOLS = ["IWM", "SPY", "BTC-USD"]
 SAFE_SYMBOLS = ["TLT", "GLD"]
-ALL_SYMBOLS = ["QQQ", "IWM", "SPY", "TLT", "GLD", "BTC-USD"]
+_all_symbols_seed: List[str] = [BASE_SYMBOL]
+if BENCH_SYMBOL not in _all_symbols_seed:
+    _all_symbols_seed.append(BENCH_SYMBOL)
+for sym in ["IWM", "SPY", "TLT", "GLD", "BTC-USD"]:
+    if sym not in _all_symbols_seed:
+        _all_symbols_seed.append(sym)
+ALL_SYMBOLS = _all_symbols_seed
 SIGNAL_SYMBOLS = ["IWM", "SPY", "TLT", "GLD", "BTC-USD"]
 
 # Window options
@@ -493,7 +510,7 @@ def compute_ffl(prices: Dict[str, List[float]], dates: List[pd.Timestamp], metri
             z[s][i] = z_momentum(series, i, k, v, RISK_CFG_FFL["zSat"])
     # --- BearGuard: downside-asymmetry damper ---
     dates_idx = pd.to_datetime(pd.Index(dates))
-    risk_candidates = ["QQQ", "IWM", "BTC-USD"]
+    risk_candidates = [BASE_SYMBOL, "IWM", "BTC-USD"]
     risk_set = [s for s in risk_candidates if s in prices]
     r_star_series: Optional[pd.Series] = None
     if risk_set:
@@ -723,8 +740,8 @@ def compute_ffl(prices: Dict[str, List[float]], dates: List[pd.Timestamp], metri
         combo = combo_mom[i] if combo_mom[i] is not None else 0.0
         br = breadth[i] if breadth[i] is not None else 0.0
         # hi-corr bear & drift
-        b10 = bench_ret("QQQ", i, 10)
-        b20 = bench_ret("QQQ", i, 20)
+        b10 = bench_ret(BASE_SYMBOL, i, 10)
+        b20 = bench_ret(BASE_SYMBOL, i, 20)
         hi_corr_bear = (mmv >= 0.90) and ((b10 if b10 is not None else -1e-9) <= 0)
         hi_corr_drift = ((co_down_all[i] is not None and co_down_all[i] >= 0.60 and jv <= 0) or (mmv >= 0.90 and (b20 if b20 is not None else -1e-9) <= 0))
         if hi_corr_drift:
@@ -1059,11 +1076,8 @@ def compute_fusion(classic: Tuple[List[str], List[float], List[int], List[float]
     }
 
 
-def leveraged_return(r: float, leverage: int = 3, weight: float = 1.0) -> float:
-    if not np.isfinite(r):
-        return 0.0
-    eff_weight = float(weight) if np.isfinite(weight) else 1.0
-    return max(-0.99, eff_weight * leverage * r)
+def leveraged_return(r: float, leverage: int = 3) -> float:
+    return max(-0.99, leverage * r)
 
 
 def backtest_from_state(
@@ -1075,34 +1089,54 @@ def backtest_from_state(
     *,
     price_mode: str = "close",
     prices_open: Optional[List[float]] = None,
-    neutral_weight: float = 1.0 / 3.0,
+    benchmark_close: Optional[List[float]] = None,
+    benchmark_open: Optional[List[float]] = None,
+    neutral_bench_weight: Optional[float] = None,
+    risk_on_bench_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     # Use arithmetic returns to match JS/UI backtest and CSV expectations
     mode = "open" if price_mode == "open" else "close"
-    series = prices_close
-    if mode == "open" and isinstance(prices_open, list) and len(prices_open) >= 2:
-        series = [
-            float(prices_open[idx])
-            if idx < len(prices_open) and np.isfinite(prices_open[idx])
-            else float(prices_close[idx]) if idx < len(prices_close) and np.isfinite(prices_close[idx])
-            else np.nan
-            for idx in range(len(prices_close))
-        ]
-    rets: List[float] = [0.0]
-    for i in range(1, len(series)):
-        a, b = series[i - 1], series[i]
-        if np.isfinite(a) and np.isfinite(b) and a != 0:
-            rets.append(b / a - 1.0)
-        else:
-            rets.append(0.0)
-    if len(rets) < len(state) + 1:
-        rets.extend([0.0] * (len(state) + 1 - len(rets)))
+
+    def _select_series(close: List[float], open_: Optional[List[float]]) -> List[float]:
+        if mode == "open" and isinstance(open_, list) and len(open_) >= 2:
+            return open_
+        return close
+
+    def _to_returns(series: Optional[List[float]]) -> List[float]:
+        out: List[float] = [0.0]
+        if not isinstance(series, list):
+            return out
+        for i in range(1, len(series)):
+            a, b = series[i - 1], series[i]
+            if np.isfinite(a) and np.isfinite(b) and a != 0:
+                out.append(b / a - 1.0)
+            else:
+                out.append(0.0)
+        return out
+
+    series = _select_series(prices_close, prices_open)
+    use_benchmark = bool(benchmark_close or benchmark_open)
+    bench_series = _select_series(
+        benchmark_close if benchmark_close is not None else prices_close,
+        benchmark_open if benchmark_open is not None else prices_open,
+    )
+
+    rets_base = _to_returns(series)
+    rets_bench = _to_returns(bench_series)
+
+    neutral_weight = (
+        NEUTRAL_BENCH_WEIGHT if neutral_bench_weight is None else neutral_bench_weight
+    )
+    risk_on_weight = (
+        RISK_ON_BENCH_WEIGHT if risk_on_bench_weight is None else risk_on_bench_weight
+    )
+
     # Align: dates length == len(series). Strategy rets length equals len(dates)
     # We map each regime day to return at same index (already aligned to window slicing externally)
-    strat_eq = []
-    bh_eq = []
-    base_returns: List[float] = []
-    strat_returns: List[float] = []
+    strat_eq: List[float] = []
+    bh_eq: List[float] = []
+    strat_rets: List[float] = []
+    bench_rets: List[float] = []
     s = 1.0
     b = 1.0
     # Build executed state with delay
@@ -1111,19 +1145,25 @@ def backtest_from_state(
         j = i - delay_days
         exec_state[i] = state[j] if j >= 0 else 0
     for i in range(len(state)):
-        # Map regime day i to corresponding benchmark return r[i]
-        idx_ret = i + 1
-        r = rets[idx_ret] if idx_ret < len(rets) else 0.0
-        base_returns.append(r)
+        r_base = rets_base[i] if i < len(rets_base) else 0.0
+        r_bench = rets_bench[i] if i < len(rets_bench) else r_base
         if exec_state[i] > 0:
-            step_ret = leveraged_return(r, leverage, 1.0)
+            if use_benchmark:
+                step_ret = risk_on_weight * r_bench
+            else:
+                step_ret = leveraged_return(r_base, leverage)
         elif exec_state[i] < 0:
             step_ret = 0.0
         else:
-            step_ret = leveraged_return(r, leverage, neutral_weight)
-        strat_returns.append(step_ret)
+            if use_benchmark:
+                step_ret = neutral_weight * r_bench
+            else:
+                step_ret = r_base
         s *= 1.0 + step_ret
-        b *= 1.0 + r
+        bench_ret = r_bench if use_benchmark else r_base
+        b *= 1.0 + bench_ret
+        strat_rets.append(step_ret)
+        bench_rets.append(bench_ret)
         strat_eq.append(s)
         bh_eq.append(b)
     return {
@@ -1133,8 +1173,9 @@ def backtest_from_state(
         "cum_strategy": strat_eq[-1] if strat_eq else 1.0,
         "cum_bh": bh_eq[-1] if bh_eq else 1.0,
         "price_mode": mode,
-        "base_returns": base_returns,
-        "strategy_returns": strat_returns,
+        "base_returns": rets_base[:len(state)],
+        "benchmark_returns": bench_rets,
+        "strategy_returns": strat_rets,
         "executed_state": exec_state,
     }
 
@@ -1202,8 +1243,8 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         for sym in ALL_SYMBOLS
     }
     dates = [d.strftime("%Y-%m-%d") for d in inter_dates]
-    prices = {s: inter_series_close[s].astype(float).tolist() for s in ALL_SYMBOLS}
-    prices_open = {s: inter_series_open[s].astype(float).tolist() for s in ALL_SYMBOLS}
+    prices = {s: inter_series_close[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_close}
+    prices_open = {s: inter_series_open[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_open}
     # Compute window metrics for SIGNAL set
     date_idx = inter_dates
     metrics = compute_window_metrics(prices, date_idx, window)
@@ -1213,18 +1254,38 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
     ffl = compute_ffl(prices, date_idx, metrics, window, variant="stab")
     # FLL-Fusion
     all_dates = [d.strftime("%Y-%m-%d") for d in date_idx]
-    fusion = compute_fusion(classic, ffl, prices["QQQ"], window, all_dates)
+    fusion = compute_fusion(classic, ffl, prices[BASE_SYMBOL], window, all_dates)
     # Backtests (provide both 1d and 2d delays)
     # JS parity: segment should start at (window-1) to yield R+1 prices for R records
     start_idx = max(0, window - 1)
-    qqq_segment = prices["QQQ"][start_idx:]
-    qqq_open_segment = prices_open.get("QQQ", [])[start_idx:] if "QQQ" in prices_open else []
+    base_close_full = prices.get(BASE_SYMBOL, [])
+    base_open_full = prices_open.get(BASE_SYMBOL, [])
+    bench_close_full = prices.get(BENCH_SYMBOL, []) if BENCH_SYMBOL in prices else None
+    bench_open_full = prices_open.get(BENCH_SYMBOL, []) if BENCH_SYMBOL in prices_open else None
+
+    def _slice(series: Optional[List[float]]) -> List[float]:
+        if not isinstance(series, list):
+            return []
+        if start_idx <= 0:
+            return series[:]
+        if start_idx >= len(series):
+            return []
+        return series[start_idx:]
+
+    qqq_segment = _slice(base_close_full)
+    qqq_open_segment = _slice(base_open_full)
+    bench_segment = _slice(bench_close_full) if bench_close_full is not None else None
+    bench_open_segment = _slice(bench_open_full) if bench_open_full is not None else None
     bt0_close = backtest_from_state(
         qqq_segment,
         ffl["dates"],
         ffl["state"],
         delay_days=0,
         price_mode="close",
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt1_close = backtest_from_state(
         qqq_segment,
@@ -1232,6 +1293,10 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         ffl["state"],
         delay_days=1,
         price_mode="close",
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt2_close = backtest_from_state(
         qqq_segment,
@@ -1239,6 +1304,10 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         ffl["state"],
         delay_days=2,
         price_mode="close",
+        benchmark_close=bench_segment,
+        benchmark_open=None,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt1_open = backtest_from_state(
         qqq_segment,
@@ -1247,6 +1316,10 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         delay_days=1,
         price_mode="open",
         prices_open=qqq_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=bench_open_segment,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
     bt2_open = backtest_from_state(
         qqq_segment,
@@ -1255,15 +1328,25 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         delay_days=2,
         price_mode="open",
         prices_open=qqq_open_segment,
+        benchmark_close=bench_segment,
+        benchmark_open=bench_open_segment,
+        neutral_bench_weight=NEUTRAL_BENCH_WEIGHT,
+        risk_on_bench_weight=RISK_ON_BENCH_WEIGHT,
     )
+    series_payload: Dict[str, List[float]] = {BASE_SYMBOL: qqq_segment}
+    if bench_segment is not None:
+        series_payload[BENCH_SYMBOL] = bench_segment
+    series_open_payload: Dict[str, List[float]] = {BASE_SYMBOL: qqq_open_segment}
+    if bench_open_segment is not None:
+        series_open_payload[BENCH_SYMBOL] = bench_open_segment
     return {
         "window": window,
         "dates": ffl["dates"],
         "classic": {"score": classic[1], "state": classic[2]},
         "ffl_stab": ffl,
         "fusion": fusion,
-        "series": {"QQQ": qqq_segment},
-        "series_open": {"QQQ": qqq_open_segment},
+        "series": series_payload,
+        "series_open": series_open_payload,
         "stability": [float(r.get("stability", np.nan)) for r in metrics["records"]],
         "smoothed": [float(r.get("smoothed", np.nan)) for r in metrics["records"]],
         "delta": [float(r.get("delta", np.nan)) for r in metrics["records"]],

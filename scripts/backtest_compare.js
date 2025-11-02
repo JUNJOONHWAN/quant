@@ -29,8 +29,15 @@ function loadHistorical() {
 function alignFromHistorical(MM, raw, symbols) {
   const seriesList = raw.assets
     .filter((a) => symbols.includes(a.symbol))
-    .map((a) => ({ symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices }));
-  return MM.alignSeries(seriesList);
+    .map((a) => {
+      const opens = Array.isArray(a.opens) && a.opens.length === a.dates.length
+        ? a.opens
+        : a.prices;
+      return { symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices, opens };
+    });
+  const aligned = MM.alignSeries(seriesList);
+  aligned.opens = buildAlignedOpenSeries(aligned.dates, seriesList);
+  return aligned;
 }
 
 function sliceAligned(aligned, startDate, endDate) {
@@ -39,8 +46,36 @@ function sliceAligned(aligned, startDate, endDate) {
   const dates = aligned.dates.filter((d) => { const n = dateToNum(d); return n >= s && n <= e; });
   const idx = new Map(aligned.dates.map((d, i) => [d, i]));
   const prices = {};
+  const opens = {};
   Object.entries(aligned.prices).forEach(([sym, arr]) => { prices[sym] = dates.map((d) => arr[idx.get(d)]); });
-  return { dates, prices, categories: aligned.categories };
+  if (aligned.opens) {
+    Object.entries(aligned.opens).forEach(([sym, arr]) => { opens[sym] = dates.map((d) => arr[idx.get(d)]); });
+  }
+  return { dates, prices, opens, categories: aligned.categories };
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) return opens;
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) return;
+    const map = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    for (let i = 0; i < series.dates.length; i += 1) {
+      const date = series.dates[i];
+      const closeValue = Array.isArray(series.prices) ? series.prices[i] : null;
+      const openValue = hasOpens ? series.opens[i] : null;
+      const normalized = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalized)) {
+        map.set(date, normalized);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = map.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+  return opens;
 }
 
 function leveragedReturn(r, lev = 3, weight = 1) {
@@ -79,16 +114,16 @@ function buildMetrics(ctx, MM, aligned) {
   return { returns, metrics };
 }
 
-function backtestSeries(series, pricesQQQ) {
+function backtestSeries(series, pricesQQQ, opensQQQ) {
   if (!series || !Array.isArray(series.state) || series.state.length === 0) return null;
   const windowOffset = Math.max(1, WINDOW - 1);
   const dates = series.dates;
   const baseRet = [];
   for (let i = 0; i < dates.length; i += 1) {
     const idx = windowOffset + i;
-    const prev = pricesQQQ[idx - 1];
-    const cur = pricesQQQ[idx];
-    baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
+    const prevOpen = Number.isFinite(opensQQQ[idx - 1]) ? opensQQQ[idx - 1] : pricesQQQ[idx - 1];
+    const curOpen = Number.isFinite(opensQQQ[idx]) ? opensQQQ[idx] : pricesQQQ[idx];
+    baseRet.push(Number.isFinite(prevOpen) && Number.isFinite(curOpen) && prevOpen !== 0 ? (curOpen / prevOpen - 1) : 0);
   }
   const executed = Array.isArray(series.executedState) && series.executedState.length === series.state.length
     ? series.executedState
@@ -122,6 +157,7 @@ async function main() {
   const ctx = createAppContext(MM);
   const { returns, metrics } = buildMetrics(ctx, MM, aligned);
   const pricesQQQ = returns.priceSeries['QQQ'];
+  const opensQQQ = aligned.opens && aligned.opens['QQQ'] ? aligned.opens['QQQ'] : pricesQQQ;
 
   // Classic
   const classic = ctx.computeRiskSeriesClassic(metrics, metrics.records);
@@ -141,8 +177,10 @@ async function main() {
   const windowOffset = WINDOW - 1;
   const baseRet = [];
   for (let i = 0; i < metrics.records.length; i += 1) {
-    const idx = windowOffset + i; const prev = pricesQQQ[idx - 1]; const cur = pricesQQQ[idx];
-    baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
+    const idx = windowOffset + i;
+    const prevOpen = Number.isFinite(opensQQQ[idx - 1]) ? opensQQQ[idx - 1] : pricesQQQ[idx - 1];
+    const curOpen = Number.isFinite(opensQQQ[idx]) ? opensQQQ[idx] : pricesQQQ[idx];
+    baseRet.push(Number.isFinite(prevOpen) && Number.isFinite(curOpen) && prevOpen !== 0 ? (curOpen / prevOpen - 1) : 0);
   }
   const eqBH = equityFromReturns(baseRet);
   const totalBH = eqBH[eqBH.length - 1] - 1;
@@ -155,11 +193,11 @@ async function main() {
   }
 
   console.log(`Compare (QQQ) | Window ${WINDOW} | ${START} ~ ${END}`);
-  summarize('Classic', backtestSeries(classic, pricesQQQ));
-  summarize('Enhanced', backtestSeries(enhanced, pricesQQQ));
-  summarize('FFL', backtestSeries(ffl, pricesQQQ));
-  summarize('FFL+EXP', backtestSeries(fflExp, pricesQQQ));
-  summarize('FFL+STAB', backtestSeries(fflStab, pricesQQQ));
+  summarize('Classic', backtestSeries(classic, pricesQQQ, opensQQQ));
+  summarize('Enhanced', backtestSeries(enhanced, pricesQQQ, opensQQQ));
+  summarize('FFL', backtestSeries(ffl, pricesQQQ, opensQQQ));
+  summarize('FFL+EXP', backtestSeries(fflExp, pricesQQQ, opensQQQ));
+  summarize('FFL+STAB', backtestSeries(fflStab, pricesQQQ, opensQQQ));
   console.log(`Bench QQQ: Total ${formatPct(totalBH)} | CAGR ${formatPct(cagrBH)} | MDD ${formatPct(mddBH)}`);
 }
 

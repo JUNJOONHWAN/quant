@@ -21,8 +21,39 @@ function dateToNum(s) { return Number(s.replace(/-/g, '')); }
 function alignFromHistorical(raw, symbols) {
   const seriesList = raw.assets
     .filter((a) => symbols.includes(a.symbol))
-    .map((a) => ({ symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices }));
-  return MM.alignSeries(seriesList);
+    .map((a) => {
+      const opens = Array.isArray(a.opens) && a.opens.length === a.dates.length
+        ? a.opens
+        : a.prices;
+      return { symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices, opens };
+    });
+  const aligned = MM.alignSeries(seriesList);
+  aligned.opens = buildAlignedOpenSeries(aligned.dates, seriesList);
+  return aligned;
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) return opens;
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) return;
+    const map = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    for (let i = 0; i < series.dates.length; i += 1) {
+      const date = series.dates[i];
+      const closeValue = Array.isArray(series.prices) ? series.prices[i] : null;
+      const openValue = hasOpens ? series.opens[i] : null;
+      const normalized = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalized)) {
+        map.set(date, normalized);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = map.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+  return opens;
 }
 
 function sliceAligned(aligned, startDate, endDate) {
@@ -34,10 +65,16 @@ function sliceAligned(aligned, startDate, endDate) {
   });
   const map = new Map(aligned.dates.map((d, i) => [d, i]));
   const prices = {};
+  const opens = {};
   Object.entries(aligned.prices).forEach(([sym, arr]) => {
     prices[sym] = dates.map((d) => arr[map.get(d)]);
   });
-  return { dates, prices, categories: aligned.categories };
+  if (aligned.opens) {
+    Object.entries(aligned.opens).forEach(([sym, arr]) => {
+      opens[sym] = dates.map((d) => arr[map.get(d)]);
+    });
+  }
+  return { dates, prices, opens, categories: aligned.categories };
 }
 
 function leveragedReturn(r, lev = 3, weight = 1) {
@@ -119,13 +156,14 @@ async function main() {
 
   const dates = engineOut.dates;
   const base = returns.priceSeries['QQQ'];
+  const baseOpen = aligned.opens && aligned.opens['QQQ'] ? aligned.opens['QQQ'] : base;
   const priceOffset = WINDOW - 1;
   const baseRet = [];
   for (let i = 0; i < dates.length; i += 1) {
     const idx = priceOffset + i;
-    const prev = base[idx - 1];
-    const cur = base[idx];
-    baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
+    const prevOpen = Number.isFinite(baseOpen[idx - 1]) ? baseOpen[idx - 1] : base[idx - 1];
+    const curOpen = Number.isFinite(baseOpen[idx]) ? baseOpen[idx] : base[idx];
+    baseRet.push(Number.isFinite(prevOpen) && Number.isFinite(curOpen) && prevOpen !== 0 ? (curOpen / prevOpen - 1) : 0);
   }
 
   const executed = engineOut.executedState;

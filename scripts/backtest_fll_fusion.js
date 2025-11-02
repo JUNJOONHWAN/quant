@@ -420,25 +420,21 @@ async function main() {
   const px = prices[baseSym];
   const ox = openSeries[baseSym] || px;
   const baseRet = [];
-  const openToCloseRet = [];
   const priceOffset = WINDOW - 1;
   for (let i = 0; i < dates.length; i += 1) {
     const idx = priceOffset + i;
-    const prev = px[idx - 1];
-    const cur = px[idx];
-    baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
-    const openPrice = ox[idx];
-    const closePrice = cur;
-    const oc = Number.isFinite(openPrice) && Number.isFinite(closePrice) && openPrice !== 0
-      ? (closePrice / openPrice) - 1
-      : baseRet[i];
-    openToCloseRet.push(oc);
+    const prevOpen = Number.isFinite(ox[idx - 1]) ? ox[idx - 1] : px[idx - 1];
+    const curOpen = Number.isFinite(ox[idx]) ? ox[idx] : px[idx];
+    const r = Number.isFinite(prevOpen) && Number.isFinite(curOpen) && prevOpen !== 0
+      ? (curOpen / prevOpen) - 1
+      : 0;
+    baseRet.push(r);
   }
   const executed = fusion.executedState; const lev = SIGNAL.trade.leverage;
   const neutralWeight = Number.isFinite(SIGNAL.trade.neutralWeight) ? SIGNAL.trade.neutralWeight : 0;
   const stratRet = executed.map((reg, i) => {
-    const on = leveragedReturn(openToCloseRet[i], lev, 1);
-    const neutral = neutralWeight !== 0 ? leveragedReturn(openToCloseRet[i], lev, neutralWeight) : 0;
+    const on = leveragedReturn(baseRet[i], lev, 1);
+    const neutral = neutralWeight !== 0 ? leveragedReturn(baseRet[i], lev, neutralWeight) : 0;
     if (reg > 0) return on;
     if (reg < 0) return 0;
     return neutral;

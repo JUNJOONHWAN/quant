@@ -45,8 +45,15 @@ function createAppContext(MM) {
 function alignFromHistorical(MM, raw, symbols) {
   const seriesList = raw.assets
     .filter((a) => symbols.includes(a.symbol))
-    .map((a) => ({ symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices }));
-  return MM.alignSeries(seriesList);
+    .map((a) => {
+      const opens = Array.isArray(a.opens) && a.opens.length === a.dates.length
+        ? a.opens
+        : a.prices;
+      return { symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices, opens };
+    });
+  const aligned = MM.alignSeries(seriesList);
+  aligned.opens = buildAlignedOpenSeries(aligned.dates, seriesList);
+  return aligned;
 }
 
 function sliceAligned(aligned, startDate, endDate) {
@@ -55,7 +62,35 @@ function sliceAligned(aligned, startDate, endDate) {
   const dates = aligned.dates.filter((d) => { const n = dateToNum(d); return n >= s && n <= e; });
   const idx = new Map(aligned.dates.map((d, i) => [d, i]));
   const prices = {}; Object.entries(aligned.prices).forEach(([sym, arr]) => { prices[sym] = dates.map((d) => arr[idx.get(d)]); });
-  return { dates, prices, categories: aligned.categories };
+  const opens = {};
+  if (aligned.opens) {
+    Object.entries(aligned.opens).forEach(([sym, arr]) => { opens[sym] = dates.map((d) => arr[idx.get(d)]); });
+  }
+  return { dates, prices, opens, categories: aligned.categories };
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) return opens;
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) return;
+    const map = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    for (let i = 0; i < series.dates.length; i += 1) {
+      const date = series.dates[i];
+      const closeValue = Array.isArray(series.prices) ? series.prices[i] : null;
+      const openValue = hasOpens ? series.opens[i] : null;
+      const normalized = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalized)) {
+        map.set(date, normalized);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = map.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+  return opens;
 }
 
 function leveragedReturn(r, lev = 3, weight = 1) {
@@ -69,12 +104,14 @@ function maxDrawdown(eq) { let p = eq[0] || 1; let m = 0; for (const v of eq) { 
 function annualize(days, total) { const y = Math.max(days / 252, 1e-9); return Math.pow(1 + total, 1 / y) - 1; }
 function hitRate(sig, fwd, skipNeutral = true) { let w = 0; let c = 0; for (let i = 0; i < Math.min(sig.length, fwd.length); i += 1) { const s = sig[i]; if (skipNeutral && s === 0) continue; const r = fwd[i]; if (Number.isFinite(r)) { if ((s > 0 && r > 0) || (s < 0 && r < 0)) w += 1; c += 1; } } return c > 0 ? (w / c) : 0; }
 
-function computeBaseReturns(pricesQQQ, windowSize) {
+function computeBaseReturns(pricesQQQ, opensQQQ, windowSize) {
   const windowOffset = Math.max(1, windowSize - 1);
   const baseRet = [];
   for (let i = 0; i < pricesQQQ.length; i += 1) {
-    const idx = windowOffset + i; const prev = pricesQQQ[idx - 1]; const cur = pricesQQQ[idx];
-    baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
+    const idx = windowOffset + i;
+    const prevOpen = Number.isFinite(opensQQQ[idx - 1]) ? opensQQQ[idx - 1] : pricesQQQ[idx - 1];
+    const curOpen = Number.isFinite(opensQQQ[idx]) ? opensQQQ[idx] : pricesQQQ[idx];
+    baseRet.push(Number.isFinite(prevOpen) && Number.isFinite(curOpen) && prevOpen !== 0 ? (curOpen / prevOpen - 1) : 0);
   }
   return baseRet;
 }
@@ -140,7 +177,8 @@ function scoreSet(ctx, MM, aligned, startDate, endDate, stabTune) {
   const series = ctx.computeRiskSeriesFFL(metrics, metrics.records);
   if (!series || !Array.isArray(series.state)) return null;
   const pricesQQQ = returns.priceSeries['QQQ'];
-  const baseRet = computeBaseReturns(pricesQQQ, 30);
+  const opensQQQ = alignedSlice.opens && alignedSlice.opens['QQQ'] ? alignedSlice.opens['QQQ'] : pricesQQQ;
+  const baseRet = computeBaseReturns(pricesQQQ, opensQQQ, 30);
   const executed = series.executedState.map((v,i)=> (i===0?0:series.executedState[i]));
   const neutralWeight = 0.33;
   const strat = executed.map((reg,i)=>{
