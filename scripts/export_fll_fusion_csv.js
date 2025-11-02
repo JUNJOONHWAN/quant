@@ -62,28 +62,14 @@ if (!filtered || filtered.empty) {
   throw new Error('Filtered records unavailable; check start/end dates.');
 }
 
-const series = context.computeRiskSeriesFLLFusion(metrics30, filtered.records);
-const backtest = context.evaluateBacktestSeries(series, metrics30, filtered.records);
-
 vm.runInContext(`state.customRange = { start: '${START}', end: '${END}', valid: true };`, context);
 
-const benchmarkSymbol = vm.runInContext('state.benchmark?.symbol || SIGNAL.trade.baseSymbol', context);
-const leveredSymbol = vm.runInContext('state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol', context);
-const priceQQQ = Array.isArray(backtest.priceQQQ) ? backtest.priceQQQ : [];
-const priceLevered = Array.isArray(backtest.priceLevered) ? backtest.priceLevered : [];
+const payload = vm.runInContext('buildBacktestCsv()', context);
+if (!payload || typeof payload.csv !== 'string') {
+  throw new Error('Failed to build CSV payload via app.js helpers.');
+}
 
-const header = `date,regime,executed,ret_bench,ret_strategy,eq_strategy,eq_benchmark,price_${benchmarkSymbol.toLowerCase()},price_${leveredSymbol.toLowerCase()}\n`;
-const rows = backtest.dates.map((date, idx) => [
-  date,
-  series.state[idx],
-  backtest.executedState[idx],
-  backtest.baseReturns[idx].toFixed(8),
-  backtest.stratReturns[idx].toFixed(8),
-  backtest.equityStrategy[idx].toFixed(8),
-  backtest.equityBenchmark[idx].toFixed(8),
-  (Number.isFinite(priceQQQ[idx]) ? Number(priceQQQ[idx]).toFixed(8) : '0.00000000'),
-  (Number.isFinite(priceLevered[idx]) ? Number(priceLevered[idx]).toFixed(8) : '0.00000000'),
-].join(','));
-
-fs.writeFileSync(OUTPUT, header + rows.join('\n'));
-console.log(`Exported ${rows.length} rows to ${OUTPUT}`);
+fs.writeFileSync(OUTPUT, payload.csv);
+const lines = payload.csv.trim().split(/\r?\n/);
+const rowCount = Math.max(0, lines.length - 1);
+console.log(`Exported ${rowCount} rows to ${OUTPUT}`);

@@ -876,6 +876,7 @@ function populateControls() {
 
   const refreshButton = document.getElementById('refresh-button');
   const downloadButton = document.getElementById('download-report');
+  const downloadCsvButton = document.getElementById('download-csv-report');
   const startInput = document.getElementById('custom-start');
   const endInput = document.getElementById('custom-end');
 
@@ -901,6 +902,13 @@ function populateControls() {
       downloadButton.dataset.bound = 'true';
     }
   }
+  if (downloadCsvButton) {
+    downloadCsvButton.disabled = !canBuildTextReport();
+    if (!downloadCsvButton.dataset.bound) {
+      downloadCsvButton.addEventListener('click', handleDownloadCsv);
+      downloadCsvButton.dataset.bound = 'true';
+    }
+  }
 
   const handleCustomRangeChange = () => {
     state.customRange.start = startInput?.value || null;
@@ -922,13 +930,14 @@ function populateControls() {
       return;
     }
 
-    if (hasSelection) {
-      setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
-    } else {
-      setCustomRangeFeedback('');
-    }
-    scheduleRender();
-  };
+  if (hasSelection) {
+    setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
+  } else {
+    setCustomRangeFeedback('');
+  }
+  updateDownloadButtonState();
+  scheduleRender();
+};
 
   if (startInput && !startInput.dataset.bound) {
     startInput.addEventListener('change', handleCustomRangeChange);
@@ -1335,6 +1344,39 @@ function computeAnnualizedReturn(equitySeries, sampleCount) {
   return Math.pow(finalEquity, 1 / years) - 1;
 }
 
+function computeRiskSeriesForMode(metrics, records) {
+  if (!metrics || !Array.isArray(records)) {
+    return null;
+  }
+  return state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, records)
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, records)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, records)
+        : computeRiskSeriesClassic(metrics, records));
+}
+
+function resolveBacktestContext() {
+  const metrics = state.metrics[state.window];
+  if (!metrics) {
+    return null;
+  }
+  const filtered = getFilteredRecords(metrics);
+  if (!filtered || filtered.empty || !Array.isArray(filtered.records) || filtered.records.length === 0) {
+    return null;
+  }
+  const riskSeries = computeRiskSeriesForMode(metrics, filtered.records);
+  if (!riskSeries) {
+    return null;
+  }
+  const backtest = evaluateBacktestSeries(riskSeries, metrics, filtered.records);
+  if (!backtest) {
+    return null;
+  }
+  return { metrics, filtered, riskSeries, backtest };
+}
+
 function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const tradeConfig = SIGNAL.trade;
   const baseSymbol = tradeConfig.baseSymbol;
@@ -1352,20 +1394,24 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const prices = state.priceSeries[baseSymbol] || [];
   const opens = state.priceSeriesOpen?.[baseSymbol] || [];
   const leveredCloses = state.leveredSeries?.[leveredSymbol]?.close || [];
+  const leveredOpens = state.leveredSeries?.[leveredSymbol]?.open || [];
 
   const baseReturns = [];
+  const leveredReturns = [];
   const priceQQQ = [];
   const priceLevered = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
+    const openNow = Number.isFinite(opens?.[priceIndex]) ? Number(opens[priceIndex]) : null;
+    const openPrev = Number.isFinite(opens?.[prevIndex]) ? Number(opens[prevIndex]) : null;
     let openReturn = 0;
     if (
-      opens[priceIndex] != null
-      && opens[prevIndex] != null
-      && opens[prevIndex] !== 0
+      openNow != null
+      && openPrev != null
+      && openPrev !== 0
     ) {
-      openReturn = opens[priceIndex] / opens[prevIndex] - 1;
+      openReturn = openNow / openPrev - 1;
     } else if (
       prices[priceIndex] != null
       && prices[prevIndex] != null
@@ -1374,10 +1420,33 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
       openReturn = prices[priceIndex] / prices[prevIndex] - 1;
     }
     baseReturns.push(openReturn);
-    const qqqClose = Number.isFinite(prices?.[priceIndex]) ? Number(prices[priceIndex]) : null;
-    const leveredClose = Number.isFinite(leveredCloses?.[priceIndex]) ? Number(leveredCloses[priceIndex]) : null;
-    priceQQQ.push(qqqClose);
-    priceLevered.push(leveredClose);
+    let leveredReturn = 0;
+    const leveredOpenNow = Number.isFinite(leveredOpens?.[priceIndex]) ? Number(leveredOpens[priceIndex]) : null;
+    const leveredOpenPrev = Number.isFinite(leveredOpens?.[prevIndex]) ? Number(leveredOpens[prevIndex]) : null;
+    if (
+      leveredOpenNow != null
+      && leveredOpenPrev != null
+      && leveredOpenPrev !== 0
+    ) {
+      leveredReturn = leveredOpenNow / leveredOpenPrev - 1;
+    } else if (
+      leveredCloses[priceIndex] != null
+      && leveredCloses[prevIndex] != null
+      && leveredCloses[prevIndex] !== 0
+    ) {
+      leveredReturn = leveredCloses[priceIndex] / leveredCloses[prevIndex] - 1;
+    } else {
+      leveredReturn = leveragedReturn(openReturn, tradeConfig.leverage, 1);
+    }
+    leveredReturns.push(leveredReturn);
+    const qqqPrice = openNow != null
+      ? openNow
+      : (Number.isFinite(prices?.[priceIndex]) ? Number(prices[priceIndex]) : null);
+    const leveredPrice = leveredOpenNow != null
+      ? leveredOpenNow
+      : (Number.isFinite(leveredCloses?.[priceIndex]) ? Number(leveredCloses[priceIndex]) : null);
+    priceQQQ.push(qqqPrice);
+    priceLevered.push(leveredPrice);
   }
 
   const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
@@ -1386,11 +1455,15 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const neutralWeight = Number.isFinite(tradeConfig.neutralWeight) ? tradeConfig.neutralWeight : 0;
 
   const stratReturns = executedState.map((regime, idx) => {
-    const baseRet = baseReturns[idx];
-    const onReturn = leveragedReturn(baseRet, tradeConfig.leverage, 1);
-    const neutralReturn = neutralWeight !== 0 ? leveragedReturn(baseRet, tradeConfig.leverage, neutralWeight) : 0;
+    const baseRet = Number.isFinite(baseReturns[idx]) ? baseReturns[idx] : 0;
+    const leveredRet = Number.isFinite(leveredReturns[idx])
+      ? leveredReturns[idx]
+      : leveragedReturn(baseRet, tradeConfig.leverage, 1);
+    const neutralReturn = neutralWeight !== 0
+      ? Math.max(-0.99, leveredRet * neutralWeight)
+      : 0;
     if (regime > 0) {
-      return onReturn;
+      return leveredRet;
     }
     if (regime < 0) {
       return 0;
@@ -1400,15 +1473,31 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
 
   const equityStrategy = [];
   const equityBenchmark = [];
+  const equityLevered = [];
   let eqStrat = 1;
   let eqBench = 1;
+  let eqLevered = 1;
   for (let i = 0; i < stratReturns.length; i += 1) {
     const stratRet = Number.isFinite(stratReturns[i]) ? stratReturns[i] : 0;
     const benchRet = Number.isFinite(baseReturns[i]) ? baseReturns[i] : 0;
+    const leveredRet = Number.isFinite(leveredReturns[i])
+      ? leveredReturns[i]
+      : leveragedReturn(benchRet, tradeConfig.leverage, 1);
     eqStrat *= 1 + stratRet;
     eqBench *= 1 + benchRet;
-    equityStrategy.push(Number(eqStrat.toFixed(6)));
-    equityBenchmark.push(Number(eqBench.toFixed(6)));
+    eqLevered *= 1 + leveredRet;
+    equityStrategy.push(Number(eqStrat.toFixed(8)));
+    equityBenchmark.push(Number(eqBench.toFixed(8)));
+    equityLevered.push(Number(eqLevered.toFixed(8)));
+  }
+  const normalizedLevered = equityLevered.slice();
+  const initialLevered = normalizedLevered.find((value) => Number.isFinite(value) && value !== 0);
+  if (Number.isFinite(initialLevered) && initialLevered !== 0) {
+    for (let i = 0; i < normalizedLevered.length; i += 1) {
+      if (Number.isFinite(normalizedLevered[i])) {
+        normalizedLevered[i] = Number((normalizedLevered[i] / initialLevered).toFixed(6));
+      }
+    }
   }
 
   const ret = baseReturns;
@@ -1437,9 +1526,11 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     dates,
     executedState,
     baseReturns,
+    leveredReturns,
     stratReturns,
     equityStrategy,
     equityBenchmark,
+    equityLevered: normalizedLevered,
     hit1,
     hit5,
     maxDrawdownStrategy,
@@ -1468,13 +1559,7 @@ function renderBacktest() {
     return;
   }
 
-  const series = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, filtered)
-      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, filtered)
-        : computeRiskSeriesClassic(metrics, filtered));
+  const series = computeRiskSeriesForMode(metrics, filtered);
   if (!series) return;
 
   const backtest = evaluateBacktestSeries(series, metrics, filtered);
@@ -1538,13 +1623,7 @@ function renderAlerts() {
   if (!box || !metrics) return;
   const { records: filtered, empty } = getFilteredRecords(metrics);
   if (empty) { box.innerHTML = ''; return; }
-  const series = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, filtered)
-      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, filtered)
-        : computeRiskSeriesClassic(metrics, filtered));
+  const series = computeRiskSeriesForMode(metrics, filtered);
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -2976,15 +3055,26 @@ function handleDownloadReport(event) {
   }
 }
 
+function handleDownloadCsv(event) {
+  if (event) {
+    event.preventDefault();
+  }
+  try {
+    const payload = buildBacktestCsv();
+    triggerCsvDownload(payload.csv, payload.filename);
+  } catch (error) {
+    console.error('CSV 다운로드 실패', error);
+    showError('CSV를 생성하지 못했습니다. 화면 데이터가 충분한지 확인한 뒤 다시 시도해 주세요.');
+  }
+}
+
 function buildTextReportPayload() {
-  const metrics = state.metrics[state.window];
-  if (!metrics) {
-    throw new Error('metrics-unavailable');
+  const contextInfo = resolveBacktestContext();
+  if (!contextInfo) {
+    throw new Error('backtest-unavailable');
   }
-  const { records, empty, rangeLabel } = getFilteredRecords(metrics);
-  if (empty || !Array.isArray(records) || records.length === 0) {
-    throw new Error('records-unavailable');
-  }
+  const { metrics, filtered, riskSeries, backtest } = contextInfo;
+  const { records, rangeLabel } = filtered;
   const latest = records[records.length - 1];
   if (!latest) {
     throw new Error('latest-record-missing');
@@ -2992,14 +3082,7 @@ function buildTextReportPayload() {
   const first = records[0];
   const generatedAt = state.generatedAt instanceof Date ? state.generatedAt : new Date();
   const rangeText = rangeLabel || `${state.range}일`;
-  const riskSeries = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, records)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, records)
-      : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, records)
-        : computeRiskSeriesClassic(metrics, records);
-  const backtestSummary = riskSeries ? evaluateBacktestSeries(riskSeries, metrics, records) : null;
+  const backtestSummary = backtest;
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',
@@ -3048,6 +3131,21 @@ function triggerTextDownload(text, filename) {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename || 'stability-report.txt';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function triggerCsvDownload(csv, filename) {
+  if (!csv) {
+    throw new Error('empty-csv');
+  }
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename || 'backtest.csv';
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
@@ -3303,6 +3401,7 @@ function buildBacktestDailySection(backtest, riskSeries) {
   const stratEquity = Array.isArray(backtest.equityStrategy) ? backtest.equityStrategy : [];
   const qqqPrices = Array.isArray(backtest.priceQQQ) ? backtest.priceQQQ : [];
   const leveredPrices = Array.isArray(backtest.priceLevered) ? backtest.priceLevered : [];
+  const leveredEquity = Array.isArray(backtest.equityLevered) ? backtest.equityLevered : [];
   const leveredLabel = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
 
   const headers = [
@@ -3311,10 +3410,11 @@ function buildBacktestDailySection(backtest, riskSeries) {
     'Executed',
     'ret_bench',
     'ret_strategy',
+    `${SIGNAL.trade.baseSymbol} 시초가`,
+    `${leveredLabel} 시초가`,
     'eq_strategy',
     'eq_benchmark',
-    `${SIGNAL.trade.baseSymbol} 종가`,
-    `${leveredLabel} 종가`,
+    'eq_tqqq',
   ];
 
   const rows = [];
@@ -3335,15 +3435,48 @@ function buildBacktestDailySection(backtest, riskSeries) {
       exec,
       formatDecimal(benchReturn, 8),
       formatDecimal(stratReturn, 8),
-      formatDecimal(eqStrat, 8),
-      formatDecimal(eqBench, 8),
       formatDecimal(qqqPrice, 8, '0.00000000'),
       formatDecimal(leveredPrice, 8, '0.00000000'),
+      formatDecimal(eqStrat, 8, '1.00000000'),
+      formatDecimal(eqBench, 8, '1.00000000'),
+      formatDecimal(leveredEquity?.[i], 8, '1.00000000'),
     ]);
   }
 
   lines.push(...formatTable(headers, rows));
   return lines;
+}
+
+function buildBacktestCsv() {
+  const contextInfo = resolveBacktestContext();
+  if (!contextInfo) {
+    throw new Error('backtest-unavailable');
+  }
+  const { riskSeries, backtest } = contextInfo;
+  const leveredLabel = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
+  const header = `date,regime,executed,ret_bench,ret_strategy,price_${SIGNAL.trade.baseSymbol.toLowerCase()},price_${leveredLabel.toLowerCase()},eq_strategy,eq_benchmark,eq_${leveredLabel.toLowerCase()}`;
+  const rows = [];
+  for (let i = 0; i < backtest.dates.length; i += 1) {
+    const date = backtest.dates[i];
+    const regime = Number.isFinite(riskSeries?.state?.[i]) ? riskSeries.state[i] : 0;
+    const executed = Number.isFinite(backtest.executedState?.[i])
+      ? backtest.executedState[i]
+      : (i === 0 ? 0 : backtest.executedState?.[i - 1] || 0);
+    const retBench = formatDecimal(backtest.baseReturns?.[i], 8);
+    const retStrat = formatDecimal(backtest.stratReturns?.[i], 8);
+    const priceQQQ = formatDecimal(backtest.priceQQQ?.[i], 8, '0.00000000');
+    const priceLevered = formatDecimal(backtest.priceLevered?.[i], 8, '0.00000000');
+    const eqStrat = formatDecimal(backtest.equityStrategy?.[i], 8, '1.00000000');
+    const eqBench = formatDecimal(backtest.equityBenchmark?.[i], 8, '1.00000000');
+    const eqLevered = formatDecimal(backtest.equityLevered?.[i], 8, '1.00000000');
+    rows.push([date, regime, executed, retBench, retStrat, priceQQQ, priceLevered, eqStrat, eqBench, eqLevered].join(','));
+  }
+  const csv = `${header}\n${rows.join('\n')}`;
+
+  const latest = backtest.dates[backtest.dates.length - 1] || 'export';
+  const stamp = latest.replace(/[^0-9]/g, '') || formatDateToken(new Date());
+  const filename = `backtest-${stamp}.csv`;
+  return { csv, filename };
 }
 
 function buildPriceSection(records) {
@@ -3574,20 +3707,22 @@ function formatDateToken(value) {
 
 function canBuildTextReport() {
   try {
-    const metrics = state.metrics[state.window];
-    if (!metrics) return false;
-    const { records, empty } = getFilteredRecords(metrics);
-    if (empty || !Array.isArray(records) || records.length === 0) return false;
-    return true;
+    return Boolean(resolveBacktestContext());
   } catch (error) {
     return false;
   }
 }
 
 function updateDownloadButtonState() {
-  const button = document.getElementById('download-report');
-  if (!button) return;
-  button.disabled = !canBuildTextReport();
+  const txtButton = document.getElementById('download-report');
+  const csvButton = document.getElementById('download-csv-report');
+  const disabled = !canBuildTextReport();
+  if (txtButton) {
+    txtButton.disabled = disabled;
+  }
+  if (csvButton) {
+    csvButton.disabled = disabled;
+  }
 }
 
 async function maybeRefreshData() {
