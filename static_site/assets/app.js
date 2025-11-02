@@ -2963,6 +2963,7 @@ function buildTextReportPayload() {
     buildRiskScoreSection(riskSeries),
     buildRegimeTimelineSection(riskSeries),
     buildBacktestSummarySection(backtestSummary, riskSeries),
+    buildBacktestDailySection(backtestSummary, riskSeries),
     buildPriceSection(records),
     buildHeatmapSection(metrics),
     buildPairSection(),
@@ -3225,8 +3226,60 @@ function buildBacktestSummarySection(backtest, riskSeries) {
   return lines;
 }
 
+function buildBacktestDailySection(backtest, riskSeries) {
+  const lines = ['[6. 백테스트 일자별 기록]'];
+  if (
+    !backtest
+    || !Array.isArray(backtest.dates)
+    || !Array.isArray(backtest.baseReturns)
+    || !Array.isArray(backtest.stratReturns)
+  ) {
+    lines.push('- 일자별 백테스트 데이터를 계산하지 못했습니다.');
+    return lines;
+  }
+
+  const states = Array.isArray(riskSeries?.state) ? riskSeries.state : [];
+  const executed = Array.isArray(backtest.executedState) ? backtest.executedState : [];
+  const benchEquity = Array.isArray(backtest.equityBenchmark) ? backtest.equityBenchmark : [];
+  const stratEquity = Array.isArray(backtest.equityStrategy) ? backtest.equityStrategy : [];
+
+  const headers = [
+    '날짜',
+    'Regime',
+    'Executed',
+    'ret_bench',
+    'ret_strategy',
+    'eq_strategy',
+    'eq_benchmark',
+  ];
+
+  const rows = [];
+  for (let i = 0; i < backtest.dates.length; i += 1) {
+    const date = backtest.dates[i];
+    const regime = Number.isFinite(states?.[i]) ? states[i] : 0;
+    const exec = Number.isFinite(executed?.[i]) ? executed[i] : (i === 0 ? 0 : executed?.[i - 1] || 0);
+    const benchReturn = Number.isFinite(backtest.baseReturns?.[i]) ? backtest.baseReturns[i] : 0;
+    const stratReturn = Number.isFinite(backtest.stratReturns?.[i]) ? backtest.stratReturns[i] : 0;
+    const eqStrat = Number.isFinite(stratEquity?.[i]) ? stratEquity[i] : 1;
+    const eqBench = Number.isFinite(benchEquity?.[i]) ? benchEquity[i] : 1;
+
+    rows.push([
+      date,
+      regime,
+      exec,
+      formatDecimal(benchReturn, 8),
+      formatDecimal(stratReturn, 8),
+      formatDecimal(eqStrat, 8),
+      formatDecimal(eqBench, 8),
+    ]);
+  }
+
+  lines.push(...formatTable(headers, rows));
+  return lines;
+}
+
 function buildPriceSection(records) {
-  const lines = ['[6. 지수 추이 (자산 가격)]'];
+  const lines = ['[7. 지수 추이 (자산 가격)]'];
   if (!Array.isArray(records) || records.length === 0) {
     lines.push('- 데이터가 없습니다.');
     return lines;
@@ -3256,7 +3309,7 @@ function buildPriceSection(records) {
 }
 
 function buildHeatmapSection(metrics) {
-  const lines = ['[7. 히트맵 매트릭스]'];
+  const lines = ['[8. 히트맵 매트릭스]'];
   if (!metrics || !Array.isArray(metrics.records) || metrics.records.length === 0) {
     lines.push('- 상관행렬 데이터를 찾지 못했습니다.');
     return lines;
@@ -3284,7 +3337,7 @@ function buildHeatmapSection(metrics) {
 }
 
 function buildPairSection() {
-  const lines = ['[8. 기준자산 상관도]'];
+  const lines = ['[9. 기준자산 상관도]'];
   const pair = state.pair || DEFAULT_PAIR;
   const [assetA, assetB] = pair.split('|');
   lines.push(`- 선택한 페어: ${assetA} / ${assetB}`);
@@ -3392,6 +3445,13 @@ function computeDailyReturnForSymbol(symbol, date) {
 
 function formatNumberOrNA(value, digits = 3) {
   if (!Number.isFinite(value)) return 'N/A';
+  return Number(value).toFixed(digits);
+}
+
+function formatDecimal(value, digits = 8, fallback = '0.00000000') {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
   return Number(value).toFixed(digits);
 }
 

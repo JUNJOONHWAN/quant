@@ -1078,7 +1078,7 @@ def backtest_from_state(
     series = prices_close
     if mode == "open" and isinstance(prices_open, list) and len(prices_open) >= 2:
         series = prices_open
-    rets: List[float] = []
+    rets: List[float] = [0.0]
     for i in range(1, len(series)):
         a, b = series[i - 1], series[i]
         if np.isfinite(a) and np.isfinite(b) and a != 0:
