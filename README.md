@@ -2,7 +2,7 @@
 
 A static web application that visualizes cross-asset correlations and a derived market stability index directly in the browser.
 The site no longer talks to Yahoo Finance from the client; instead, a GitHub Actions workflow runs `scripts/generate-data.js`, which
-pulls daily prices for QQQ, IWM, SPY, TLT, GLD, and BTC-USD from Alpha Vantage, precomputes the correlation metrics (signals are built
+pulls daily prices for QQQ, IWM, SPY, TLT, GLD, and BTC-USD from Financial Modeling Prep (FMP), precomputes the correlation metrics (signals are built
 on IWM·SPY·TLT·GLD·BTC-USD, while the backtest benchmark stays on QQQ/TQQQ), and uploads the
 resulting JSON bundle (`static_site/data/precomputed.json`) alongside the static assets. Browsers simply download that JSON and
 render gauges, history charts, and pair analytics—no backend services required.
@@ -10,21 +10,21 @@ render gauges, history charts, and pair analytics—no backend services required
 ## Repository layout
 
 - `docs/market_stability_app_plan.md` – system design and background notes for the dashboard.
-- `scripts/generate-data.js` – Alpha Vantage fetcher + metric precomputation used by CI and local previews.
+- `scripts/generate-data.js` – FMP fetcher + metric precomputation used by CI and local previews.
 - `static_site/` – GitHub Pages–ready frontend (HTML, CSS, JavaScript, and the generated data file).
 
 ## Deploy to GitHub Pages
 
-### 1. Provision an Alpha Vantage API key
+### 1. Provision an FMP API key
 
-Create a free key at <https://www.alphavantage.co/support/#api-key>. You will need it both for local previews and for the automated
-GitHub Actions deployment.
+Create a key at <https://site.financialmodelingprep.com/developer>. You will need it both for local previews and for the automated
+GitHub Actions deployment. The free tier is sufficient for the daily refresh cadence used by this project.
 
 ### 2. Store the key in the repository secrets
 
 1. Open your GitHub repository.
 2. Navigate to **Settings → Secrets and variables → Actions**.
-3. Create a new repository secret named **`ALPHAVANTAGE_API_KEY`** and paste the key value.
+3. Create a new repository secret named **`FMP_API_KEY`** and paste the key value.
 
 ### 3. One-click deploy with GitHub Actions (recommended)
 
@@ -33,7 +33,7 @@ push to `main`.
 
 1. Push the repository to GitHub with your work living on the `main` branch.
 2. In **Settings → Pages → Build and deployment**, pick **GitHub Actions** as the source (only required once).
-3. Every push to `main` now triggers the workflow. The job fails fast if the API key is missing or Alpha Vantage returns an error, so
+3. Every push to `main` now triggers the workflow. The job fails fast if the API key is missing or FMP returns an error, so
 you immediately know when the data refresh needs attention. You can also run the workflow manually from the **Actions** tab.
 
 ### Manual branch deployment (fallback option)
@@ -68,14 +68,14 @@ git push origin main
 
 ## Local preview
 
-1. Export your Alpha Vantage key (or rely on the repository secret if you are running inside GitHub Codespaces with inherited secrets).
+1. Export your FMP key (or rely on the repository secret if you are running inside GitHub Codespaces with inherited secrets).
 2. Generate the dataset locally.
 3. Serve the static files.
 
 > **Note:** The generator requires Node.js 18 or newer to use the built-in `fetch` API.
 
 ```bash
-export ALPHAVANTAGE_API_KEY=your-key-here
+export FMP_API_KEY=your-key-here
 npm run generate:data
 cd static_site
 python -m http.server 8000
@@ -96,23 +96,26 @@ Running the suite is a quick way to verify that correlation, EMA, and weighting 
 
 ## Historical cache (2017+)
 
-Alpha Vantage pulls now focus on 2024-and-newer samples to stay within the provider's quota, while everything before 2024 is sourced
-from a local JSON cache. Generate or refresh that cache before running the Node-based precomputation:
+Both the Node generator and the Python helper pull from the same FMP endpoints. To refresh the long-horizon cache that lives in
+`static_site/data/historical_prices.json`, run:
 
-1. Install the Python dependency once: `python3 -m pip install yfinance`.
-2. Download the long history (2017-01-01 → today) and write `static_site/data/historical_prices.json`:
+1. Export `FMP_API_KEY`.
+2. Download the full history (2017-01-01 → today):
 
    ```bash
    python scripts/fetch_long_history.py --force
    ```
 
-3. Run `npm run generate:data` as usual. The script automatically splices the cached data (pre-2024) with the freshly downloaded
-   Alpha Vantage rows (2024+).
+3. Regenerate the precomputed metrics:
 
-If the cache is missing, the generator logs a warning and emits only the recent window, so keep the JSON in source control whenever
-possible to guarantee reproducible full-history datasets.
+   ```bash
+   npm run generate:data
+   ```
+
+The Python script keeps every asset in sync with the JSON format that the frontend expects. Keeping the cache under version control
+helps guarantee reproducible full-history datasets even if rate limits block a fresh pull.
 
 ## Data notice
 
-The published numbers are derived from Alpha Vantage daily endpoints and are intended for informational purposes only. Accuracy and
+The published numbers are derived from Financial Modeling Prep daily endpoints and are intended for informational purposes only. Accuracy and
 availability are not guaranteed, and the project does not provide investment advice.

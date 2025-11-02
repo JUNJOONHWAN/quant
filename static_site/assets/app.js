@@ -5,9 +5,8 @@ const BANDS = { red: [0, 0.3], yellow: [0.3, 0.4], green: [0.4, 1.0] };
 const DEFAULT_PAIR = 'IWM|BTC-USD';
 const MAX_STALE_DAYS = 7;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const ALPHA_RANGE_YEARS = 5;
-const MINIMUM_ALPHA_CUTOFF = '2020-01-01';
-const ALPHA_RATE_DELAY = Math.round((60 * 1000) / 5) + 1500;
+const FMP_DATA_START = '2017-01-01';
+const FMP_RATE_DELAY = 500;
 const ACTIOND_WAIT_MS = 5000;
 const ACTIOND_POLL_INTERVAL_MS = 75;
 const IS_LOCAL = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
@@ -131,26 +130,26 @@ async function ensureActiondReady() {
   return candidate;
 }
 
-async function hydrateAlphaKeyFromEnvironment() {
-  const direct = resolveActiondEnvironment('ALPHAVANTAGE_API_KEY');
+async function hydrateFmpKeyFromEnvironment() {
+  const direct = resolveActiondEnvironment('FMP_API_KEY');
   if (direct) {
-    state.alphaKey = direct;
+    state.fmpKey = direct;
     return;
   }
 
-  const fetched = await fetchActiondSecret('ALPHAVANTAGE_API_KEY');
+  const fetched = await fetchActiondSecret('FMP_API_KEY');
   if (fetched) {
-    state.alphaKey = fetched;
+    state.fmpKey = fetched;
   }
 }
 
 const ASSETS = [
-  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY_ADJUSTED' },
-  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
+  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', fmpSymbol: 'QQQ' },
+  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', fmpSymbol: 'IWM' },
+  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', fmpSymbol: 'SPY' },
+  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', fmpSymbol: 'TLT' },
+  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', fmpSymbol: 'GLD' },
+  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', fmpSymbol: 'BTCUSD' },
 ];
 
 const SIGNAL = {
@@ -192,7 +191,7 @@ const state = {
   analysisDates: [],
   generatedAt: null,
   pair: DEFAULT_PAIR,
-  alphaKey: '',
+  fmpKey: '',
   refreshing: false,
   autoRefreshAttempted: false,
   customRange: {
@@ -349,7 +348,7 @@ if (document.readyState === 'loading') {
 async function init() {
   showError('데이터를 불러오는 중입니다...');
   state.metrics = {};
-  await hydrateAlphaKeyFromEnvironment();
+  await hydrateFmpKeyFromEnvironment();
   try {
     const precomputed = await loadPrecomputed();
     if (!precomputed) {
@@ -381,16 +380,17 @@ async function loadFromYahoo() {
   maybeAlignDatesToCurrent();
 }
 
-async function loadFromAlphaVantage(apiKey) {
-  const effectiveCutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
+async function loadFromFmp(apiKey) {
+  const effectiveCutoff = computeFmpCutoffDate();
+  const endDate = new Date().toISOString().slice(0, 10);
   const assetSeries = [];
 
   for (let index = 0; index < ASSETS.length; index += 1) {
     const asset = ASSETS[index];
-    const series = await fetchAlphaSeriesBrowser(asset, apiKey, effectiveCutoff);
+    const series = await fetchFmpSeriesBrowser(asset, apiKey, effectiveCutoff, endDate);
     assetSeries.push(series);
     if (index < ASSETS.length - 1) {
-      await delay(ALPHA_RATE_DELAY);
+      await delay(FMP_RATE_DELAY);
     }
   }
 
@@ -3274,8 +3274,8 @@ async function maybeRefreshData() {
     return false;
   }
 
-  if (!state.alphaKey) {
-    await hydrateAlphaKeyFromEnvironment();
+  if (!state.fmpKey) {
+    await hydrateFmpKeyFromEnvironment();
   }
 
   const { shouldFetch } = evaluateRefreshNeeds();
@@ -3284,13 +3284,13 @@ async function maybeRefreshData() {
     return false;
   }
 
-  if (!state.alphaKey) {
-    showNotice('Alpha Vantage API 키를 찾을 수 없어 자동 갱신을 건너뜁니다. GitHub Actions/Pages Secrets 또는 환경 변수 ALPHAVANTAGE_API_KEY를 설정해 주세요.');
+  if (!state.fmpKey) {
+    showNotice('FMP API 키를 찾을 수 없어 자동 갱신을 건너뜁니다. GitHub Actions/Pages Secrets 또는 환경 변수 FMP_API_KEY를 설정해 주세요.');
     return false;
   }
 
-  showNotice('Alpha Vantage에서 최신 데이터를 불러오는 중입니다...');
-  await loadFromAlphaVantage(state.alphaKey);
+  showNotice('Financial Modeling Prep에서 최신 데이터를 불러오는 중입니다...');
+  await loadFromFmp(state.fmpKey);
   hideError();
   return true;
 }
@@ -3305,7 +3305,7 @@ function evaluateRefreshNeeds() {
     || records[records.length - 1]?.date
     || null;
 
-  const requiredCutoff = computeAlphaCutoffDate(ALPHA_RANGE_YEARS);
+  const requiredCutoff = computeFmpCutoffDate();
   const needsRangeCoverage = !earliest || earliest > requiredCutoff;
   const needsFreshLatest = isLatestDateStale(latest);
 
@@ -4053,98 +4053,72 @@ function renderCorrelationChart(chart, dates, correlationValues, priceA, correla
   });
 }
 
-function computeAlphaCutoffDate() {
-  return MINIMUM_ALPHA_CUTOFF;
+function computeFmpCutoffDate() {
+  return FMP_DATA_START;
 }
 
-async function fetchAlphaSeriesBrowser(asset, apiKey, cutoffDate) {
-  if (asset.source === 'DIGITAL_CURRENCY_DAILY') {
-    return fetchAlphaDigital(asset, apiKey, cutoffDate);
+async function fetchFmpSeriesBrowser(asset, apiKey, startDate, endDate) {
+  const symbol = asset.fmpSymbol || asset.symbol.replace(/[^A-Za-z0-9]/g, '');
+  const url = new URL(`https://financialmodelingprep.com/api/v3/historical-price-full/${encodeURIComponent(symbol)}`);
+  if (apiKey) {
+    url.searchParams.set('apikey', apiKey);
   }
-  return fetchAlphaEquity(asset, apiKey, cutoffDate);
-}
-
-async function fetchAlphaEquity(asset, apiKey, cutoffDate) {
-  const url = new URL('https://www.alphavantage.co/query');
-  url.searchParams.set('function', 'TIME_SERIES_DAILY_ADJUSTED');
-  url.searchParams.set('symbol', asset.symbol);
-  url.searchParams.set('outputsize', 'full');
-  url.searchParams.set('apikey', apiKey);
-
-  const json = await fetchAlphaJson(url, asset.symbol);
-  const series = json['Time Series (Daily)'];
-  if (!series) {
-    throw buildAlphaError(json, asset.symbol);
+  url.searchParams.set('serietype', 'line');
+  if (startDate) {
+    url.searchParams.set('from', startDate);
   }
-  return normalizeAlphaSeries(asset, series, cutoffDate, (value) => Number(value['5. adjusted close'] || value['4. close']));
-}
-
-async function fetchAlphaDigital(asset, apiKey, cutoffDate) {
-  const url = new URL('https://www.alphavantage.co/query');
-  url.searchParams.set('function', 'DIGITAL_CURRENCY_DAILY');
-  url.searchParams.set('symbol', asset.symbol.split('-')[0]);
-  url.searchParams.set('market', 'USD');
-  url.searchParams.set('apikey', apiKey);
-
-  const json = await fetchAlphaJson(url, asset.symbol);
-  const series = json['Time Series (Digital Currency Daily)'];
-  if (!series) {
-    throw buildAlphaError(json, asset.symbol);
-  }
-  return normalizeAlphaSeries(asset, series, cutoffDate, (value) => Number(value['4a. close (USD)'] || value['4b. close (USD)']));
-}
-
-async function fetchAlphaJson(url, symbol) {
-  const response = await fetch(url.toString(), { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`${symbol || 'Alpha Vantage'}: 요청 실패 (${response.status})`);
-  }
-  const json = await response.json();
-  if (json?.Note || json?.Information || json?.['Error Message']) {
-    throw buildAlphaError(json, symbol || url.searchParams.get('symbol') || '요청');
-  }
-  return json;
-}
-
-function normalizeAlphaSeries(asset, rawSeries, cutoffDate, extractClose) {
-  const dates = Object.keys(rawSeries)
-    .filter((date) => date >= cutoffDate)
-    .sort();
-
-  if (dates.length === 0) {
-    throw new Error(`${asset.symbol}: ${cutoffDate} 이후 데이터가 없습니다.`);
+  if (endDate) {
+    url.searchParams.set('to', endDate);
   }
 
-  const filteredDates = [];
-  const prices = [];
-  dates.forEach((date) => {
-    const close = extractClose(rawSeries[date]);
-    if (Number.isFinite(close)) {
-      filteredDates.push(date);
-      prices.push(close);
-    }
-  });
+  const json = await fetchFmpJson(url, asset.symbol);
+  const rows = Array.isArray(json?.historical) ? json.historical : [];
+  if (!rows || rows.length === 0) {
+    throw buildFmpError(json, asset.symbol);
+  }
 
-  if (filteredDates.length < 2) {
-    throw new Error(`${asset.symbol}: Alpha Vantage에서 충분한 표본을 받지 못했습니다.`);
+  const filtered = rows
+    .filter((row) => typeof row?.date === 'string')
+    .filter((row) => (!startDate || row.date >= startDate) && (!endDate || row.date <= endDate))
+    .map((row) => ({
+      date: row.date,
+      price: Number(row.close ?? row.adjClose ?? row.price),
+    }))
+    .filter((row) => Number.isFinite(row.price))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (filtered.length < 2) {
+    throw new Error(`${asset.symbol}: FMP에서 충분한 표본을 받지 못했습니다.`);
   }
 
   return {
     symbol: asset.symbol,
     category: asset.category,
-    dates: filteredDates,
-    prices,
+    dates: filtered.map((row) => row.date),
+    prices: filtered.map((row) => row.price),
   };
 }
 
-function buildAlphaError(payload, symbol) {
+async function fetchFmpJson(url, symbol) {
+  const response = await fetch(url.toString(), { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`${symbol || 'FMP'}: 요청 실패 (${response.status})`);
+  }
+  const json = await response.json();
+  if (json?.Note || json?.Information || json?.['Error Message']) {
+    throw buildFmpError(json, symbol || url.pathname.split('/').pop() || '요청');
+  }
+  return json;
+}
+
+function buildFmpError(payload, symbol) {
   if (payload && typeof payload === 'object') {
     const message = payload['Error Message'] || payload.Note || payload.Information;
     if (message) {
-      return new Error(`${symbol}: Alpha Vantage 오류 - ${message}`);
+      return new Error(`${symbol}: FMP 오류 - ${message}`);
     }
   }
-  return new Error(`${symbol}: Alpha Vantage 응답을 해석할 수 없습니다.`);
+  return new Error(`${symbol}: FMP 응답을 해석할 수 없습니다.`);
 }
 
 function isLatestDateStale(dateStr) {

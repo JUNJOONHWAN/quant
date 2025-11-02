@@ -1,39 +1,34 @@
 #!/usr/bin/env python3
-"""Download long-horizon price history with yfinance.
+"""Download long-horizon price history from Financial Modeling Prep.
 
 The script fetches daily close prices for the dashboard's asset universe,
 covering 2017-01-01 through today (inclusive by default), and stores the
 result as JSON under ``static_site/data``.  Later steps in the pipeline can
-merge this historical snapshot with the Alpha Vantage pulls that focus on
-recent data.
+reuse this historical snapshot when building the precomputed dataset.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
+import os
+import urllib.error
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-import pandas as pd
-
-try:
-    import yfinance as yf
-except ImportError as error:  # pragma: no cover - handled at runtime
-    print(
-        "yfinance is required. Install it via 'pip install yfinance' before running this script.",
-        file=sys.stderr,
-    )
-    raise
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "static_site" / "data"
 DEFAULT_OUTPUT = DATA_DIR / "historical_prices.json"
 DEFAULT_START = date(2017, 1, 1)
+API_KEY = os.environ.get("FMP_API_KEY", "").strip()
+FMP_BASE_URL = "https://financialmodelingprep.com/api/v3/historical-price-full"
+USER_AGENT = "market-stability-dashboard/1.0 (+https://github.com/)"
 
 
 @dataclass(frozen=True)
@@ -41,15 +36,16 @@ class Asset:
     symbol: str
     label: str
     category: str
+    fmp_symbol: str
 
 
 ASSETS: Sequence[Asset] = (
-    Asset("QQQ", "QQQ (NASDAQ 100 ETF)", "stock"),
-    Asset("IWM", "IWM (Russell 2000 ETF)", "stock"),
-    Asset("SPY", "SPY (S&P 500 ETF)", "stock"),
-    Asset("TLT", "TLT (US Long Treasury)", "bond"),
-    Asset("GLD", "GLD (Gold ETF)", "gold"),
-    Asset("BTC-USD", "BTC-USD (Bitcoin)", "crypto"),
+    Asset("QQQ", "QQQ (NASDAQ 100 ETF)", "stock", "QQQ"),
+    Asset("IWM", "IWM (Russell 2000 ETF)", "stock", "IWM"),
+    Asset("SPY", "SPY (S&P 500 ETF)", "stock", "SPY"),
+    Asset("TLT", "TLT (US Long Treasury)", "bond", "TLT"),
+    Asset("GLD", "GLD (Gold ETF)", "gold", "GLD"),
+    Asset("BTC-USD", "BTC-USD (Bitcoin)", "crypto", "BTCUSD"),
 )
 
 
@@ -94,79 +90,56 @@ def ensure_valid_range(start: date, end: date) -> None:
 def fetch_symbol_history(symbol: str, start: date, end: date) -> List[Tuple[str, float]]:
     """Return sorted (date, close) tuples between start and end inclusive."""
 
-    # yfinance's ``end`` parameter is exclusive; push it one day forward so
-    # the closing price for ``end`` itself is included when available.
-    end_plus_one = end + timedelta(days=1)
-    frame = yf.download(
-        symbol,
-        start=start.isoformat(),
-        end=end_plus_one.isoformat(),
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-    )
+    asset = next((candidate for candidate in ASSETS if candidate.symbol == symbol), None)
+    if asset is None:
+        raise RuntimeError(f"Unknown asset symbol {symbol}.")
 
-    frame = _flatten_download_columns(frame, symbol)
+    params = {
+        "apikey": API_KEY,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "serietype": "line",
+    }
+    url = f"{FMP_BASE_URL}/{asset.fmp_symbol}?{urlencode(params)}"
+    request = Request(url, headers={"User-Agent": USER_AGENT})
 
-    if frame.empty:
-        raise RuntimeError(f"yfinance returned no rows for {symbol}.")
+    try:
+        with urlopen(request, timeout=60) as response:
+            if response.status != 200:
+                raise RuntimeError(f"FMP request for {symbol} failed with HTTP {response.status}.")
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:  # pragma: no cover - network dependent
+        raise RuntimeError(f"FMP request for {symbol} returned HTTP {exc.code}.") from exc
+    except urllib.error.URLError as exc:  # pragma: no cover - network dependent
+        raise RuntimeError(f"FMP request for {symbol} failed: {exc}") from exc
 
-    column = _select_close_column(frame)
-    series = frame[column].dropna()
+    rows = payload.get("historical") or []
+    if not rows:
+        message = payload.get("Error Message") or payload.get("Note")
+        if message:
+            raise RuntimeError(f"FMP returned no data for {symbol}: {message}")
+        raise RuntimeError(f"FMP returned no data for {symbol}.")
 
-    rows: List[Tuple[str, float]] = []
-    for idx, value in series.items():
-        # yfinance can emit timezone-aware timestamps; convert to date.
-        if hasattr(idx, "to_pydatetime"):
-            idx_datetime = idx.to_pydatetime()
-        else:
-            idx_datetime = datetime.combine(idx, datetime.min.time())
-        date_key = idx_datetime.date().isoformat()
-        rows.append((date_key, float(value)))
+    start_key = start.isoformat()
+    end_key = end.isoformat()
+    dedup: Dict[str, float] = {}
+    for row in rows:
+        date_key = row.get("date")
+        if not isinstance(date_key, str):
+            continue
+        if date_key < start_key or date_key > end_key:
+            continue
+        value = row.get("close") or row.get("adjClose") or row.get("price")
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            continue
+        dedup[date_key] = price
 
-    rows.sort(key=lambda pair: pair[0])
-    # Deduplicate (yfinance can emit multiple entries for dividends/actions).
-    deduped: Dict[str, float] = {}
-    for date_key, price in rows:
-        deduped[date_key] = price
+    if not dedup:
+        raise RuntimeError(f"FMP returned no usable closing prices for {symbol}.")
 
-    return sorted(deduped.items(), key=lambda pair: pair[0])
-
-
-def _flatten_download_columns(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    columns = frame.columns
-    if not isinstance(columns, pd.MultiIndex):
-        return frame
-
-    for level in range(columns.nlevels):
-        level_values = columns.get_level_values(level)
-        if all(value == symbol for value in level_values):
-            return frame.droplevel(level, axis=1)
-
-    flattened = [
-        "_".join(str(part) for part in column if part and part != symbol)
-        for column in columns
-    ]
-    frame = frame.copy()
-    frame.columns = flattened
-    return frame
-
-
-def _select_close_column(frame: pd.DataFrame) -> str:
-    candidates = ["Adj Close", "Close", "adjclose", "close"]
-    for candidate in candidates:
-        if candidate in frame.columns:
-            return candidate
-
-    # fallback: match columns that contain the keyword (e.g., "Adj Close_QQQ")
-    lowered = [col.lower() for col in frame.columns]
-    for keyword in ("adj close", "close"):
-        for idx, name in enumerate(lowered):
-            if keyword in name:
-                return frame.columns[idx]
-
-    raise KeyError("Close")
+    return sorted(dedup.items(), key=lambda pair: pair[0])
 
 
 def build_payload(start: date, end: date, history: Dict[str, List[Tuple[str, float]]]) -> Dict[str, object]:
@@ -190,7 +163,7 @@ def build_payload(start: date, end: date, history: Dict[str, List[Tuple[str, flo
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "source": "yfinance",
+        "source": "financialmodelingprep",
         "assets": assets_payload,
     }
 
@@ -208,12 +181,15 @@ def main() -> None:
     end = parse_iso_date(args.end, field="end")
     ensure_valid_range(start, end)
 
+    if not API_KEY:
+        raise SystemExit("Environment variable FMP_API_KEY is not set. Please export it before running.")
+
     history: Dict[str, List[Tuple[str, float]]] = {}
     for asset in ASSETS:
-        print(f"[yfinance] downloading {asset.symbol} from {start} to {end}")
+        print(f"[fmp] downloading {asset.symbol} from {start} to {end}")
         rows = fetch_symbol_history(asset.symbol, start, end)
         history[asset.symbol] = rows
-        print(f"[yfinance] {asset.symbol}: {len(rows)} rows")
+        print(f"[fmp] {asset.symbol}: {len(rows)} rows")
 
     payload = build_payload(start, end, history)
     write_payload(args.out, payload, force=args.force)

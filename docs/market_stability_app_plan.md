@@ -10,7 +10,7 @@
 
 ## 2. Data Pipeline
 
-1. **Source**: Alpha Vantage daily endpoints. ETFs/ETNs use `TIME_SERIES_DAILY_ADJUSTED`; BTC-USD uses `DIGITAL_CURRENCY_DAILY`. Access requires the `ALPHAVANTAGE_API_KEY` secret.
+1. **Source**: Financial Modeling Prep daily endpoints. ETFs/ETNs and BTCUSD use the `historical-price-full` API. Access requires the `FMP_API_KEY` secret.
 2. **Generator (`scripts/generate-data.js`)**: Node.js (18+) script that pulls five years of closes, aligns trading days, computes log returns, and derives rolling correlations for 20/30/60 session windows before emitting a consolidated JSON payload.
 3. **Trigger**: `.github/workflows/deploy.yml` executes the generator on every push to `main` (and on manual dispatch). Add a cron trigger if an automatic daily refresh is desired.
 4. **Artifact**: `static_site/data/precomputed.json` containing windowed records (stability, smoothed stability, deltas, correlation matrices, sub-indexes) plus pair-level price/correlation series and metadata (generation timestamp, asset catalog).
@@ -26,7 +26,7 @@ quant/
 ├── docs/
 │   └── market_stability_app_plan.md
 ├── scripts/
-│   └── generate-data.js        # Alpha Vantage fetcher + precomputation logic
+│   └── generate-data.js        # FMP fetcher + precomputation logic
 ├── static_site/
 │   ├── assets/                 # Browser JavaScript, CSS, shared metric helpers
 │   ├── data/                   # Holds precomputed.json generated during deployment
@@ -122,9 +122,9 @@ quant/
 ## 7. Deployment & Operations
 
 - **CI/CD**: Pull requests run unit tests (`npm test`). Pushes to `main` execute `deploy.yml`, which generates `precomputed.json` and deploys Pages.
-- **Secrets**: `ALPHAVANTAGE_API_KEY` is mandatory. Store it as a repository secret so the workflow can read it. Future paid feeds can reuse the same mechanism.
+- **Secrets**: `FMP_API_KEY` is mandatory. Store it as a repository secret so the workflow can read it. Future paid feeds can reuse the same mechanism.
 - **Error Handling**: Workflow failure leaves the previous deployment intact; the frontend displays a "데이터를 생성하세요" message if the JSON is missing.
-- **Documentation**: README now covers key provisioning, local previews, and the Alpha Vantage disclaimer.
+- **Documentation**: README now covers key provisioning, local previews, and the FMP data disclaimer.
 
 ## 8. Future Enhancements
 

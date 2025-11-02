@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Generate precomputed market stability metrics using Alpha Vantage data.
+ * Generate precomputed market stability metrics using Financial Modeling Prep data.
  * The script writes a JSON blob that the GitHub Pages frontend consumes.
  */
 const fs = require('fs/promises');
@@ -24,19 +24,24 @@ const {
   mean,
 } = require('../static_site/assets/metrics');
 
-const API_KEY = process.env.ALPHAVANTAGE_API_KEY;
-const USE_FMP_HISTORY_ONLY = flagEnabled(process.env.USE_FMP_HISTORY_ONLY || process.env.GENERATE_USE_FMP_ONLY);
+const API_KEY = process.env.FMP_API_KEY;
+const USE_HISTORY_ONLY = flagEnabled(
+  process.env.USE_FMP_HISTORY_ONLY
+  || process.env.GENERATE_USE_FMP_ONLY
+  || process.env.GENERATE_USE_HISTORY_ONLY
+);
 const DATA_DIR = path.join(__dirname, '..', 'static_site', 'data');
 const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
 const HISTORICAL_PATH = path.join(DATA_DIR, 'historical_prices.json');
 
+const DATA_START_DATE = '2017-01-01';
 const ASSETS = [
-  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
-  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
-  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', source: 'TIME_SERIES_DAILY' },
-  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', source: 'TIME_SERIES_DAILY' },
-  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', source: 'TIME_SERIES_DAILY' },
-  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', source: 'DIGITAL_CURRENCY_DAILY' },
+  { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', fmpSymbol: 'QQQ' },
+  { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', fmpSymbol: 'IWM' },
+  { symbol: 'SPY', label: 'SPY (S&P 500 ETF)', category: 'stock', fmpSymbol: 'SPY' },
+  { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', fmpSymbol: 'TLT' },
+  { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', fmpSymbol: 'GLD' },
+  { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', fmpSymbol: 'BTCUSD' },
 ];
 
 const SIGNAL = {
@@ -44,10 +49,7 @@ const SIGNAL = {
 };
 
 const WINDOWS = [20, 30, 60];
-const RANGE_YEARS = 5;
-const REMOTE_CUTOFF_DATE = '2024-01-01';
-const MINIMUM_CUTOFF_DATE = REMOTE_CUTOFF_DATE;
-const REQUEST_DELAY_MS = 15000;
+const MINIMUM_CUTOFF_DATE = DATA_START_DATE;
 
 async function main() {
   if (typeof fetch !== 'function') {
@@ -57,36 +59,32 @@ async function main() {
 
   const hasApiKey = Boolean(API_KEY);
   const historical = await readHistoricalSeries();
-  const cutoffDate = computeCutoffDate(RANGE_YEARS);
-  const useHistoryOnly = USE_FMP_HISTORY_ONLY || !hasApiKey;
+  const cutoffDate = computeCutoffDate();
+  const endDate = computeEndDate();
+  const useHistoryOnly = USE_HISTORY_ONLY || !hasApiKey;
 
   try {
     let mergedSeries;
     if (useHistoryOnly) {
       if (!historical || !(historical.map instanceof Map) || historical.map.size === 0) {
-        throw new Error('Historical dataset is unavailable; cannot build precomputed payload without Alpha Vantage data.');
+        throw new Error('Historical dataset is unavailable; cannot build precomputed payload without FMP data.');
       }
       if (!hasApiKey) {
-        console.warn('[generate-data] ALPHAVANTAGE_API_KEY missing; using historical/FMP dataset only.');
-      } else if (USE_FMP_HISTORY_ONLY) {
-        console.log('[generate-data] USE_FMP_HISTORY_ONLY enabled; skipping Alpha Vantage fetch.');
+        console.warn('[generate-data] FMP_API_KEY missing; using cached dataset only.');
+      } else if (USE_HISTORY_ONLY) {
+        console.log('[generate-data] USE_FMP_HISTORY_ONLY/GENERATE_USE_FMP_ONLY enabled; skipping live fetch.');
       }
       mergedSeries = buildSeriesFromHistory(historical, cutoffDate);
     } else {
       const assetSeries = [];
       for (let index = 0; index < ASSETS.length; index += 1) {
         const asset = ASSETS[index];
-        console.log(`Fetching ${asset.symbol} via Alpha Vantage (${asset.source})`);
-        const series = await fetchAlphaSeries(asset, cutoffDate);
+        console.log(`Fetching ${asset.symbol} via Financial Modeling Prep`);
+        const series = await fetchFmpSeries(asset, cutoffDate, endDate);
         assetSeries.push(series);
         console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
-
-        if (index < ASSETS.length - 1) {
-          console.log('Waiting to respect Alpha Vantage rate limits...');
-          await delay(REQUEST_DELAY_MS);
-        }
       }
-      mergedSeries = mergeSeriesWithHistory(assetSeries, historical, REMOTE_CUTOFF_DATE);
+      mergedSeries = mergeSeriesWithHistory(assetSeries, historical, cutoffDate);
     }
 
     const aligned = alignSeries(mergedSeries);
@@ -99,84 +97,62 @@ async function main() {
   }
 }
 
-function computeCutoffDate() {
-  return MINIMUM_CUTOFF_DATE;
+function computeEndDate() {
+  return new Date().toISOString().slice(0, 10);
 }
 
-async function fetchAlphaSeries(asset, cutoffDate) {
-  if (asset.source === 'DIGITAL_CURRENCY_DAILY') {
-    return fetchDigital(asset, cutoffDate);
-  }
-  return fetchEquity(asset, cutoffDate);
-}
-
-async function fetchEquity(asset, cutoffDate) {
-  const url = buildAlphaUrl({
-    function: 'TIME_SERIES_DAILY',
-    symbol: asset.symbol,
-    outputsize: 'full',
-  });
-
+async function fetchFmpSeries(asset, startDate, endDate) {
+  const fmpSymbol = asset.fmpSymbol || sanitizeFmpSymbol(asset.symbol);
+  const url = buildFmpUrl(fmpSymbol, startDate, endDate);
   const json = await fetchJson(url);
-  const series = extractEquitySeries(json);
-
-  if (!series) {
-    throw buildAlphaError(json, asset.symbol);
+  const rows = Array.isArray(json?.historical) ? json.historical : [];
+  if (rows.length === 0) {
+    throw buildFmpError(json, asset.symbol);
   }
 
-  return normalizeSeries(asset, series, cutoffDate, (value) => Number(value?.['4. close']));
-}
+  const filtered = rows
+    .filter((row) => typeof row?.date === 'string')
+    .filter((row) => (!startDate || row.date >= startDate) && (!endDate || row.date <= endDate))
+    .map((row) => ({
+      date: row.date,
+      price: safeNumber(row.close ?? row.adjClose ?? row.price),
+    }))
+    .filter((row) => row.price != null)
+    .sort((a, b) => a.date.localeCompare(b.date));
 
-async function fetchDigital(asset, cutoffDate) {
-  const { base, market } = parseCryptoSymbol(asset.symbol);
-  const url = buildAlphaUrl({
-    function: 'DIGITAL_CURRENCY_DAILY',
-    symbol: base,
-    market,
-  });
-
-  const json = await fetchJson(url);
-  const series = json['Time Series (Digital Currency Daily)'];
-  if (!series) {
-    throw buildAlphaError(json, asset.symbol);
-  }
-
-  const primaryCloseKey = `4a. close (${market})`;
-  const secondaryCloseKey = `4b. close (${market})`;
-  const legacyCloseKey = '4. close';
-  const dates = Object.keys(series)
-    .filter((date) => date >= cutoffDate)
-    .sort();
-  if (dates.length === 0) {
-    throw new Error(`${asset.symbol}: no samples after ${cutoffDate}`);
-  }
-
-  const filteredDates = [];
-  const prices = [];
-  dates.forEach((date) => {
-    const value = series[date];
-    const close = Number(
-      value?.[primaryCloseKey]
-        ?? value?.[secondaryCloseKey]
-        ?? value?.[legacyCloseKey]
-    );
-    if (Number.isFinite(close)) {
-      filteredDates.push(date);
-      prices.push(close);
-    }
-  });
-
-  if (filteredDates.length < 2) {
-    console.warn(`${asset.symbol}: short series ${filteredDates.length}d after cutoff ${cutoffDate}`);
+  if (filtered.length < 2) {
+    throw new Error(`${asset.symbol}: insufficient samples from FMP after filtering.`);
   }
 
   return {
     symbol: asset.symbol,
     label: asset.label,
     category: asset.category,
-    dates: filteredDates,
-    prices,
+    dates: filtered.map((row) => row.date),
+    prices: filtered.map((row) => row.price),
   };
+}
+
+function buildFmpUrl(symbol, startDate, endDate) {
+  const url = new URL(`https://financialmodelingprep.com/api/v3/historical-price-full/${encodeURIComponent(symbol)}`);
+  url.searchParams.set('apikey', API_KEY || '');
+  url.searchParams.set('serietype', 'line');
+  if (startDate) {
+    url.searchParams.set('from', startDate);
+  }
+  if (endDate) {
+    url.searchParams.set('to', endDate);
+  }
+  return url;
+}
+
+function sanitizeFmpSymbol(symbol) {
+  return symbol.replace(/[^A-Za-z0-9]/g, '');
+}
+
+function safeNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 async function fetchJson(url) {
@@ -190,53 +166,14 @@ async function fetchJson(url) {
   return json;
 }
 
-function normalizeSeries(asset, rawSeries, cutoffDate, extractClose) {
-  const dates = Object.keys(rawSeries)
-    .filter((date) => date >= cutoffDate)
-    .sort();
-  if (dates.length === 0) {
-    throw new Error(`${asset.symbol}: no samples after ${cutoffDate}`);
+function buildFmpError(payload, symbol) {
+  if (payload && typeof payload.Note === 'string') {
+    return new Error(`${symbol}: FMP returned a notice - ${payload.Note}`);
   }
-
-  const filteredDates = [];
-  const prices = [];
-  dates.forEach((date) => {
-    const close = extractClose(rawSeries[date]);
-    if (Number.isFinite(close)) {
-      filteredDates.push(date);
-      prices.push(close);
-    }
-  });
-
-  if (filteredDates.length < 2) {
-    throw new Error(`${asset.symbol}: insufficient samples after filtering`);
+  if (payload && typeof payload['Error Message'] === 'string') {
+    return new Error(`${symbol}: FMP error - ${payload['Error Message']}`);
   }
-
-  return {
-    symbol: asset.symbol,
-    label: asset.label,
-    category: asset.category,
-    dates: filteredDates,
-    prices,
-  };
-}
-
-function buildAlphaUrl(params) {
-  const url = new URL('https://www.alphavantage.co/query');
-  Object.entries(params).forEach(([key, value]) => {
-    url.searchParams.set(key, value);
-  });
-  url.searchParams.set('apikey', API_KEY);
-  return url;
-}
-
-function extractEquitySeries(payload) {
-  return payload?.['Time Series (Daily)'];
-}
-
-function parseCryptoSymbol(symbol) {
-  const [base, quote = 'USD'] = symbol.split('-');
-  return { base, market: quote };
+  return new Error(`${symbol}: FMP response did not contain historical data.`);
 }
 
 function buildOutput(aligned, returns) {
@@ -357,13 +294,8 @@ function buildPairSeries(records, window, alignedPrices, symbols) {
   return pairs;
 }
 
-function buildAlphaError(payload, symbol) {
-  const message = payload?.Note || payload?.['Error Message'] || JSON.stringify(payload);
-  return new Error(`${symbol}: Alpha Vantage returned an error: ${message}`);
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function computeCutoffDate() {
+  return MINIMUM_CUTOFF_DATE;
 }
 
 async function readHistoricalSeries() {
@@ -417,7 +349,7 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
     return latestSeries;
   }
 
-  const cutoff = cutoffDate || REMOTE_CUTOFF_DATE;
+  const cutoff = cutoffDate || DATA_START_DATE;
   const merged = latestSeries.map((series) => {
     const history = historical.map.get(series.symbol);
     if (!history) {
@@ -473,7 +405,7 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
 
 function buildSeriesFromHistory(historical, cutoffDate) {
   const merged = [];
-  const cutoff = cutoffDate || REMOTE_CUTOFF_DATE;
+  const cutoff = cutoffDate || DATA_START_DATE;
   ASSETS.forEach((asset) => {
     const cached = historical.map.get(asset.symbol);
     if (!cached) {

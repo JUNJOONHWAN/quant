@@ -34,14 +34,14 @@ require_tool npm
 require_file scripts/fetch_long_history.py
 require_file scripts/generate-data.js
 
-if [[ -z "${ALPHAVANTAGE_API_KEY:-}" ]]; then
-  die "환경변수 ALPHAVANTAGE_API_KEY 가 설정되어 있지 않습니다. Alpha Vantage 키를 내보낸 뒤 실행하세요."
+if [[ -z "${FMP_API_KEY:-}" ]]; then
+  die "환경변수 FMP_API_KEY 가 설정되어 있지 않습니다. Financial Modeling Prep 키를 내보낸 뒤 실행하세요."
 fi
 
 log "1/3 장기 시계열(2017-) 다운로드"
 python3 scripts/fetch_long_history.py --force
 
-log "2/3 Alpha Vantage 기반 지표 생성"
+log "2/3 FMP 기반 지표 생성"
 npm run generate:data
 
 log "3/3 단위 테스트 실행"
