@@ -58,7 +58,12 @@ function sliceAligned(aligned, startDate, endDate) {
   return { dates, prices, categories: aligned.categories };
 }
 
-function leveragedReturn(r, lev = 3) { if (!Number.isFinite(r)) return 0; const x = lev * r; return Math.max(-0.99, x); }
+function leveragedReturn(r, lev = 3, weight = 1) {
+  if (!Number.isFinite(r)) return 0;
+  const effWeight = Number.isFinite(weight) ? weight : 1;
+  const x = lev * r * effWeight;
+  return Math.max(-0.99, x);
+}
 function equityFromReturns(ret) { let e = 1; return ret.map((r) => { e *= 1 + (Number.isFinite(r) ? r : 0); return Number(e.toFixed(8)); }); }
 function maxDrawdown(eq) { let p = eq[0] || 1; let m = 0; for (const v of eq) { if (v > p) p = v; const dd = (p - v) / p; if (dd > m) m = dd; } return m; }
 function annualize(days, total) { const y = Math.max(days / 252, 1e-9); return Math.pow(1 + total, 1 / y) - 1; }
@@ -137,7 +142,12 @@ function scoreSet(ctx, MM, aligned, startDate, endDate, stabTune) {
   const pricesQQQ = returns.priceSeries['QQQ'];
   const baseRet = computeBaseReturns(pricesQQQ, 30);
   const executed = series.executedState.map((v,i)=> (i===0?0:series.executedState[i]));
-  const strat = executed.map((reg,i)=>(reg>0?leveragedReturn(baseRet[i],3):reg<0?0:baseRet[i]));
+  const neutralWeight = 0.33;
+  const strat = executed.map((reg,i)=>{
+    if (reg>0) return leveragedReturn(baseRet[i],3,1);
+    if (reg<0) return 0;
+    return leveragedReturn(baseRet[i],3,neutralWeight);
+  });
   const eq = equityFromReturns(strat);
   const total = eq[eq.length-1]-1;
   const cagr = annualize(series.dates.length, total);

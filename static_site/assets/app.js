@@ -208,6 +208,7 @@ const SIGNAL = {
     baseSymbol: 'QQQ',
     leveredSymbol: 'TQQQ',
     leverage: 3,
+    neutralWeight: 0.33,
   },
 };
 
@@ -1334,15 +1335,19 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
     ? riskSeries.executedState
     : riskSeries.state.map((value, idx) => (idx === 0 ? 0 : riskSeries.state[idx - 1] || 0));
+  const neutralWeight = Number.isFinite(tradeConfig.neutralWeight) ? tradeConfig.neutralWeight : 0;
 
   const stratReturns = executedState.map((regime, idx) => {
+    const baseRet = baseReturns[idx];
+    const onReturn = leveragedReturn(baseRet, tradeConfig.leverage, 1);
+    const neutralReturn = neutralWeight !== 0 ? leveragedReturn(baseRet, tradeConfig.leverage, neutralWeight) : 0;
     if (regime > 0) {
-      return leveragedReturn(baseReturns[idx], tradeConfig.leverage);
+      return onReturn;
     }
     if (regime < 0) {
       return 0;
     }
-    return baseReturns[idx];
+    return neutralReturn;
   });
 
   const equityStrategy = [];
@@ -1453,7 +1458,9 @@ function renderBacktest() {
 
   if (stats) {
     const onLabel = tradeConfig.leveredSymbol || `${tradeConfig.leverage}x ${tradeConfig.baseSymbol}`;
-    const configNote = `포지션: On=${onLabel} · Neutral=${tradeConfig.baseSymbol} · Off=현금 (1일 지연)`;
+    const neutralPct = Number.isFinite(tradeConfig.neutralWeight) ? Math.round(tradeConfig.neutralWeight * 100) : null;
+    const neutralLabel = neutralPct != null ? `${neutralPct}% ${onLabel}` : tradeConfig.baseSymbol;
+    const configNote = `포지션: On=${onLabel} · Neutral=${neutralLabel} · Off=현금 (1일 지연)`;
     const out = `히트율(1일): ${(backtest.hit1 * 100).toFixed(1)}% · 히트율(5일): ${(backtest.hit5 * 100).toFixed(1)}% · 전략 누적 ${pct(backtest.cumulativeStrategy)} · 벤치마크 누적 ${pct(backtest.cumulativeBenchmark)} · ${configNote}`;
     stats.textContent = out;
   }
@@ -2834,9 +2841,9 @@ function sigmoid(x, slope = 1) {
   return 1 / (1 + Math.exp(-t));
 }
 
-function leveragedReturn(baseReturn, leverage = 3) {
+function leveragedReturn(baseReturn, leverage = 3, weight = 1) {
   if (!Number.isFinite(baseReturn)) return 0;
-  const levered = leverage * baseReturn;
+  const levered = leverage * baseReturn * (Number.isFinite(weight) ? weight : 1);
   // Prevent daily drop worse than -100% to avoid negative equity
   return Math.max(-0.99, levered);
 }
@@ -3017,6 +3024,7 @@ function buildMethodologySection() {
     '- FFL Mode = Classic 점수에 Safe↔Risk 플럭스(J_norm), Flux Intensity, FAR, Guard를 조합한 Classic+Flux 레짐입니다.',
     '- FFL+EXP Mode = Classic(현재 레짐) + Flux(J_norm, 전환 감지) + Stability(시장 결합도, EMA/레벨) 3요소를 단순 결합합니다. 다수결로 On/Off를 결정(동률이면 Flux 우선), 점수는 세 값을 단순 평균합니다. 별도 수식은 추가하지 않습니다.',
     '- 기본 동작은 Classic이며 사용자가 명시적으로 변경한 경우에만 Enhanced/FFL이 적용됩니다.',
+    '- 레짐 포지션: Risk-On = TQQQ 100%, Neutral = TQQQ 33%, Risk-Off = 현금. 모든 신호는 T+1 시초가 기준으로 집행됩니다.',
     `- 히트맵과 Absorption Ratio는 ${state.window}일 롤링 상관행렬·1차 고유값 비중으로 계산하며, 동일 데이터가 레짐 Guard에도 쓰입니다.`,
     `- 지수 추이 표는 신호 주지수(${SIGNAL.primaryStock})와 벤치마크(${SIGNAL.trade.baseSymbol})의 종가/일간 수익률을 그대로 나열해 백테스트 결과를 재현할 수 있도록 합니다.`,
   ];

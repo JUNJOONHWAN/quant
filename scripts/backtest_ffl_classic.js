@@ -40,9 +40,10 @@ function sliceAligned(aligned, startDate, endDate) {
   return { dates, prices, categories: aligned.categories };
 }
 
-function leveragedReturn(r, lev = 3) {
+function leveragedReturn(r, lev = 3, weight = 1) {
   if (!Number.isFinite(r)) return 0;
-  const x = lev * r;
+  const effWeight = Number.isFinite(weight) ? weight : 1;
+  const x = lev * r * effWeight;
   return Math.max(-0.99, x);
 }
 
@@ -128,10 +129,11 @@ async function main() {
   }
 
   const executed = engineOut.executedState;
+  const neutralWeight = 0.33;
   const stratRet = executed.map((reg, i) => {
-    if (reg > 0) return leveragedReturn(baseRet[i], 3);
+    if (reg > 0) return leveragedReturn(baseRet[i], 3, 1);
     if (reg < 0) return 0;
-    return baseRet[i];
+    return leveragedReturn(baseRet[i], 3, neutralWeight);
   });
 
   const eqStrat = equityFromReturns(stratRet);
@@ -155,4 +157,3 @@ async function main() {
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
-

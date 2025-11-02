@@ -35,7 +35,7 @@ const SIGNAL = {
   primaryStock: 'IWM',
   breadth: ['IWM', 'SPY', 'BTC-USD'],
   pairKey: 'IWM|BTC-USD',
-  trade: { baseSymbol: 'QQQ', leveredSymbol: 'TQQQ', leverage: 3 },
+  trade: { baseSymbol: 'QQQ', leveredSymbol: 'TQQQ', leverage: 3, neutralWeight: 0.33 },
 };
 
 const RISK_CFG_CLASSIC = {
@@ -392,7 +392,12 @@ function computeRiskSeriesFLLFusion(metrics, records, prices, opts = {}) {
 }
 
 // ------------------ Backtest runner ------------------
-function leveragedReturn(baseReturn, leverage = 3) { if (!Number.isFinite(baseReturn)) return 0; const levered = leverage * baseReturn; return Math.max(-0.99, levered); }
+function leveragedReturn(baseReturn, leverage = 3, weight = 1) {
+  if (!Number.isFinite(baseReturn)) return 0;
+  const effWeight = Number.isFinite(weight) ? weight : 1;
+  const levered = leverage * baseReturn * effWeight;
+  return Math.max(-0.99, levered);
+}
 function equityFromReturns(retArr) { let e = 1; const eq = []; for (let i = 0; i < retArr.length; i += 1) { const r = Number.isFinite(retArr[i]) ? retArr[i] : 0; e *= (1 + r); eq.push(Number(e.toFixed(8))); } return eq; }
 function maxDrawdown(equity) { let peak = equity[0] || 1; let mdd = 0; for (let i = 0; i < equity.length; i += 1) { const v = equity[i]; if (v > peak) peak = v; const dd = (peak - v) / peak; if (dd > mdd) mdd = dd; } return mdd; }
 function annualize(days, totalReturn) { const years = Math.max(days / 252, 1e-9); return Math.pow(1 + totalReturn, 1 / years) - 1; }
@@ -430,7 +435,14 @@ async function main() {
     openToCloseRet.push(oc);
   }
   const executed = fusion.executedState; const lev = SIGNAL.trade.leverage;
-  const stratRet = executed.map((reg, i) => (reg > 0 ? leveragedReturn(openToCloseRet[i], lev) : (reg < 0 ? 0 : baseRet[i])));
+  const neutralWeight = Number.isFinite(SIGNAL.trade.neutralWeight) ? SIGNAL.trade.neutralWeight : 0;
+  const stratRet = executed.map((reg, i) => {
+    const on = leveragedReturn(openToCloseRet[i], lev, 1);
+    const neutral = neutralWeight !== 0 ? leveragedReturn(openToCloseRet[i], lev, neutralWeight) : 0;
+    if (reg > 0) return on;
+    if (reg < 0) return 0;
+    return neutral;
+  });
   const eqStrat = equityFromReturns(stratRet); const eqBH = equityFromReturns(baseRet);
   const totalDays = dates.length; const totalStrat = eqStrat[eqStrat.length - 1] - 1; const totalBH = eqBH[eqBH.length - 1] - 1;
   const cagrStrat = annualize(totalDays, totalStrat); const cagrBH = annualize(totalDays, totalBH);

@@ -1059,8 +1059,11 @@ def compute_fusion(classic: Tuple[List[str], List[float], List[int], List[float]
     }
 
 
-def leveraged_return(r: float, leverage: int = 3) -> float:
-    return max(-0.99, leverage * r)
+def leveraged_return(r: float, leverage: int = 3, weight: float = 1.0) -> float:
+    if not np.isfinite(r):
+        return 0.0
+    eff_weight = float(weight) if np.isfinite(weight) else 1.0
+    return max(-0.99, eff_weight * leverage * r)
 
 
 def backtest_from_state(
@@ -1072,12 +1075,19 @@ def backtest_from_state(
     *,
     price_mode: str = "close",
     prices_open: Optional[List[float]] = None,
+    neutral_weight: float = 1.0 / 3.0,
 ) -> Dict[str, Any]:
     # Use arithmetic returns to match JS/UI backtest and CSV expectations
     mode = "open" if price_mode == "open" else "close"
     series = prices_close
     if mode == "open" and isinstance(prices_open, list) and len(prices_open) >= 2:
-        series = prices_open
+        series = [
+            float(prices_open[idx])
+            if idx < len(prices_open) and np.isfinite(prices_open[idx])
+            else float(prices_close[idx]) if idx < len(prices_close) and np.isfinite(prices_close[idx])
+            else np.nan
+            for idx in range(len(prices_close))
+        ]
     rets: List[float] = [0.0]
     for i in range(1, len(series)):
         a, b = series[i - 1], series[i]
@@ -1085,10 +1095,14 @@ def backtest_from_state(
             rets.append(b / a - 1.0)
         else:
             rets.append(0.0)
+    if len(rets) < len(state) + 1:
+        rets.extend([0.0] * (len(state) + 1 - len(rets)))
     # Align: dates length == len(series). Strategy rets length equals len(dates)
     # We map each regime day to return at same index (already aligned to window slicing externally)
     strat_eq = []
     bh_eq = []
+    base_returns: List[float] = []
+    strat_returns: List[float] = []
     s = 1.0
     b = 1.0
     # Build executed state with delay
@@ -1098,13 +1112,17 @@ def backtest_from_state(
         exec_state[i] = state[j] if j >= 0 else 0
     for i in range(len(state)):
         # Map regime day i to corresponding benchmark return r[i]
-        r = rets[i] if i < len(rets) else 0.0
+        idx_ret = i + 1
+        r = rets[idx_ret] if idx_ret < len(rets) else 0.0
+        base_returns.append(r)
         if exec_state[i] > 0:
-            s *= 1.0 + leveraged_return(r, leverage)
+            step_ret = leveraged_return(r, leverage, 1.0)
         elif exec_state[i] < 0:
-            s *= 1.0  # cash
+            step_ret = 0.0
         else:
-            s *= 1.0 + r
+            step_ret = leveraged_return(r, leverage, neutral_weight)
+        strat_returns.append(step_ret)
+        s *= 1.0 + step_ret
         b *= 1.0 + r
         strat_eq.append(s)
         bh_eq.append(b)
@@ -1115,6 +1133,9 @@ def backtest_from_state(
         "cum_strategy": strat_eq[-1] if strat_eq else 1.0,
         "cum_bh": bh_eq[-1] if bh_eq else 1.0,
         "price_mode": mode,
+        "base_returns": base_returns,
+        "strategy_returns": strat_returns,
+        "executed_state": exec_state,
     }
 
 
