@@ -35,6 +35,9 @@ const PRECOMPUTED_PATH = path.join(DATA_DIR, 'precomputed.json');
 const HISTORICAL_PATH = path.join(DATA_DIR, 'historical_prices.json');
 
 const DATA_START_DATE = '2017-01-01';
+const BENCHMARK_SYMBOL = 'QQQ';
+const LEVERED_SYMBOL = 'TQQQ';
+
 const ASSETS = [
   { symbol: 'QQQ', label: 'QQQ (NASDAQ 100 ETF)', category: 'stock', fmpSymbol: 'QQQ' },
   { symbol: 'IWM', label: 'IWM (Russell 2000 ETF)', category: 'stock', fmpSymbol: 'IWM' },
@@ -42,6 +45,10 @@ const ASSETS = [
   { symbol: 'TLT', label: 'TLT (미국 장기채)', category: 'bond', fmpSymbol: 'TLT' },
   { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', fmpSymbol: 'GLD' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', fmpSymbol: 'BTCUSD' },
+];
+
+const LEVERED_ASSETS = [
+  { symbol: 'TQQQ', label: 'TQQQ (NASDAQ 100 3x ETF)', category: 'levered', fmpSymbol: 'TQQQ' },
 ];
 
 const SIGNAL = {
@@ -65,6 +72,7 @@ async function main() {
 
   try {
     let mergedSeries;
+    let leveredSeriesMerged;
     if (useHistoryOnly) {
       if (!historical || !(historical.map instanceof Map) || historical.map.size === 0) {
         throw new Error('Historical dataset is unavailable; cannot build precomputed payload without FMP data.');
@@ -74,7 +82,8 @@ async function main() {
       } else if (USE_HISTORY_ONLY) {
         console.log('[generate-data] USE_FMP_HISTORY_ONLY/GENERATE_USE_FMP_ONLY enabled; skipping live fetch.');
       }
-      mergedSeries = buildSeriesFromHistory(historical, cutoffDate);
+      mergedSeries = buildSeriesFromHistory(historical, cutoffDate, ASSETS);
+      leveredSeriesMerged = buildSeriesFromHistory(historical, cutoffDate, LEVERED_ASSETS);
     } else {
       const assetSeries = [];
       for (let index = 0; index < ASSETS.length; index += 1) {
@@ -85,12 +94,23 @@ async function main() {
         console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
       }
       mergedSeries = mergeSeriesWithHistory(assetSeries, historical, cutoffDate);
+
+      const leveredLatest = [];
+      for (let index = 0; index < LEVERED_ASSETS.length; index += 1) {
+        const asset = LEVERED_ASSETS[index];
+        console.log(`Fetching ${asset.symbol} via Financial Modeling Prep`);
+        const series = await fetchFmpSeries(asset, cutoffDate, endDate);
+        leveredLatest.push(series);
+        console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
+      }
+      leveredSeriesMerged = mergeSeriesWithHistory(leveredLatest, historical, cutoffDate);
     }
 
     const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
     const openSeries = buildAlignedOpenSeries(aligned.dates, mergedSeries);
-    const output = buildOutput(aligned, returns, openSeries);
+    const leveredAligned = buildLeveredSeries(aligned.dates, leveredSeriesMerged || []);
+    const output = buildOutput(aligned, returns, openSeries, leveredAligned);
     await writeOutput(output);
   } catch (error) {
     console.error(error);
@@ -225,7 +245,7 @@ function buildFmpError(payload, symbol) {
   return new Error(`${symbol}: FMP response did not contain historical data.`);
 }
 
-function buildOutput(aligned, returns, openSeries) {
+function buildOutput(aligned, returns, openSeries, leveredSeries) {
   const windows = {};
   WINDOWS.forEach((window) => {
     windows[window] = computeWindowMetrics(window, returns, aligned);
@@ -238,10 +258,56 @@ function buildOutput(aligned, returns, openSeries) {
     normalizedPrices: returns.normalizedPrices,
     priceSeries: returns.priceSeries,
     priceSeriesOpen: openSeries,
+    leveredSeries,
     priceSeriesSource: 'actual',
+    benchmark: {
+      symbol: BENCHMARK_SYMBOL,
+      leveredSymbol: LEVERED_SYMBOL,
+    },
     assets: ASSETS.map(({ symbol, label, category }) => ({ symbol, label, category })),
     windows,
   };
+}
+
+function buildLeveredSeries(dates, seriesList) {
+  const result = {};
+  if (!Array.isArray(dates) || !Array.isArray(seriesList)) {
+    return result;
+  }
+  if (dates.length < 2) {
+    return result;
+  }
+  const analysisDates = dates.slice(1);
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) {
+      return;
+    }
+    const closeMap = new Map(series.dates.map((date, index) => [date, series.prices[index]]));
+    const openMap = new Map(series.dates.map((date, index) => [date, Array.isArray(series.opens) ? series.opens[index] : undefined]));
+    const closes = [];
+    const opens = [];
+    let lastClose = null;
+    let lastOpen = null;
+    for (let i = 0; i < analysisDates.length; i += 1) {
+      const date = analysisDates[i];
+      const closeValue = Number(closeMap.get(date));
+      const openValue = Number(openMap.get(date));
+      const normalizedClose = Number.isFinite(closeValue) ? closeValue : lastClose;
+      const normalizedOpen = Number.isFinite(openValue)
+        ? openValue
+        : (Number.isFinite(closeValue) ? closeValue : lastOpen ?? normalizedClose);
+      closes.push(Number.isFinite(normalizedClose) ? normalizedClose : null);
+      opens.push(Number.isFinite(normalizedOpen) ? normalizedOpen : null);
+      if (Number.isFinite(normalizedClose)) {
+        lastClose = normalizedClose;
+      }
+      if (Number.isFinite(normalizedOpen)) {
+        lastOpen = normalizedOpen;
+      }
+    }
+    result[series.symbol] = { close: closes, open: opens };
+  });
+  return result;
 }
 
 async function writeOutput(output) {
@@ -482,17 +548,22 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
   return merged;
 }
 
-function buildSeriesFromHistory(historical, cutoffDate) {
+function buildSeriesFromHistory(historical, cutoffDate, assets) {
+  if (!historical || !(historical.map instanceof Map)) {
+    return [];
+  }
   const merged = [];
   const cutoff = cutoffDate || DATA_START_DATE;
-  ASSETS.forEach((asset) => {
+  assets.forEach((asset) => {
     const cached = historical.map.get(asset.symbol);
     if (!cached) {
-      throw new Error(`Historical dataset missing ${asset.symbol}; cannot build payload.`);
+      console.warn(`[generate-data] historical dataset missing ${asset.symbol}; skipping.`);
+      return;
     }
     const trimmed = trimSeries(cached, (date) => !cutoff || date >= cutoff);
     if (trimmed.dates.length < 2) {
-      throw new Error(`${asset.symbol}: insufficient historical samples after cutoff ${cutoff}.`);
+      console.warn(`[generate-data] ${asset.symbol}: insufficient historical samples after cutoff ${cutoff}; skipping.`);
+      return;
     }
     merged.push({
       symbol: asset.symbol,

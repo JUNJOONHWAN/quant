@@ -236,6 +236,7 @@ const state = {
   normalizedPrices: {},
   priceSeries: {},
   priceSeriesOpen: {},
+  leveredSeries: {},
   priceSeriesSource: 'actual',
   analysisDates: [],
   generatedAt: null,
@@ -250,6 +251,10 @@ const state = {
   },
   riskMode: getInitialRiskMode(),
   heatmapDate: null,
+  benchmark: {
+    symbol: SIGNAL.trade.baseSymbol,
+    leveredSymbol: SIGNAL.trade.leveredSymbol,
+  },
 };
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
@@ -498,6 +503,23 @@ function cloneSeriesMap(seriesMap) {
   );
 }
 
+function alignArrayLength(values, targetLength) {
+  if (!Number.isFinite(targetLength) || targetLength <= 0) {
+    return Array.isArray(values) ? values.slice() : [];
+  }
+  const normalized = Array.isArray(values)
+    ? values.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+    : [];
+  if (normalized.length === targetLength) {
+    return normalized;
+  }
+  if (normalized.length > targetLength) {
+    return normalized.slice(normalized.length - targetLength);
+  }
+  const padding = new Array(targetLength - normalized.length).fill(null);
+  return padding.concat(normalized);
+}
+
 function buildAlignedOpenSeries(dates, seriesList) {
   const opens = {};
   if (!Array.isArray(dates)) {
@@ -598,6 +620,24 @@ function hydrateFromPrecomputed(data) {
   state.priceSeries = priceSeries;
   state.priceSeriesOpen = priceSeriesOpen;
   state.normalizedPrices = normalizedPrices;
+  state.benchmark = {
+    symbol: data?.benchmark?.symbol || SIGNAL.trade.baseSymbol,
+    leveredSymbol: data?.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol,
+  };
+  state.leveredSeries = {};
+  if (data.leveredSeries && typeof data.leveredSeries === 'object') {
+    const targetLength = Array.isArray(state.analysisDates) ? state.analysisDates.length : 0;
+    Object.entries(data.leveredSeries).forEach(([symbol, series]) => {
+      const closes = Array.isArray(series?.close) ? series.close.slice() : [];
+      const opens = Array.isArray(series?.open) ? series.open.slice() : [];
+      const alignedClose = alignArrayLength(closes, targetLength);
+      const alignedOpen = alignArrayLength(opens.length ? opens : closes, targetLength);
+      state.leveredSeries[symbol] = {
+        close: alignedClose,
+        open: alignedOpen,
+      };
+    });
+  }
   state.priceSeriesSource = 'actual';
   state.metrics = {};
   if (data.windows && typeof data.windows === 'object') {
@@ -1298,6 +1338,7 @@ function computeAnnualizedReturn(equitySeries, sampleCount) {
 function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const tradeConfig = SIGNAL.trade;
   const baseSymbol = tradeConfig.baseSymbol;
+  const leveredSymbol = state.benchmark?.leveredSymbol || tradeConfig.leveredSymbol;
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const firstDate = filteredRecords?.[0]?.date;
   let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
@@ -1310,8 +1351,11 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
 
   const prices = state.priceSeries[baseSymbol] || [];
   const opens = state.priceSeriesOpen?.[baseSymbol] || [];
+  const leveredCloses = state.leveredSeries?.[leveredSymbol]?.close || [];
 
   const baseReturns = [];
+  const priceQQQ = [];
+  const priceLevered = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
@@ -1330,6 +1374,10 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
       openReturn = prices[priceIndex] / prices[prevIndex] - 1;
     }
     baseReturns.push(openReturn);
+    const qqqClose = Number.isFinite(prices?.[priceIndex]) ? Number(prices[priceIndex]) : null;
+    const leveredClose = Number.isFinite(leveredCloses?.[priceIndex]) ? Number(leveredCloses[priceIndex]) : null;
+    priceQQQ.push(qqqClose);
+    priceLevered.push(leveredClose);
   }
 
   const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
@@ -1400,6 +1448,8 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     cagrBenchmark,
     cumulativeStrategy: equityStrategy.length > 0 ? equityStrategy[equityStrategy.length - 1] - 1 : 0,
     cumulativeBenchmark: equityBenchmark.length > 0 ? equityBenchmark[equityBenchmark.length - 1] - 1 : 0,
+    priceQQQ,
+    priceLevered,
   };
 }
 
@@ -3222,6 +3272,7 @@ function buildBacktestSummarySection(backtest, riskSeries) {
   lines.push(`- 연복리 수익률(CAGR): 전략 ${pct(backtest.cagrStrategy)} | 벤치마크 ${pct(backtest.cagrBenchmark)}`);
   lines.push(`- 최대 낙폭(MDD): 전략 ${pct(backtest.maxDrawdownStrategy)} | 벤치마크 ${pct(backtest.maxDrawdownBenchmark)}`);
   lines.push(`- 히트율: 1일 ${(backtest.hit1 * 100).toFixed(1)}% · 5일 ${(backtest.hit5 * 100).toFixed(1)}%`);
+  lines.push(`- 벤치마크: ${state.benchmark?.symbol || SIGNAL.trade.baseSymbol} (T+1 시초가 기준)`);
 
   if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
     const total = riskSeries.state.length;
@@ -3250,6 +3301,9 @@ function buildBacktestDailySection(backtest, riskSeries) {
   const executed = Array.isArray(backtest.executedState) ? backtest.executedState : [];
   const benchEquity = Array.isArray(backtest.equityBenchmark) ? backtest.equityBenchmark : [];
   const stratEquity = Array.isArray(backtest.equityStrategy) ? backtest.equityStrategy : [];
+  const qqqPrices = Array.isArray(backtest.priceQQQ) ? backtest.priceQQQ : [];
+  const leveredPrices = Array.isArray(backtest.priceLevered) ? backtest.priceLevered : [];
+  const leveredLabel = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
 
   const headers = [
     '날짜',
@@ -3259,6 +3313,8 @@ function buildBacktestDailySection(backtest, riskSeries) {
     'ret_strategy',
     'eq_strategy',
     'eq_benchmark',
+    `${SIGNAL.trade.baseSymbol} 종가`,
+    `${leveredLabel} 종가`,
   ];
 
   const rows = [];
@@ -3270,6 +3326,8 @@ function buildBacktestDailySection(backtest, riskSeries) {
     const stratReturn = Number.isFinite(backtest.stratReturns?.[i]) ? backtest.stratReturns[i] : 0;
     const eqStrat = Number.isFinite(stratEquity?.[i]) ? stratEquity[i] : 1;
     const eqBench = Number.isFinite(benchEquity?.[i]) ? benchEquity[i] : 1;
+    const qqqPrice = Number.isFinite(qqqPrices?.[i]) ? qqqPrices[i] : null;
+    const leveredPrice = Number.isFinite(leveredPrices?.[i]) ? leveredPrices[i] : null;
 
     rows.push([
       date,
@@ -3279,6 +3337,8 @@ function buildBacktestDailySection(backtest, riskSeries) {
       formatDecimal(stratReturn, 8),
       formatDecimal(eqStrat, 8),
       formatDecimal(eqBench, 8),
+      formatDecimal(qqqPrice, 8, '0.00000000'),
+      formatDecimal(leveredPrice, 8, '0.00000000'),
     ]);
   }
 
@@ -3294,23 +3354,28 @@ function buildPriceSection(records) {
   }
   const signalSymbol = SIGNAL.primaryStock;
   const benchmarkSymbol = SIGNAL.trade.baseSymbol;
+  const leveredSymbol = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
   lines.push(`- 대상: 신호 주지수 ${signalSymbol}, 벤치마크 ${benchmarkSymbol}`);
   const rows = records.map((rec) => {
     const date = rec.date;
     const signalPrice = lookupPriceByDate(signalSymbol, date);
     const benchmarkPrice = lookupPriceByDate(benchmarkSymbol, date);
+    const leveredPrice = lookupPriceByDate(leveredSymbol, date);
     const signalRet = computeDailyReturnForSymbol(signalSymbol, date);
     const benchmarkRet = computeDailyReturnForSymbol(benchmarkSymbol, date);
+    const leveredRet = computeDailyReturnForSymbol(leveredSymbol, date);
     return [
       date,
       formatNumberOrNA(signalPrice, 2),
       formatSignedPercent(signalRet),
       formatNumberOrNA(benchmarkPrice, 2),
       formatSignedPercent(benchmarkRet),
+      formatNumberOrNA(leveredPrice, 2),
+      formatSignedPercent(leveredRet),
     ];
   });
   lines.push(...formatTable(
-    ['날짜', `${signalSymbol} 종가`, `${signalSymbol} 일간`, `${benchmarkSymbol} 종가`, `${benchmarkSymbol} 일간`],
+    ['날짜', `${signalSymbol} 종가`, `${signalSymbol} 일간`, `${benchmarkSymbol} 종가`, `${benchmarkSymbol} 일간`, `${leveredSymbol} 종가`, `${leveredSymbol} 일간`],
     rows,
   ));
   return lines;
@@ -3432,7 +3497,13 @@ function lookupPriceByDate(symbol, date) {
   const dates = state.analysisDates || [];
   const idx = dates.indexOf(date);
   if (idx < 0) return null;
-  const series = state.priceSeries?.[symbol];
+  let series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series) || !series.length) {
+    const levered = state.leveredSeries?.[symbol]?.close;
+    if (Array.isArray(levered)) {
+      series = levered;
+    }
+  }
   if (!Array.isArray(series)) return null;
   const price = series[idx];
   return Number.isFinite(price) ? price : null;
@@ -3443,7 +3514,13 @@ function computeDailyReturnForSymbol(symbol, date) {
   const dates = state.analysisDates || [];
   const idx = dates.indexOf(date);
   if (idx <= 0) return null;
-  const series = state.priceSeries?.[symbol];
+  let series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series) || !series.length) {
+    const levered = state.leveredSeries?.[symbol]?.close;
+    if (Array.isArray(levered)) {
+      series = levered;
+    }
+  }
   if (!Array.isArray(series)) return null;
   const current = series[idx];
   const prev = series[idx - 1];

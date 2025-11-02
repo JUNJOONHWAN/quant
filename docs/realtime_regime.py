@@ -13,8 +13,10 @@ import requests
 
 # Symbols and clusters (match front-end JS defaults)
 BASE_SYMBOL = "QQQ"
-_bench_sym_env = os.getenv("REGIME_BENCH_SYMBOL", "TQQQ")
-BENCH_SYMBOL = (_bench_sym_env or "TQQQ").upper()
+_levered_sym_env = os.getenv("REGIME_LEVERED_SYMBOL", "TQQQ")
+LEVERED_SYMBOL = (_levered_sym_env or "TQQQ").upper()
+_bench_sym_env = os.getenv("REGIME_BENCH_SYMBOL", LEVERED_SYMBOL)
+BENCH_SYMBOL = (_bench_sym_env or LEVERED_SYMBOL).upper()
 try:
     NEUTRAL_BENCH_WEIGHT = float(os.getenv("REGIME_NEUTRAL_BENCH_WEIGHT", "0.33"))
 except ValueError:
@@ -1194,6 +1196,7 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         raise RuntimeError("FMP_API_KEY is not set. Please add it to .env")
     # 1) Daily history (adj close + adj open)
     hist_frames = fetch_daily_history_fmp(ALL_SYMBOLS, from_str, api_key)
+    levered_frames = fetch_daily_history_fmp([LEVERED_SYMBOL], from_str, api_key)
     close_map: Dict[str, pd.Series] = {}
     open_map: Dict[str, pd.Series] = {}
     idx_union: Optional[pd.Index] = None
@@ -1242,9 +1245,31 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         sym: aligned_open[sym].reindex(idx_inter).ffill().fillna(inter_series_close[sym])
         for sym in ALL_SYMBOLS
     }
+    levered_series: Dict[str, Dict[str, List[float]]] = {}
+    if levered_frames:
+        levered_df = levered_frames.get(LEVERED_SYMBOL)
+        if levered_df is not None and not levered_df.empty:
+            close_series = levered_df["adj_close"].astype(float)
+            open_series = levered_df.get("adj_open")
+            if open_series is not None:
+                open_series = open_series.astype(float)
+            else:
+                open_series = pd.Series(index=close_series.index, dtype=float)
+            open_series = open_series.fillna(close_series)
+            close_aligned = close_series.reindex(idx_union).ffill()
+            open_aligned = open_series.reindex(idx_union).ffill().fillna(close_aligned)
+            close_final = close_aligned.reindex(idx_inter).ffill()
+            open_final = open_aligned.reindex(idx_inter).ffill().fillna(close_final)
+            levered_series[LEVERED_SYMBOL] = {
+                "close": close_final.astype(float).tolist(),
+                "open": open_final.astype(float).tolist(),
+            }
     dates = [d.strftime("%Y-%m-%d") for d in inter_dates]
     prices = {s: inter_series_close[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_close}
     prices_open = {s: inter_series_open[s].astype(float).tolist() for s in ALL_SYMBOLS if s in inter_series_open}
+    if levered_series:
+        prices.update({sym: series["close"] for sym, series in levered_series.items()})
+        prices_open.update({sym: series["open"] for sym, series in levered_series.items()})
     # Compute window metrics for SIGNAL set
     date_idx = inter_dates
     metrics = compute_window_metrics(prices, date_idx, window)
@@ -1345,6 +1370,8 @@ def compute_realtime_regime(window: int = 30, use_realtime: bool = True, years: 
         "classic": {"score": classic[1], "state": classic[2]},
         "ffl_stab": ffl,
         "fusion": fusion,
+        "benchmark": {"symbol": BASE_SYMBOL, "leveredSymbol": LEVERED_SYMBOL},
+        "levered_series": levered_series,
         "series": series_payload,
         "series_open": series_open_payload,
         "stability": [float(r.get("stability", np.nan)) for r in metrics["records"]],

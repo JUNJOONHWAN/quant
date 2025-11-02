@@ -46,6 +46,7 @@ ASSETS: Sequence[Asset] = (
     Asset("TLT", "TLT (US Long Treasury)", "bond", "TLT"),
     Asset("GLD", "GLD (Gold ETF)", "gold", "GLD"),
     Asset("BTC-USD", "BTC-USD (Bitcoin)", "crypto", "BTCUSD"),
+    Asset("TQQQ", "TQQQ (NASDAQ 100 3x ETF)", "levered", "TQQQ"),
 )
 
 

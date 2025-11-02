@@ -65,7 +65,14 @@ if (!filtered || filtered.empty) {
 const series = context.computeRiskSeriesFLLFusion(metrics30, filtered.records);
 const backtest = context.evaluateBacktestSeries(series, metrics30, filtered.records);
 
-const header = 'date,regime,executed,ret_bench,ret_strategy,eq_strategy,eq_benchmark\n';
+vm.runInContext(`state.customRange = { start: '${START}', end: '${END}', valid: true };`, context);
+
+const benchmarkSymbol = vm.runInContext('state.benchmark?.symbol || SIGNAL.trade.baseSymbol', context);
+const leveredSymbol = vm.runInContext('state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol', context);
+const priceQQQ = Array.isArray(backtest.priceQQQ) ? backtest.priceQQQ : [];
+const priceLevered = Array.isArray(backtest.priceLevered) ? backtest.priceLevered : [];
+
+const header = `date,regime,executed,ret_bench,ret_strategy,eq_strategy,eq_benchmark,price_${benchmarkSymbol.toLowerCase()},price_${leveredSymbol.toLowerCase()}\n`;
 const rows = backtest.dates.map((date, idx) => [
   date,
   series.state[idx],
@@ -74,6 +81,8 @@ const rows = backtest.dates.map((date, idx) => [
   backtest.stratReturns[idx].toFixed(8),
   backtest.equityStrategy[idx].toFixed(8),
   backtest.equityBenchmark[idx].toFixed(8),
+  (Number.isFinite(priceQQQ[idx]) ? Number(priceQQQ[idx]).toFixed(8) : '0.00000000'),
+  (Number.isFinite(priceLevered[idx]) ? Number(priceLevered[idx]).toFixed(8) : '0.00000000'),
 ].join(','));
 
 fs.writeFileSync(OUTPUT, header + rows.join('\n'));
