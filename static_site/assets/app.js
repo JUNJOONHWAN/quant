@@ -234,6 +234,7 @@ const state = {
   metrics: {},
   normalizedPrices: {},
   priceSeries: {},
+  priceSeriesOpen: {},
   priceSeriesSource: 'actual',
   analysisDates: [],
   generatedAt: null,
@@ -422,6 +423,7 @@ async function loadFromYahoo() {
   state.generatedAt = new Date();
   state.normalizedPrices = returns.normalizedPrices;
   state.priceSeries = returns.priceSeries;
+  state.priceSeriesOpen = cloneSeriesMap(returns.priceSeries);
   state.priceSeriesSource = 'actual';
   computeAllMetrics(returns, aligned);
   maybeAlignDatesToCurrent();
@@ -447,6 +449,20 @@ async function loadFromFmp(apiKey) {
   state.generatedAt = new Date();
   state.normalizedPrices = returns.normalizedPrices;
   state.priceSeries = returns.priceSeries;
+  const openSeries = buildAlignedOpenSeries(aligned.dates, assetSeries);
+  Object.keys(returns.priceSeries).forEach((symbol) => {
+    const closes = Array.isArray(returns.priceSeries[symbol]) ? returns.priceSeries[symbol] : [];
+    const opens = Array.isArray(openSeries[symbol]) ? openSeries[symbol] : [];
+    if (!Array.isArray(openSeries[symbol]) || openSeries[symbol].length !== closes.length) {
+      openSeries[symbol] = closes.slice();
+    } else {
+      openSeries[symbol] = opens.map((value, index) => {
+        const closeValue = closes[index];
+        return Number.isFinite(value) ? value : closeValue;
+      });
+    }
+  });
+  state.priceSeriesOpen = openSeries;
   state.priceSeriesSource = 'actual';
   computeAllMetrics(returns, aligned);
 }
@@ -479,6 +495,37 @@ function cloneSeriesMap(seriesMap) {
   return Object.fromEntries(
     Object.entries(seriesMap).map(([symbol, values]) => [symbol, Array.isArray(values) ? values.slice() : []]),
   );
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) {
+    return opens;
+  }
+
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) {
+      return;
+    }
+    const openMap = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    const length = series.dates.length;
+    for (let index = 0; index < length; index += 1) {
+      const date = series.dates[index];
+      const closeValue = Array.isArray(series.prices) ? series.prices[index] : null;
+      const openValue = hasOpens ? series.opens[index] : null;
+      const normalizedOpen = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalizedOpen)) {
+        openMap.set(date, normalizedOpen);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = openMap.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+
+  return opens;
 }
 
 function findMissingSymbols(seriesMap, symbols) {
@@ -518,6 +565,10 @@ function hydrateFromPrecomputed(data) {
     return;
   }
 
+  const rawPriceSeriesOpen = data.priceSeriesOpen && typeof data.priceSeriesOpen === 'object'
+    ? data.priceSeriesOpen
+    : null;
+
   const missingSymbols = findMissingSymbols(rawPriceSeries, REQUIRED_SYMBOLS);
   if (missingSymbols.length > 0) {
     const summary = `필수 자산 데이터 누락: ${missingSymbols.join(', ')}`;
@@ -527,6 +578,16 @@ function hydrateFromPrecomputed(data) {
   }
 
   const priceSeries = cloneSeriesMap(rawPriceSeries);
+  const priceSeriesOpen = {};
+  const sourceOpen = rawPriceSeriesOpen ? cloneSeriesMap(rawPriceSeriesOpen) : {};
+  Object.keys(priceSeries).forEach((symbol) => {
+    const opens = sourceOpen[symbol];
+    if (Array.isArray(opens) && opens.length === (priceSeries[symbol]?.length || 0)) {
+      priceSeriesOpen[symbol] = opens.slice();
+    } else {
+      priceSeriesOpen[symbol] = Array.isArray(priceSeries[symbol]) ? priceSeries[symbol].slice() : [];
+    }
+  });
   const normalizedSource =
     data.normalizedPrices && typeof data.normalizedPrices === 'object'
       ? data.normalizedPrices
@@ -534,6 +595,7 @@ function hydrateFromPrecomputed(data) {
   const normalizedPrices = cloneSeriesMap(normalizedSource);
 
   state.priceSeries = priceSeries;
+  state.priceSeriesOpen = priceSeriesOpen;
   state.normalizedPrices = normalizedPrices;
   state.priceSeriesSource = 'actual';
   state.metrics = {};
@@ -1230,8 +1292,9 @@ function renderBacktest() {
   if (baseIdx < 0) baseIdx = 0;
   const dates = series.dates;
   const prices = state.priceSeries[symbol] || [];
+  const opens = state.priceSeriesOpen?.[symbol] || [];
   const baseReturns = [];
-  const leveredReturns = [];
+  const openToCloseReturns = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const prevIndex = priceIndex - 1;
@@ -1240,16 +1303,25 @@ function renderBacktest() {
       daily = prices[priceIndex] / prices[prevIndex] - 1;
     }
     baseReturns.push(daily);
-    leveredReturns.push(leveragedReturn(daily, tradeConfig.leverage));
+    const openPrice = opens[priceIndex];
+    const closePrice = prices[priceIndex];
+    const ocReturn = Number.isFinite(openPrice) && Number.isFinite(closePrice) && openPrice !== 0
+      ? (closePrice / openPrice) - 1
+      : daily;
+    openToCloseReturns.push(ocReturn);
   }
 
   const executedState = Array.isArray(series.executedState) && series.executedState.length === series.state.length
     ? series.executedState
     : series.state.map((value, idx) => (idx === 0 ? 0 : series.state[idx - 1] || 0));
   const stratReturns = executedState.map((regime, idx) => {
-    if (regime > 0) return leveredReturns[idx];
-    if (regime < 0) return 0; // cash
-    return baseReturns[idx]; // neutral holds base asset
+    if (regime > 0) {
+      return leveragedReturn(openToCloseReturns[idx], tradeConfig.leverage);
+    }
+    if (regime < 0) {
+      return 0;
+    }
+    return baseReturns[idx];
   });
 
   function rollingReturnFromSeriesUI(priceSeries, symbol, index, lookback) {
@@ -4072,7 +4144,6 @@ async function fetchFmpSeriesBrowser(asset, apiKey, startDate, endDate) {
   if (apiKey) {
     url.searchParams.set('apikey', apiKey);
   }
-  url.searchParams.set('serietype', 'line');
   if (startDate) {
     url.searchParams.set('from', startDate);
   }
@@ -4089,11 +4160,28 @@ async function fetchFmpSeriesBrowser(asset, apiKey, startDate, endDate) {
   const filtered = rows
     .filter((row) => typeof row?.date === 'string')
     .filter((row) => (!startDate || row.date >= startDate) && (!endDate || row.date <= endDate))
-    .map((row) => ({
-      date: row.date,
-      price: Number(row.close ?? row.adjClose ?? row.price),
-    }))
-    .filter((row) => Number.isFinite(row.price))
+    .map((row) => {
+      const rawClose = Number(row.close ?? row.price);
+      const adjCloseCandidate = Number(row.adjClose ?? row.adj_close);
+      const close = Number.isFinite(adjCloseCandidate) ? adjCloseCandidate : rawClose;
+      if (!Number.isFinite(close)) {
+        return null;
+      }
+      const rawOpenValue = Number(row.open ?? row.adj_open);
+      let open = Number.isFinite(rawOpenValue) ? rawOpenValue : null;
+      if (Number.isFinite(rawOpenValue) && Number.isFinite(adjCloseCandidate) && Number.isFinite(rawClose) && rawClose !== 0) {
+        open = rawOpenValue * (adjCloseCandidate / rawClose);
+      }
+      if (!Number.isFinite(open)) {
+        open = close;
+      }
+      return {
+        date: row.date,
+        close,
+        open,
+      };
+    })
+    .filter((row) => row && Number.isFinite(row.close))
     .sort((a, b) => a.date.localeCompare(b.date));
 
   if (filtered.length < 2) {
@@ -4104,7 +4192,8 @@ async function fetchFmpSeriesBrowser(asset, apiKey, startDate, endDate) {
     symbol: asset.symbol,
     category: asset.category,
     dates: filtered.map((row) => row.date),
-    prices: filtered.map((row) => row.price),
+    prices: filtered.map((row) => row.close),
+    opens: filtered.map((row) => (row.open != null ? row.open : row.close)),
   };
 }
 

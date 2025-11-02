@@ -2,7 +2,7 @@
 
 A static web application that visualizes cross-asset correlations and a derived market stability index directly in the browser.
 The site no longer talks to Yahoo Finance from the client; instead, a GitHub Actions workflow runs `scripts/generate-data.js`, which
-pulls daily prices for QQQ, IWM, SPY, TLT, GLD, and BTC-USD from Financial Modeling Prep (FMP), precomputes the correlation metrics (signals are built
+pulls **adjusted open/close prices** for QQQ, IWM, SPY, TLT, GLD, and BTC-USD from Financial Modeling Prep (FMP), precomputes the correlation metrics (signals are built
 on IWM·SPY·TLT·GLD·BTC-USD, while the backtest benchmark stays on QQQ/TQQQ), and uploads the
 resulting JSON bundle (`static_site/data/precomputed.json`) alongside the static assets. Browsers simply download that JSON and
 render gauges, history charts, and pair analytics—no backend services required.
@@ -96,7 +96,7 @@ Running the suite is a quick way to verify that correlation, EMA, and weighting 
 
 ## Historical cache (2017+)
 
-Both the Node generator and the Python helper pull from the same FMP endpoints. To refresh the long-horizon cache that lives in
+Both the Node generator and the Python helper pull from the same FMP endpoints. The cache now stores **adjusted closes and matching adjusted opens** (`prices` / `opens` arrays) so that all downstream backtests can model T+1 open execution. To refresh the long-horizon cache that lives in
 `static_site/data/historical_prices.json`, run:
 
 1. Export `FMP_API_KEY`.
@@ -112,8 +112,12 @@ Both the Node generator and the Python helper pull from the same FMP endpoints. 
    npm run generate:data
    ```
 
-The Python script keeps every asset in sync with the JSON format that the frontend expects. Keeping the cache under version control
+The Python script keeps every asset in sync with the JSON format that the frontend expects (including the `opens` arrays). Keeping the cache under version control
 helps guarantee reproducible full-history datasets even if rate limits block a fresh pull.
+
+## Execution model
+
+Signals are calculated using end-of-day data, but **all strategy backtests (CLI + UI) assume trades execute at the next session’s adjusted open**. The generated datasets therefore expose both closes (`priceSeries`) and opens (`priceSeriesOpen`), and the JavaScript/Python backtests convert On positions to open→close P&L while Off stays in cash. Neutral mode continues to hold the underlying (close→close) so that benchmark comparisons remain intuitive.
 
 ## Data notice
 

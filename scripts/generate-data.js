@@ -89,7 +89,8 @@ async function main() {
 
     const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
-    const output = buildOutput(aligned, returns);
+    const openSeries = buildAlignedOpenSeries(aligned.dates, mergedSeries);
+    const output = buildOutput(aligned, returns, openSeries);
     await writeOutput(output);
   } catch (error) {
     console.error(error);
@@ -113,11 +114,25 @@ async function fetchFmpSeries(asset, startDate, endDate) {
   const filtered = rows
     .filter((row) => typeof row?.date === 'string')
     .filter((row) => (!startDate || row.date >= startDate) && (!endDate || row.date <= endDate))
-    .map((row) => ({
-      date: row.date,
-      price: safeNumber(row.close ?? row.adjClose ?? row.price),
-    }))
-    .filter((row) => row.price != null)
+    .map((row) => {
+      const rawClose = safeNumber(row.close ?? row.price);
+      const adjClose = safeNumber(row.adjClose ?? row.adj_close);
+      const close = adjClose ?? rawClose;
+      if (!Number.isFinite(close)) {
+        return null;
+      }
+      const rawOpen = safeNumber(row.open ?? row.adj_open);
+      let open = rawOpen;
+      if (Number.isFinite(rawOpen) && Number.isFinite(adjClose) && Number.isFinite(rawClose) && rawClose !== 0) {
+        open = rawOpen * (adjClose / rawClose);
+      }
+      return {
+        date: row.date,
+        close,
+        open: Number.isFinite(open) ? open : null,
+      };
+    })
+    .filter((row) => row && Number.isFinite(row.close))
     .sort((a, b) => a.date.localeCompare(b.date));
 
   if (filtered.length < 2) {
@@ -129,14 +144,14 @@ async function fetchFmpSeries(asset, startDate, endDate) {
     label: asset.label,
     category: asset.category,
     dates: filtered.map((row) => row.date),
-    prices: filtered.map((row) => row.price),
+    prices: filtered.map((row) => row.close),
+    opens: filtered.map((row) => (row.open != null ? row.open : row.close)),
   };
 }
 
 function buildFmpUrl(symbol, startDate, endDate) {
   const url = new URL(`https://financialmodelingprep.com/api/v3/historical-price-full/${encodeURIComponent(symbol)}`);
   url.searchParams.set('apikey', API_KEY || '');
-  url.searchParams.set('serietype', 'line');
   if (startDate) {
     url.searchParams.set('from', startDate);
   }
@@ -153,6 +168,40 @@ function sanitizeFmpSymbol(symbol) {
 function safeNumber(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opensBySymbol = {};
+  if (!Array.isArray(dates)) {
+    return opensBySymbol;
+  }
+
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) {
+      return;
+    }
+    const map = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    const length = series.dates.length;
+    for (let index = 0; index < length; index += 1) {
+      const date = series.dates[index];
+      const closeValue = Array.isArray(series.prices) ? series.prices[index] : undefined;
+      const rawOpen = hasOpens ? series.opens[index] : undefined;
+      const normalizedOpen = Number.isFinite(rawOpen) ? rawOpen : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalizedOpen)) {
+        map.set(date, normalizedOpen);
+      }
+    }
+    opensBySymbol[series.symbol] = dates.map((date) => {
+      const value = map.get(date);
+      if (Number.isFinite(value)) {
+        return value;
+      }
+      return null;
+    });
+  });
+
+  return opensBySymbol;
 }
 
 async function fetchJson(url) {
@@ -176,7 +225,7 @@ function buildFmpError(payload, symbol) {
   return new Error(`${symbol}: FMP response did not contain historical data.`);
 }
 
-function buildOutput(aligned, returns) {
+function buildOutput(aligned, returns, openSeries) {
   const windows = {};
   WINDOWS.forEach((window) => {
     windows[window] = computeWindowMetrics(window, returns, aligned);
@@ -188,6 +237,7 @@ function buildOutput(aligned, returns) {
     analysisDates: returns.dates,
     normalizedPrices: returns.normalizedPrices,
     priceSeries: returns.priceSeries,
+    priceSeriesOpen: openSeries,
     priceSeriesSource: 'actual',
     assets: ASSETS.map(({ symbol, label, category }) => ({ symbol, label, category })),
     windows,
@@ -310,15 +360,24 @@ async function readHistoricalSeries() {
       }
       const dates = Array.isArray(asset.dates) ? asset.dates : [];
       const prices = Array.isArray(asset.prices) ? asset.prices : [];
+      const opens = Array.isArray(asset.opens) ? asset.opens : null;
       if (dates.length === 0 || dates.length !== prices.length) {
         return;
       }
+      const normalizedOpens = Array.isArray(opens) && opens.length === dates.length
+        ? opens.map((value, index) => {
+          const fallback = prices[index];
+          const num = Number(value);
+          return Number.isFinite(num) ? num : fallback;
+        })
+        : prices.slice();
       map.set(asset.symbol, {
         symbol: asset.symbol,
         label: asset.label,
         category: asset.category,
         dates,
         prices,
+        opens: normalizedOpens,
       });
     });
 
@@ -361,6 +420,7 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
         ...series,
         dates: filtered.dates,
         prices: filtered.prices,
+        opens: filtered.opens ?? (Array.isArray(series.opens) ? filtered.prices : undefined),
       };
     }
     const after = trimSeries(series, (date) => !cutoff || date >= cutoff);
@@ -372,17 +432,35 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
       return !cutoff || date < cutoff;
     });
     if (before.dates.length === 0) {
-      return { ...series, dates: after.dates, prices: after.prices };
+      return {
+        ...series,
+        dates: after.dates,
+        prices: after.prices,
+        opens: after.opens ?? (Array.isArray(series.opens) ? after.prices : undefined),
+      };
     }
     if (after.dates.length === 0) {
-      return { ...series, dates: before.dates, prices: before.prices };
+      return {
+        ...series,
+        dates: before.dates,
+        prices: before.prices,
+        opens: before.opens ?? (Array.isArray(history.opens) ? before.prices : undefined),
+      };
     }
     const boundary = firstAfterDate || cutoff || 'live-data';
     console.log(`[generate-data] ${series.symbol}: prepended ${before.dates.length} cached rows before ${boundary}`);
+    const beforeOpens = before.opens ?? (Array.isArray(history.opens) ? before.prices : undefined);
+    const afterOpens = after.opens ?? (Array.isArray(series.opens) ? after.prices : undefined);
+    const hasBeforeOpen = Array.isArray(beforeOpens);
+    const hasAfterOpen = Array.isArray(afterOpens);
+    const combinedOpens = (hasBeforeOpen || hasAfterOpen)
+      ? (hasBeforeOpen ? beforeOpens : before.prices).concat(hasAfterOpen ? afterOpens : after.prices)
+      : undefined;
     return {
       ...series,
       dates: before.dates.concat(after.dates),
       prices: before.prices.concat(after.prices),
+      opens: combinedOpens,
     };
   });
 
@@ -397,6 +475,7 @@ function mergeSeriesWithHistory(latestSeries, historical, cutoffDate) {
       category: history.category || findAssetCategory(symbol),
       dates: history.dates.slice(),
       prices: history.prices.slice(),
+      opens: Array.isArray(history.opens) ? history.opens.slice() : undefined,
     });
   });
 
@@ -421,6 +500,7 @@ function buildSeriesFromHistory(historical, cutoffDate) {
       category: asset.category,
       dates: trimmed.dates,
       prices: trimmed.prices,
+      opens: trimmed.opens ?? trimmed.prices,
     });
   });
   return merged;
@@ -429,14 +509,16 @@ function buildSeriesFromHistory(historical, cutoffDate) {
 function trimSeries(series, predicate) {
   const dates = [];
   const prices = [];
+  const opens = [];
   if (!series) {
-    return { dates, prices };
+    return { dates, prices, opens };
   }
 
   const length = Math.min(
     Array.isArray(series.dates) ? series.dates.length : 0,
     Array.isArray(series.prices) ? series.prices.length : 0,
   );
+  const hasOpens = Array.isArray(series.opens) && series.opens.length >= length;
 
   for (let index = 0; index < length; index += 1) {
     const date = series.dates[index];
@@ -449,9 +531,14 @@ function trimSeries(series, predicate) {
     }
     dates.push(date);
     prices.push(price);
+    if (hasOpens) {
+      const openValue = series.opens[index];
+      const normalizedOpen = Number.isFinite(openValue) ? openValue : price;
+      opens.push(normalizedOpen);
+    }
   }
 
-  return { dates, prices };
+  return { dates, prices, opens: hasOpens ? opens : undefined };
 }
 
 function findAssetLabel(symbol) {

@@ -126,7 +126,7 @@ function topEigenvectorLocal(matrix, maxIter = 60, tol = 1e-8) {
   return v;
 }
 
-const state = { window: WINDOW, priceSeries: {}, metrics: {} };
+const state = { window: WINDOW, priceSeries: {}, priceSeriesOpen: {}, metrics: {} };
 
 function computeWindowMetrics(window, returns, aligned) {
   const allSymbols = ASSETS.map((a) => a.symbol);
@@ -151,6 +151,35 @@ function computeWindowMetrics(window, returns, aligned) {
   const latest = records[records.length - 1]; const average180 = MM.mean(stabilityValues.slice(-180));
   const pairs = buildPairSeries(records, window, allSymbols);
   return { records, latest, average180, pairs };
+}
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) {
+    return opens;
+  }
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) {
+      return;
+    }
+    const openMap = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    const length = series.dates.length;
+    for (let index = 0; index < length; index += 1) {
+      const date = series.dates[index];
+      const closeValue = Array.isArray(series.prices) ? series.prices[index] : null;
+      const openValue = hasOpens ? series.opens[index] : null;
+      const normalized = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalized)) {
+        openMap.set(date, normalized);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = openMap.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+  return opens;
 }
 
 function selectMatrixForSymbols(record, symbols) {
@@ -467,18 +496,70 @@ function computeRiskSeriesFFL(metrics, recordsOverride) {
 
 function computeHitRate(stateArr, fwdRetArr) { let wins = 0; let cnt = 0; for (let i = 0; i < Math.min(stateArr.length, fwdRetArr.length); i += 1) { const s = stateArr[i]; const r = fwdRetArr[i]; if (!Number.isFinite(r)) continue; if (s > 0 && r > 0) wins += 1; else if (s < 0 && r < 0) wins += 1; else if (s === 0 && r >= 0) wins += 1; cnt += 1; } return cnt > 0 ? wins / cnt : 0; }
 
-function loadHistorical() { const raw = fs.readFileSync(DATA_PATH, 'utf8'); const json = JSON.parse(raw); if (!Array.isArray(json.assets)) throw new Error('historical_prices.json: assets[] missing'); const bySymbol = new Map(json.assets.map((a) => [a.symbol, a])); const seriesList = ASSETS.map(({ symbol, category }) => { const a = bySymbol.get(symbol); if (!a) throw new Error(`Missing asset ${symbol} in historical file`); return { symbol, category, dates: a.dates, prices: a.prices }; }); return seriesList; }
+function loadHistorical() {
+  const raw = fs.readFileSync(DATA_PATH, 'utf8');
+  const json = JSON.parse(raw);
+  if (!Array.isArray(json.assets)) throw new Error('historical_prices.json: assets[] missing');
+  const bySymbol = new Map(json.assets.map((a) => [a.symbol, a]));
+  return ASSETS.map(({ symbol, category }) => {
+    const asset = bySymbol.get(symbol);
+    if (!asset) throw new Error(`Missing asset ${symbol} in historical file`);
+    const opens = Array.isArray(asset.opens) && asset.opens.length === asset.dates.length
+      ? asset.opens
+      : asset.prices;
+    return {
+      symbol,
+      category,
+      dates: asset.dates,
+      prices: asset.prices,
+      opens,
+    };
+  });
+}
 function yearlyReturnsFromEquity(dates, equity) { const out = new Map(); for (let i = 1; i < dates.length; i += 1) { const y = dates[i].slice(0, 4); if (!out.has(y)) out.set(y, { start: equity[i - 1], end: equity[i] }); else out.set(y, { start: out.get(y).start, end: equity[i] }); } return Array.from(out.entries()).map(([year, { start, end }]) => ({ year: Number(year), ret: (end / start - 1) })); }
 
 function main() {
   const seriesList = loadHistorical(); const aligned = MM.alignSeries(seriesList); const returns = MM.computeReturns(aligned); state.priceSeries = returns.priceSeries;
+  const openSeries = buildAlignedOpenSeries(aligned.dates, seriesList);
+  state.priceSeriesOpen = {};
+  Object.keys(state.priceSeries).forEach((symbol) => {
+    const closes = state.priceSeries[symbol] || [];
+    const opens = Array.isArray(openSeries[symbol]) ? openSeries[symbol] : [];
+    if (opens.length === closes.length) {
+      state.priceSeriesOpen[symbol] = opens.map((value, idx) => (Number.isFinite(value) ? value : closes[idx]));
+    } else {
+      state.priceSeriesOpen[symbol] = closes.slice();
+    }
+  });
   const metrics = computeWindowMetrics(WINDOW, returns, aligned); state.metrics[WINDOW] = metrics;
   const filteredRecords = metrics.records.filter((r) => r.date >= RANGE_START && r.date <= RANGE_END);
   const ffl = computeRiskSeriesFFL(metrics, filteredRecords); if (!ffl) throw new Error('Failed to compute FFL series');
   const baseSymbol = SIGNAL.trade.baseSymbol; const windowOffset = Math.max(1, WINDOW - 1); const firstDate = filteredRecords?.[0]?.date; let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate); if (baseIdx < 0) baseIdx = 0;
-  const dates = ffl.dates; const prices = state.priceSeries[baseSymbol] || []; const baseReturns = []; const leveredReturns = [];
-  for (let idx = 0; idx < dates.length; idx += 1) { const priceIndex = windowOffset + baseIdx + idx; const prevIndex = priceIndex - 1; let daily = 0; if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) daily = prices[priceIndex] / prices[prevIndex] - 1; baseReturns.push(daily); leveredReturns.push(Math.max(-0.99, SIGNAL.trade.leverage * daily)); }
-  const executedState = Array.isArray(ffl.executedState) && ffl.executedState.length === ffl.state.length ? ffl.executedState : ffl.state.map((v, i) => (i === 0 ? 0 : ffl.state[i - 1] || 0));
+  const dates = ffl.dates;
+  const prices = state.priceSeries[baseSymbol] || [];
+  const opens = state.priceSeriesOpen[baseSymbol] || [];
+  const baseReturns = [];
+  const openToCloseReturns = [];
+  for (let idx = 0; idx < dates.length; idx += 1) {
+    const priceIndex = windowOffset + baseIdx + idx;
+    const prevIndex = priceIndex - 1;
+    let daily = 0;
+    if (prices[priceIndex] != null && prices[prevIndex] != null && prices[prevIndex] !== 0) {
+      daily = prices[priceIndex] / prices[prevIndex] - 1;
+    }
+    baseReturns.push(daily);
+    const openPrice = opens[priceIndex];
+    const closePrice = prices[priceIndex];
+    const ocReturn = Number.isFinite(openPrice) && Number.isFinite(closePrice) && openPrice !== 0
+      ? (closePrice / openPrice) - 1
+      : daily;
+    openToCloseReturns.push(ocReturn);
+  }
+
+  const executedState = Array.isArray(ffl.executedState) && ffl.executedState.length === ffl.state.length
+    ? ffl.executedState
+    : ffl.state.map((v, i) => (i === 0 ? 0 : ffl.state[i - 1] || 0));
+
   const stratReturns = executedState.map((regime, i) => {
     if (regime > 0) {
       const idxPrice = baseIdx + i + windowOffset;
@@ -506,7 +587,7 @@ function main() {
       } else if (hiCorrBear) {
         lev = 1;
       }
-      return Math.max(-0.99, lev * baseReturns[i]);
+      return Math.max(-0.99, lev * openToCloseReturns[i]);
     }
     if (regime < 0) return 0;
     return baseReturns[i];

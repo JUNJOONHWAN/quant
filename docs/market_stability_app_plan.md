@@ -4,16 +4,16 @@
 
 - **Purpose**: Provide a public, web-based dashboard that tracks correlations between major assets and translates them into a "Market Stability Index" between 0 and 1.
 - **Assets**: QQQ (backtest/benchmark), IWM, SPY, TLT, GLD, BTC-USD (signal universe).
-- **Data Freshness**: Daily close data refreshed once per day (free data tier).
+- **Data Freshness**: Daily open/close data refreshed once per day (free data tier).
 - **Audience**: Open access; raw market data is not redistributed to comply with licensing.
 - **Language/Locale**: Primary audience in Korea; timestamps displayed in KST.
 
 ## 2. Data Pipeline
 
 1. **Source**: Financial Modeling Prep daily endpoints. ETFs/ETNs and BTCUSD use the `historical-price-full` API. Access requires the `FMP_API_KEY` secret.
-2. **Generator (`scripts/generate-data.js`)**: Node.js (18+) script that pulls five years of closes, aligns trading days, computes log returns, and derives rolling correlations for 20/30/60 session windows before emitting a consolidated JSON payload.
+2. **Generator (`scripts/generate-data.js`)**: Node.js (18+) script that pulls five years of adjusted opens and closes, aligns trading days, computes log returns, and derives rolling correlations for 20/30/60 session windows before emitting a consolidated JSON payload.
 3. **Trigger**: `.github/workflows/deploy.yml` executes the generator on every push to `main` (and on manual dispatch). Add a cron trigger if an automatic daily refresh is desired.
-4. **Artifact**: `static_site/data/precomputed.json` containing windowed records (stability, smoothed stability, deltas, correlation matrices, sub-indexes) plus pair-level price/correlation series and metadata (generation timestamp, asset catalog).
+4. **Artifact**: `static_site/data/precomputed.json` containing windowed records (stability, smoothed stability, deltas, correlation matrices, sub-indexes) plus pair-level price/correlation series, **both close and open price series** (for T+1 execution modelling), and metadata (generation timestamp, asset catalog).
 5. **Hosting**: The same workflow uploads `static_site/`—including the freshly generated JSON—to GitHub Pages via the official Actions integration.
 6. **Monitoring**: Workflow failures surface in the GitHub Actions UI; the frontend shows a descriptive error if the JSON is missing or stale.
 
@@ -73,11 +73,14 @@ quant/
   - `analysisDates`: Array of ISO dates aligned with the rolling return series.
   - `normalizedPrices`: Map from symbol to normalized price index (aligned with `analysisDates`).
   - `assets`: Symbol metadata consumed by tooltips and selectors.
+  - `priceSeries`: Map of adjusted closes by symbol.
+  - `priceSeriesOpen`: Map of adjusted opens by symbol (used for T+1 open execution in backtests).
   - `windows`: Object keyed by window length (`"20"`, `"30"`, `"60"`). Each entry contains:
     - `records`: Array ordered by date with `stability`, `smoothed`, `delta`, `sub` (sub-index breakdown), and `matrix` (5×5 correlation matrix).
     - `average180`: Mean stability over the trailing 180 trading days.
     - `latest`: Convenience copy of the last record.
     - `pairs`: Map of `<symbolA>|<symbolB>` to aligned `dates`, `correlation`, `priceA`, `priceB` arrays for the pair detail chart.
+- Downstream backtests use `priceSeriesOpen` to apply regimes with a one-day execution lag (signals based on close, trades at next session's open) while neutrals track close-to-close benchmark returns.
 
 ```json
 {

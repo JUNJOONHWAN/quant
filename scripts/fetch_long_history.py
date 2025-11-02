@@ -16,7 +16,7 @@ import urllib.error
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -87,8 +87,8 @@ def ensure_valid_range(start: date, end: date) -> None:
         raise SystemExit(f"End date {end} must be on/after start date {start}.")
 
 
-def fetch_symbol_history(symbol: str, start: date, end: date) -> List[Tuple[str, float]]:
-    """Return sorted (date, close) tuples between start and end inclusive."""
+def fetch_symbol_history(symbol: str, start: date, end: date) -> List[Tuple[str, float, Optional[float]]]:
+    """Return sorted (date, adj_close, adj_open) tuples between start and end inclusive."""
 
     asset = next((candidate for candidate in ASSETS if candidate.symbol == symbol), None)
     if asset is None:
@@ -98,7 +98,6 @@ def fetch_symbol_history(symbol: str, start: date, end: date) -> List[Tuple[str,
         "apikey": API_KEY,
         "from": start.isoformat(),
         "to": end.isoformat(),
-        "serietype": "line",
     }
     url = f"{FMP_BASE_URL}/{asset.fmp_symbol}?{urlencode(params)}"
     request = Request(url, headers={"User-Agent": USER_AGENT})
@@ -122,40 +121,62 @@ def fetch_symbol_history(symbol: str, start: date, end: date) -> List[Tuple[str,
 
     start_key = start.isoformat()
     end_key = end.isoformat()
-    dedup: Dict[str, float] = {}
+    dedup: Dict[str, Tuple[float, Optional[float]]] = {}
     for row in rows:
         date_key = row.get("date")
         if not isinstance(date_key, str):
             continue
         if date_key < start_key or date_key > end_key:
             continue
-        value = row.get("close") or row.get("adjClose") or row.get("price")
+        adj_close = row.get("adjClose")
+        close = row.get("close")
+        open_raw = row.get("open")
+        price = None
         try:
-            price = float(value)
+            if isinstance(adj_close, (int, float)):
+                price = float(adj_close)
+            elif isinstance(close, (int, float)):
+                price = float(close)
         except (TypeError, ValueError):
+            price = None
+        if price is None:
             continue
-        dedup[date_key] = price
+        adj_open = None
+        if isinstance(open_raw, (int, float)):
+            if isinstance(adj_close, (int, float)) and isinstance(close, (int, float)) and close != 0:
+                factor = float(adj_close) / float(close)
+                adj_open = float(open_raw) * factor
+            else:
+                adj_open = float(open_raw)
+        dedup[date_key] = (price, adj_open)
 
     if not dedup:
         raise RuntimeError(f"FMP returned no usable closing prices for {symbol}.")
 
-    return sorted(dedup.items(), key=lambda pair: pair[0])
+    ordered: List[Tuple[str, float, Optional[float]]] = []
+    for date_key in sorted(dedup.keys()):
+        price, adj_open = dedup[date_key]
+        ordered.append((date_key, price, adj_open))
+    return ordered
 
 
-def build_payload(start: date, end: date, history: Dict[str, List[Tuple[str, float]]]) -> Dict[str, object]:
+def build_payload(start: date, end: date, history: Dict[str, List[Tuple[str, float, Optional[float]]]]) -> Dict[str, object]:
     assets_payload = []
     for asset in ASSETS:
         rows = history.get(asset.symbol, [])
         if not rows:
             raise RuntimeError(f"Missing history for {asset.symbol}.")
-        dates, prices = zip(*rows)
+        dates = [row[0] for row in rows]
+        closes = [row[1] for row in rows]
+        opens = [row[2] if row[2] is not None else row[1] for row in rows]
         assets_payload.append(
             {
                 "symbol": asset.symbol,
                 "label": asset.label,
                 "category": asset.category,
                 "dates": list(dates),
-                "prices": [round(float(price), 6) for price in prices],
+                "prices": [round(float(price), 6) for price in closes],
+                "opens": [round(float(opn), 6) if opn is not None else None for opn in opens],
             }
         )
 

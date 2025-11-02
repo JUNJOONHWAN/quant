@@ -66,16 +66,74 @@ function loadHistorical() {
 function dateNum(s) { return Number(String(s).replace(/-/g, '')); }
 
 function alignFromHistorical(raw, symbols) {
-  const list = raw.assets.filter((a) => symbols.includes(a.symbol)).map((a) => ({ symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices }));
-  return MM.alignSeries(list);
+  const list = raw.assets
+    .filter((a) => symbols.includes(a.symbol))
+    .map((a) => {
+      const opens = Array.isArray(a.opens) && a.opens.length === a.dates.length
+        ? a.opens
+        : a.prices;
+      return { symbol: a.symbol, category: a.category, dates: a.dates, prices: a.prices, opens };
+    });
+  const aligned = MM.alignSeries(list);
+  aligned.opens = buildAlignedOpenSeries(aligned.dates, list);
+  return aligned;
 }
+
+function buildAlignedOpenSeries(dates, seriesList) {
+  const opens = {};
+  if (!Array.isArray(dates)) {
+    return opens;
+  }
+  seriesList.forEach((series) => {
+    if (!series || !Array.isArray(series.dates)) {
+      return;
+    }
+    const map = new Map();
+    const hasOpens = Array.isArray(series.opens);
+    for (let index = 0; index < series.dates.length; index += 1) {
+      const date = series.dates[index];
+      const closeValue = Array.isArray(series.prices) ? series.prices[index] : null;
+      const openValue = hasOpens ? series.opens[index] : null;
+      const normalized = Number.isFinite(openValue) ? openValue : (Number.isFinite(closeValue) ? closeValue : null);
+      if (typeof date === 'string' && Number.isFinite(normalized)) {
+        map.set(date, normalized);
+      }
+    }
+    opens[series.symbol] = dates.map((date) => {
+      const value = map.get(date);
+      return Number.isFinite(value) ? value : null;
+    });
+  });
+  return opens;
+}
+
 function sliceAligned(aligned, start, end) {
-  const s = dateNum(start); const e = dateNum(end);
-  const keep = aligned.dates.map((d, i) => ({ d, i, n: dateNum(d) })).filter((x) => x.n >= s && x.n <= e);
+  const s = dateNum(start);
+  const e = dateNum(end);
+  const keep = aligned.dates
+    .map((d, i) => ({ d, i, n: dateNum(d) }))
+    .filter((x) => x.n >= s && x.n <= e);
   const dates = keep.map((x) => x.d);
-  const idxMap = new Map(keep.map((x, k) => [x.d, aligned.dates.indexOf(x.d)]));
-  const prices = {}; Object.entries(aligned.prices).forEach(([sym, arr]) => { prices[sym] = dates.map((d) => arr[idxMap.get(d)]); });
-  return { dates, prices, categories: aligned.categories };
+  const idxMap = new Map(keep.map((x) => [x.d, aligned.dates.indexOf(x.d)]));
+  const prices = {};
+  Object.entries(aligned.prices).forEach(([sym, arr]) => {
+    prices[sym] = dates.map((d) => arr[idxMap.get(d)]);
+  });
+  const opens = {};
+  const alignedOpens = aligned.opens || {};
+  Object.entries(alignedOpens).forEach(([sym, arr]) => {
+    opens[sym] = dates.map((d, idx) => {
+      const value = arr[idxMap.get(d)];
+      const closeValue = prices[sym]?.[idx];
+      return Number.isFinite(value) ? value : closeValue;
+    });
+  });
+  Object.keys(prices).forEach((sym) => {
+    if (!Array.isArray(opens[sym])) {
+      opens[sym] = prices[sym].slice();
+    }
+  });
+  return { dates, prices, opens, categories: aligned.categories };
 }
 
 // ------------------ Metrics (records & pairs) ------------------
@@ -347,18 +405,32 @@ async function main() {
   const returns = MM.computeReturns(aligned);
   const metrics = computeWindowMetrics(WINDOW, returns, aligned);
   const prices = returns.priceSeries; // aligned to returns.dates (~ WINDOW offset for metrics)
+  const openSeries = aligned.opens || {};
 
   const fusion = computeRiskSeriesFLLFusion(metrics, metrics.records, prices, { win: 40, lam: 0.50, tau: 4.0, floor: 0.10, onThr: 0.20, offThr: -0.20 });
   if (!fusion) throw new Error('Failed to compute FLL-Fusion series');
 
-  const dates = fusion.dates; const baseSym = SIGNAL.trade.baseSymbol; const px = prices[baseSym];
-  const baseRet = []; const priceOffset = WINDOW - 1;
+  const dates = fusion.dates;
+  const baseSym = SIGNAL.trade.baseSymbol;
+  const px = prices[baseSym];
+  const ox = openSeries[baseSym] || px;
+  const baseRet = [];
+  const openToCloseRet = [];
+  const priceOffset = WINDOW - 1;
   for (let i = 0; i < dates.length; i += 1) {
-    const idx = priceOffset + i; const prev = px[idx - 1]; const cur = px[idx];
+    const idx = priceOffset + i;
+    const prev = px[idx - 1];
+    const cur = px[idx];
     baseRet.push(Number.isFinite(prev) && Number.isFinite(cur) && prev !== 0 ? (cur / prev - 1) : 0);
+    const openPrice = ox[idx];
+    const closePrice = cur;
+    const oc = Number.isFinite(openPrice) && Number.isFinite(closePrice) && openPrice !== 0
+      ? (closePrice / openPrice) - 1
+      : baseRet[i];
+    openToCloseRet.push(oc);
   }
   const executed = fusion.executedState; const lev = SIGNAL.trade.leverage;
-  const stratRet = executed.map((reg, i) => (reg > 0 ? leveragedReturn(baseRet[i], lev) : (reg < 0 ? 0 : baseRet[i])));
+  const stratRet = executed.map((reg, i) => (reg > 0 ? leveragedReturn(openToCloseRet[i], lev) : (reg < 0 ? 0 : baseRet[i])));
   const eqStrat = equityFromReturns(stratRet); const eqBH = equityFromReturns(baseRet);
   const totalDays = dates.length; const totalStrat = eqStrat[eqStrat.length - 1] - 1; const totalBH = eqBH[eqBH.length - 1] - 1;
   const cagrStrat = annualize(totalDays, totalStrat); const cagrBH = annualize(totalDays, totalBH);
