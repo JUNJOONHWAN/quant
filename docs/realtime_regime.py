@@ -258,7 +258,6 @@ def fetch_daily_history_fmp(symbols: List[str], from_date: str, api_key: str) ->
             open_raw = row.get("open")
             if not d or not isinstance(close, (int, float)):
                 continue
-            # Build adjusted open when possible to stay aligned with adjusted close.
             if isinstance(ac, (int, float)) and isinstance(row.get("close"), (int, float)) and row.get("close"):
                 factor = float(ac) / float(row.get("close"))
                 adj_open = float(open_raw) * factor if isinstance(open_raw, (int, float)) else None
