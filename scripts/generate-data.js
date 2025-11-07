@@ -47,6 +47,7 @@ const ASSETS = [
   { symbol: 'GLD', label: 'GLD (금 ETF)', category: 'gold', fmpSymbol: 'GLD' },
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', fmpSymbol: 'BTCUSD' },
 ];
+const SUPPORTED_SYMBOLS = new Set(ASSETS.map((asset) => asset.symbol));
 
 const SIGNAL = {
   symbols: ['IWM', 'SPY', 'TLT', 'GLD', 'BTC-USD'],
@@ -417,6 +418,9 @@ async function readHistoricalSeries() {
     const map = new Map();
     assets.forEach((asset) => {
       if (!asset || typeof asset.symbol !== 'string') {
+        return;
+      }
+      if (!SUPPORTED_SYMBOLS.has(asset.symbol)) {
         return;
       }
       const dates = Array.isArray(asset.dates) ? asset.dates : [];
