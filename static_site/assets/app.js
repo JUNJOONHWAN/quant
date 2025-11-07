@@ -1468,7 +1468,8 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   if (dates.length <= 1) {
     return null;
   }
-  const effectiveLength = Math.max(0, dates.length - 1);
+  const executionDates = dates.slice(1);
+  const effectiveLength = executionDates.length;
 
   const prices = state.priceSeries[baseSymbol] || [];
   const opens = state.priceSeriesOpen?.[baseSymbol] || [];
@@ -1579,7 +1580,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const cagrBenchmark = computeAnnualizedReturn(equityBenchmark, dates.length);
 
   return {
-    dates: dates.slice(0, effectiveLength),
+    dates: executionDates,
     executedState,
     baseReturns,
     leveredReturns,
