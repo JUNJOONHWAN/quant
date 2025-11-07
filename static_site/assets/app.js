@@ -1465,9 +1465,10 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   if (baseIdx < 0) baseIdx = 0;
 
   const dates = Array.isArray(riskSeries?.dates) ? riskSeries.dates : [];
-  if (dates.length === 0) {
+  if (dates.length <= 1) {
     return null;
   }
+  const effectiveLength = Math.max(0, dates.length - 1);
 
   const prices = state.priceSeries[baseSymbol] || [];
   const opens = state.priceSeriesOpen?.[baseSymbol] || [];
@@ -1478,7 +1479,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const leveredReturns = [];
   const priceQQQ = [];
   const priceLevered = [];
-  for (let idx = 0; idx < dates.length; idx += 1) {
+  for (let idx = 0; idx < effectiveLength; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
     const nextIndex = priceIndex + 1;
     const openNext = Number.isFinite(opens?.[nextIndex]) ? Number(opens[nextIndex]) : null;
@@ -1506,7 +1507,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     priceLevered.push(leveredOpenNext != null ? leveredOpenNext : leveredCloseNext);
   }
 
-  const executedState = riskSeries.state.map((value) => (Number.isFinite(value) ? value : 0));
+  const executedState = riskSeries.state.slice(0, effectiveLength).map((value) => (Number.isFinite(value) ? value : 0));
   const neutralWeight = Number.isFinite(tradeConfig.neutralWeight) ? tradeConfig.neutralWeight : 0;
 
   const stratReturns = executedState.map((regime, idx) => {
@@ -1555,9 +1556,9 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     }
   }
 
-  const ret = baseReturns;
+  const ret = baseReturns.slice();
   const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
-  const state1 = riskSeries.state.slice(0, riskSeries.state.length - 1);
+  const state1 = executedState.slice(0, executedState.length - 1);
   const hit1 = computeHitRate(state1, fwd1);
 
   const horizon = 5;
@@ -1569,7 +1570,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     }
     fwd5.push(prod - 1);
   }
-  const state5 = riskSeries.state.slice(0, riskSeries.state.length - 1);
+  const state5 = executedState.slice(0, executedState.length - 1);
   const hit5 = computeHitRate(state5, fwd5.slice(0, state5.length));
 
   const maxDrawdownStrategy = computeMaxDrawdown(equityStrategy);
@@ -1578,7 +1579,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const cagrBenchmark = computeAnnualizedReturn(equityBenchmark, dates.length);
 
   return {
-    dates,
+    dates: dates.slice(0, effectiveLength),
     executedState,
     baseReturns,
     leveredReturns,
