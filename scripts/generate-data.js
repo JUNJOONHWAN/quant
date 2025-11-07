@@ -23,6 +23,7 @@ const {
   ema,
   mean,
 } = require('../static_site/assets/metrics');
+const { computeFusionNewgate } = require('./fusion-newgate');
 
 const API_KEY = process.env.FMP_API_KEY;
 const USE_HISTORY_ONLY = flagEnabled(
@@ -56,6 +57,7 @@ const SIGNAL = {
 };
 
 const WINDOWS = [20, 30, 60];
+const FUSION_WINDOW = 30;
 const MINIMUM_CUTOFF_DATE = DATA_START_DATE;
 
 async function main() {
@@ -88,8 +90,19 @@ async function main() {
       const assetSeries = [];
       for (let index = 0; index < ASSETS.length; index += 1) {
         const asset = ASSETS[index];
+        const lastCachedDate = findLastCachedDate(asset.symbol, historical);
+        const startDate = computeAssetStartDate(asset.symbol, historical, cutoffDate);
+        if (!shouldFetchRange(startDate, endDate)) {
+          console.log(`[${asset.symbol}] up to date (last date ${lastCachedDate || 'n/a'})`);
+          continue;
+        }
         console.log(`Fetching ${asset.symbol} via Financial Modeling Prep`);
-        const series = await fetchFmpSeries(asset, cutoffDate, endDate);
+        const hasHistory = Boolean(lastCachedDate);
+        const series = await fetchFmpSeries(asset, startDate, endDate, hasHistory ? 1 : 2);
+        if (series.dates.length === 0) {
+          console.log(`[${asset.symbol}] no incremental rows available from ${startDate} to ${endDate}`);
+          continue;
+        }
         assetSeries.push(series);
         console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
       }
@@ -98,8 +111,19 @@ async function main() {
       const leveredLatest = [];
       for (let index = 0; index < LEVERED_ASSETS.length; index += 1) {
         const asset = LEVERED_ASSETS[index];
+        const lastCachedDate = findLastCachedDate(asset.symbol, historical);
+        const startDate = computeAssetStartDate(asset.symbol, historical, cutoffDate);
+        if (!shouldFetchRange(startDate, endDate)) {
+          console.log(`[${asset.symbol}] up to date (last date ${lastCachedDate || 'n/a'})`);
+          continue;
+        }
         console.log(`Fetching ${asset.symbol} via Financial Modeling Prep`);
-        const series = await fetchFmpSeries(asset, cutoffDate, endDate);
+        const hasHistory = Boolean(lastCachedDate);
+        const series = await fetchFmpSeries(asset, startDate, endDate, hasHistory ? 1 : 2);
+        if (series.dates.length === 0) {
+          console.log(`[${asset.symbol}] no incremental rows available from ${startDate} to ${endDate}`);
+          continue;
+        }
         leveredLatest.push(series);
         console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
       }
@@ -111,6 +135,24 @@ async function main() {
     const openSeries = buildAlignedOpenSeries(returns.dates, mergedSeries);
     const leveredAligned = buildLeveredSeries(aligned.dates, leveredSeriesMerged || []);
     const output = buildOutput(aligned, returns, openSeries, leveredAligned);
+    try {
+      const metricsWindow = output?.windows?.[FUSION_WINDOW] || output?.windows?.[String(FUSION_WINDOW)];
+      if (metricsWindow) {
+        const fusionPreset = process.env.FUSION_PRESET || 'aggressive_plus';
+        const fusionSeries = computeFusionNewgate({
+          analysisDates: output.analysisDates,
+          priceSeries: output.priceSeries,
+          metrics: metricsWindow,
+          window: FUSION_WINDOW,
+          preset: fusionPreset,
+        });
+        if (fusionSeries) {
+          output.fusionNewgate = fusionSeries;
+        }
+      }
+    } catch (fusionError) {
+      console.warn('[generate-data] fusion-newgate computation failed:', fusionError?.message || fusionError);
+    }
     await writeOutput(output);
   } catch (error) {
     console.error(error);
@@ -122,7 +164,7 @@ function computeEndDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function fetchFmpSeries(asset, startDate, endDate) {
+async function fetchFmpSeries(asset, startDate, endDate, minimumSamples = 2) {
   const fmpSymbol = asset.fmpSymbol || sanitizeFmpSymbol(asset.symbol);
   const url = buildFmpUrl(fmpSymbol, startDate, endDate);
   const json = await fetchJson(url);
@@ -155,7 +197,17 @@ async function fetchFmpSeries(asset, startDate, endDate) {
     .filter((row) => row && Number.isFinite(row.close))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  if (filtered.length < 2) {
+  if (filtered.length < minimumSamples) {
+    if (minimumSamples === 1 && filtered.length === 0) {
+      return {
+        symbol: asset.symbol,
+        label: asset.label,
+        category: asset.category,
+        dates: [],
+        prices: [],
+        opens: [],
+      };
+    }
     throw new Error(`${asset.symbol}: insufficient samples from FMP after filtering.`);
   }
 
@@ -637,6 +689,50 @@ async function emitNoDataWithReason(message, error) {
     console.warn(`[generate-data] detail: ${detail}`);
   }
   await emitNoDataPlaceholder();
+}
+
+function findLastCachedDate(symbol, historical) {
+  if (!historical || !(historical.map instanceof Map)) {
+    return null;
+  }
+  const cached = historical.map.get(symbol);
+  const dates = Array.isArray(cached?.dates) ? cached.dates : [];
+  if (dates.length === 0) {
+    return null;
+  }
+  return dates[dates.length - 1];
+}
+
+function computeAssetStartDate(symbol, historical, cutoffDate) {
+  const fallback = cutoffDate || DATA_START_DATE;
+  const lastDate = findLastCachedDate(symbol, historical);
+  if (!lastDate) {
+    return fallback;
+  }
+  const nextDate = incrementDate(lastDate);
+  if (!nextDate) {
+    return fallback;
+  }
+  return nextDate > fallback ? nextDate : fallback;
+}
+
+function incrementDate(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const date = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function shouldFetchRange(start, end) {
+  if (!start || !end) {
+    return true;
+  }
+  return start <= end;
 }
 
 main().catch((error) => {

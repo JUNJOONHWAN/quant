@@ -220,7 +220,15 @@ function getInitialRiskMode() {
   }
   try {
     const saved = window.localStorage?.getItem(RISK_MODE_STORAGE_KEY);
-    if (saved === 'classic' || saved === 'enhanced' || saved === 'ffl' || saved === 'ffl_exp' || saved === 'ffl_stab' || saved === 'fll_fusion') {
+    if (
+      saved === 'classic'
+      || saved === 'enhanced'
+      || saved === 'ffl'
+      || saved === 'ffl_exp'
+      || saved === 'ffl_stab'
+      || saved === 'fll_fusion'
+      || saved === 'fusion_newgate'
+    ) {
       return saved;
     }
   } catch (error) {
@@ -255,6 +263,7 @@ const state = {
     symbol: SIGNAL.trade.baseSymbol,
     leveredSymbol: SIGNAL.trade.leveredSymbol,
   },
+  fusionNewgate: null,
 };
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
@@ -262,7 +271,8 @@ function applyRiskMode(nextMode, { persist = true } = {}) {
     : (nextMode === 'ffl' ? 'ffl'
     : (nextMode === 'ffl_exp' ? 'ffl_exp'
     : (nextMode === 'ffl_stab' ? 'ffl_stab'
-    : (nextMode === 'fll_fusion' ? 'fll_fusion' : 'classic'))));
+    : (nextMode === 'fll_fusion' ? 'fll_fusion'
+    : (nextMode === 'fusion_newgate' ? 'fusion_newgate' : 'classic')))));
   state.riskMode = normalized;
   if (persist) {
     try {
@@ -565,6 +575,45 @@ function findMissingSymbols(seriesMap, symbols) {
   return missing;
 }
 
+function normalizeFusionNewgate(payload) {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.dates) || payload.dates.length === 0) {
+    return null;
+  }
+  const dates = payload.dates.map((date) => (typeof date === 'string' ? date : null));
+  const indexByDate = new Map();
+  dates.forEach((date, idx) => {
+    if (date != null && !indexByDate.has(date)) {
+      indexByDate.set(date, idx);
+    }
+  });
+  const toNumericArray = (values) => alignArrayLength(values, dates.length);
+  const toIntArray = (values) => {
+    const aligned = alignArrayLength(values, dates.length);
+    return aligned.map((value) => {
+      if (Number.isFinite(value)) {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
+      }
+      return 0;
+    });
+  };
+  return {
+    preset: typeof payload.preset === 'string' ? payload.preset : 'aggressive_plus',
+    dates,
+    indexByDate,
+    state: toIntArray(payload.state),
+    executedState: toIntArray(payload.executedState),
+    score: toNumericArray(payload.score),
+    wClassic: toNumericArray(payload.wClassic),
+    wFFL: toNumericArray(payload.wFFL),
+    scCorr: toNumericArray(payload.scCorr),
+    safeNeg: toNumericArray(payload.safeNeg),
+    mm: toNumericArray(payload.mm),
+    diag: typeof payload.diag === 'object' && payload.diag !== null ? payload.diag : null,
+  };
+}
+
 function hydrateFromPrecomputed(data) {
   if (!data || typeof data !== 'object') {
     showEmptyState('실제 데이터가 없습니다.');
@@ -638,6 +687,7 @@ function hydrateFromPrecomputed(data) {
       };
     });
   }
+  state.fusionNewgate = normalizeFusionNewgate(data.fusionNewgate);
   state.priceSeriesSource = 'actual';
   state.metrics = {};
   if (data.windows && typeof data.windows === 'object') {
@@ -859,7 +909,22 @@ function populateControls() {
       opt4.textContent = 'FLL-Fusion';
       riskModeSelect.appendChild(opt4);
     }
+    let fusionOption = Array.from(riskModeSelect.options).find((option) => option.value === 'fusion_newgate');
+    if (!fusionOption) {
+      fusionOption = document.createElement('option');
+      fusionOption.value = 'fusion_newgate';
+      fusionOption.textContent = 'Fusion-Newgate';
+      riskModeSelect.appendChild(fusionOption);
+    }
+    fusionOption.disabled = !state.fusionNewgate;
+    fusionOption.title = state.fusionNewgate ? '' : 'Fusion-Newgate 데이터가 포함된 사전 계산 파일이 필요합니다.';
     const supportedModes = ['classic', 'enhanced', 'ffl', 'ffl_exp', 'ffl_stab', 'fll_fusion'];
+    if (state.fusionNewgate) {
+      supportedModes.push('fusion_newgate');
+    }
+    if (!supportedModes.includes(state.riskMode)) {
+      applyRiskMode('classic');
+    }
     const currentMode = supportedModes.includes(state.riskMode) ? state.riskMode : 'classic';
     if (riskModeSelect.value !== currentMode) {
       riskModeSelect.value = currentMode;
@@ -1158,7 +1223,9 @@ function renderRisk() {
   }
 
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
-  const series = state.riskMode === 'enhanced'
+  const series = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(filteredRecords2)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
     : (state.riskMode === 'fll_fusion')
       ? computeRiskSeriesFLLFusion(metrics, filteredRecords2)
@@ -1176,7 +1243,9 @@ function renderRisk() {
   const latestIdx = series.score.length - 1;
   const latestScore = series.score[latestIdx] || 0;
   const latestState = series.state[latestIdx] || 0;
-  const palette = state.riskMode === 'classic' ? RISK_CFG_CLASSIC.colors : RISK_CFG_ENH.colors;
+  const palette = (state.riskMode === 'classic' || state.riskMode === 'fusion_newgate')
+    ? RISK_CFG_CLASSIC.colors
+    : RISK_CFG_ENH.colors;
   const fragile = !!series.fragile?.[latestIdx];
   const stateLabel = latestState > 0 ? (fragile ? 'Risk-On (Fragile)' : 'Risk-On') : latestState < 0 ? 'Risk-Off' : 'Neutral';
   const stateColor = latestState > 0 ? (fragile ? (palette.onFragile || palette.on) : palette.on) : latestState < 0 ? palette.off : palette.neutral;
@@ -1257,6 +1326,13 @@ function renderRisk() {
           if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
           if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
           if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+        } else if (state.riskMode === 'fll_fusion' || state.riskMode === 'fusion_newgate') {
+          const wC = series.wClassic?.[idx];
+          const wF = series.wFFL?.[idx];
+          const mm = series.mm?.[idx];
+          if (Number.isFinite(wC)) parts.push(`wTA ${(wC * 100).toFixed(0)}%`);
+          if (Number.isFinite(wF)) parts.push(`wFlow ${(wF * 100).toFixed(0)}%`);
+          if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
         }
         // Always include FFL overlays (Flux/FINT) for Classic/Enhanced tooltips
         if (fflOverlay) {
@@ -1348,7 +1424,9 @@ function computeRiskSeriesForMode(metrics, records) {
   if (!metrics || !Array.isArray(records)) {
     return null;
   }
-  return state.riskMode === 'enhanced'
+  return state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(records)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, records)
     : (state.riskMode === 'fll_fusion')
       ? computeRiskSeriesFLLFusion(metrics, records)
@@ -2862,6 +2940,34 @@ function computeRiskSeriesFLLFusion(metrics, recordsOverride, opts = {}) {
   };
 }
 
+function computeRiskSeriesFusionNewgate(records) {
+  const fusion = state.fusionNewgate;
+  if (!fusion || !Array.isArray(records) || records.length === 0 || !(fusion.indexByDate instanceof Map)) {
+    return null;
+  }
+  const indices = records.map((record) => fusion.indexByDate.get(record.date));
+  if (indices.some((idx) => typeof idx !== 'number' || idx < 0)) {
+    return null;
+  }
+  const selectValues = (series, fallback = null) => indices.map(
+    (idx) => (Array.isArray(series) && idx < series.length ? (series[idx] ?? fallback) : fallback),
+  );
+  const mmSeries = selectValues(fusion.mm);
+  const fragile = mmSeries.map((value) => Number.isFinite(value) && value >= 0.88);
+  return {
+    dates: records.map((record) => record.date),
+    state: selectValues(fusion.state, 0).map((value) => (Number.isFinite(value) ? value : 0)),
+    executedState: selectValues(fusion.executedState, 0).map((value) => (Number.isFinite(value) ? value : 0)),
+    score: selectValues(fusion.score),
+    wClassic: selectValues(fusion.wClassic),
+    wFFL: selectValues(fusion.wFFL),
+    scCorr: selectValues(fusion.scCorr),
+    safeNeg: selectValues(fusion.safeNeg),
+    mm: mmSeries,
+    fragile,
+  };
+}
+
 function clamp01(value) {
   if (!Number.isFinite(value)) return 0;
   if (value <= 0) return 0;
@@ -3088,7 +3194,15 @@ function buildTextReportPayload() {
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
-    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : state.riskMode === 'ffl_stab' ? 'FFL+STAB' : state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${
+      state.riskMode === 'enhanced' ? 'Enhanced'
+        : state.riskMode === 'ffl' ? 'FFL'
+        : state.riskMode === 'ffl_exp' ? 'FFL+EXP'
+        : state.riskMode === 'ffl_stab' ? 'FFL+STAB'
+        : state.riskMode === 'fll_fusion' ? 'FLL-Fusion'
+        : state.riskMode === 'fusion_newgate' ? 'Fusion-Newgate'
+        : 'Classic'
+    }`,
     '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',
@@ -3597,6 +3711,11 @@ function formatRegimeTransitionLine(riskSeries, idx) {
     const wF = Number.isFinite(riskSeries.wFFL?.[idx]) ? `${(riskSeries.wFFL[idx] * 100).toFixed(0)}%` : 'N/A';
     const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
     extras = `, wC=${wC}, wFFL=${wF}, Absorption=${mm}`;
+  } else if (state.riskMode === 'fusion_newgate') {
+    const wC = Number.isFinite(riskSeries.wClassic?.[idx]) ? `${(riskSeries.wClassic[idx] * 100).toFixed(0)}%` : 'N/A';
+    const wF = Number.isFinite(riskSeries.wFFL?.[idx]) ? `${(riskSeries.wFFL[idx] * 100).toFixed(0)}%` : 'N/A';
+    const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
+    extras = `, wTA=${wC}, wFlow=${wF}, Absorption=${mm}`;
   }
   return `- ${riskSeries.dates[idx]} · ${label} (Score=${scoreValue}, Corr=${corrValue}, Safe-NEG=${safeValue}${extras})`;
 }
@@ -3869,7 +3988,9 @@ function renderGauge() {
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
   // Regime summary (Classic/Enhanced/FFL/FLL-Fusion)
-  const riskSeries = state.riskMode === 'enhanced'
+  const riskSeries = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(filteredRecords)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(state.metrics[state.window], filteredRecords)
     : (state.riskMode === 'fll_fusion')
       ? computeRiskSeriesFLLFusion(state.metrics[state.window], filteredRecords)
@@ -3886,7 +4007,8 @@ function renderGauge() {
       : (state.riskMode === 'ffl' ? 'FFL'
       : (state.riskMode === 'ffl_exp' ? 'FFL+EXP'
       : (state.riskMode === 'ffl_stab' ? 'FFL+STAB'
-      : (state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'))));
+      : (state.riskMode === 'fll_fusion' ? 'FLL-Fusion'
+      : (state.riskMode === 'fusion_newgate' ? 'Fusion-Newgate' : 'Classic')))));
     const summary = `${modeLabel} 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
     setGaugePanelFeedback(summary);
   }
@@ -4057,11 +4179,15 @@ function renderHistory() {
   if (!metrics) return;
 
   const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
-  const riskSeries = state.riskMode === 'enhanced'
+  const riskSeries = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(series)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, series)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, series)
-      : computeRiskSeriesClassic(metrics, series);
+    : state.riskMode === 'fll_fusion'
+      ? computeRiskSeriesFLLFusion(metrics, series)
+      : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, series)
+        : computeRiskSeriesClassic(metrics, series);
   let markAreas = [];
   if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
     const segments = computeRegimeSegments(riskSeries.dates, riskSeries.state) || [];
