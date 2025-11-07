@@ -1502,7 +1502,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
       openCloseReturn = 0;
     }
     baseReturns.push(openCloseReturn);
-    const leveredReturn = clampLeveredReturn(openCloseReturn, tradeConfig.leverage, 1);
+    const leveredReturn = leveragedReturn(openCloseReturn, tradeConfig.leverage, 1);
     leveredReturns.push(leveredReturn);
     priceQQQ.push(openNext != null ? openNext : closeNext);
     priceLevered.push(leveredOpenNext != null ? leveredOpenNext : leveredCloseNext);
