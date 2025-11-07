@@ -48,10 +48,6 @@ const ASSETS = [
   { symbol: 'BTC-USD', label: 'BTC-USD (비트코인)', category: 'crypto', fmpSymbol: 'BTCUSD' },
 ];
 
-const LEVERED_ASSETS = [
-  { symbol: 'TQQQ', label: 'TQQQ (NASDAQ 100 3x ETF)', category: 'levered', fmpSymbol: 'TQQQ' },
-];
-
 const SIGNAL = {
   symbols: ['IWM', 'SPY', 'TLT', 'GLD', 'BTC-USD'],
 };
@@ -74,7 +70,6 @@ async function main() {
 
   try {
     let mergedSeries;
-    let leveredSeriesMerged;
     if (useHistoryOnly) {
       if (!historical || !(historical.map instanceof Map) || historical.map.size === 0) {
         throw new Error('Historical dataset is unavailable; cannot build precomputed payload without FMP data.');
@@ -85,7 +80,6 @@ async function main() {
         console.log('[generate-data] USE_FMP_HISTORY_ONLY/GENERATE_USE_FMP_ONLY enabled; skipping live fetch.');
       }
       mergedSeries = buildSeriesFromHistory(historical, cutoffDate, ASSETS);
-      leveredSeriesMerged = buildSeriesFromHistory(historical, cutoffDate, LEVERED_ASSETS);
     } else {
       const assetSeries = [];
       for (let index = 0; index < ASSETS.length; index += 1) {
@@ -107,34 +101,24 @@ async function main() {
         console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
       }
       mergedSeries = mergeSeriesWithHistory(assetSeries, historical, cutoffDate);
-
-      const leveredLatest = [];
-      for (let index = 0; index < LEVERED_ASSETS.length; index += 1) {
-        const asset = LEVERED_ASSETS[index];
-        const lastCachedDate = findLastCachedDate(asset.symbol, historical);
-        const startDate = computeAssetStartDate(asset.symbol, historical, cutoffDate);
-        if (!shouldFetchRange(startDate, endDate)) {
-          console.log(`[${asset.symbol}] up to date (last date ${lastCachedDate || 'n/a'})`);
-          continue;
-        }
-        console.log(`Fetching ${asset.symbol} via Financial Modeling Prep`);
-        const hasHistory = Boolean(lastCachedDate);
-        const series = await fetchFmpSeries(asset, startDate, endDate, hasHistory ? 1 : 2);
-        if (series.dates.length === 0) {
-          console.log(`[${asset.symbol}] no incremental rows available from ${startDate} to ${endDate}`);
-          continue;
-        }
-        leveredLatest.push(series);
-        console.log(`[${asset.symbol}] rows after cutoff = ${series.dates.length}`);
-      }
-      leveredSeriesMerged = mergeSeriesWithHistory(leveredLatest, historical, cutoffDate);
     }
 
     const aligned = alignSeries(mergedSeries);
     const returns = computeReturns(aligned);
     const openSeries = buildAlignedOpenSeries(returns.dates, mergedSeries);
-    const leveredAligned = buildLeveredSeries(aligned.dates, leveredSeriesMerged || []);
-    const output = buildOutput(aligned, returns, openSeries, leveredAligned);
+    const output = buildOutput(aligned, returns, openSeries, {});
+    const syntheticLevered = buildSyntheticLeveredSeries(
+      returns.priceSeries,
+      openSeries,
+      {
+        baseSymbol: BENCHMARK_SYMBOL,
+        targetSymbol: LEVERED_SYMBOL,
+        leverage: 3,
+      },
+    );
+    if (syntheticLevered) {
+      output.leveredSeries = syntheticLevered;
+    }
     try {
       const metricsWindow = output?.windows?.[FUSION_WINDOW] || output?.windows?.[String(FUSION_WINDOW)];
       if (metricsWindow) {
@@ -319,47 +303,6 @@ function buildOutput(aligned, returns, openSeries, leveredSeries) {
     assets: ASSETS.map(({ symbol, label, category }) => ({ symbol, label, category })),
     windows,
   };
-}
-
-function buildLeveredSeries(dates, seriesList) {
-  const result = {};
-  if (!Array.isArray(dates) || !Array.isArray(seriesList)) {
-    return result;
-  }
-  if (dates.length < 2) {
-    return result;
-  }
-  const analysisDates = dates.slice(1);
-  seriesList.forEach((series) => {
-    if (!series || !Array.isArray(series.dates)) {
-      return;
-    }
-    const closeMap = new Map(series.dates.map((date, index) => [date, series.prices[index]]));
-    const openMap = new Map(series.dates.map((date, index) => [date, Array.isArray(series.opens) ? series.opens[index] : undefined]));
-    const closes = [];
-    const opens = [];
-    let lastClose = null;
-    let lastOpen = null;
-    for (let i = 0; i < analysisDates.length; i += 1) {
-      const date = analysisDates[i];
-      const closeValue = Number(closeMap.get(date));
-      const openValue = Number(openMap.get(date));
-      const normalizedClose = Number.isFinite(closeValue) ? closeValue : lastClose;
-      const normalizedOpen = Number.isFinite(openValue)
-        ? openValue
-        : (Number.isFinite(closeValue) ? closeValue : lastOpen ?? normalizedClose);
-      closes.push(Number.isFinite(normalizedClose) ? normalizedClose : null);
-      opens.push(Number.isFinite(normalizedOpen) ? normalizedOpen : null);
-      if (Number.isFinite(normalizedClose)) {
-        lastClose = normalizedClose;
-      }
-      if (Number.isFinite(normalizedOpen)) {
-        lastOpen = normalizedOpen;
-      }
-    }
-    result[series.symbol] = { close: closes, open: opens };
-  });
-  return result;
 }
 
 async function writeOutput(output) {
@@ -627,6 +570,78 @@ function buildSeriesFromHistory(historical, cutoffDate, assets) {
     });
   });
   return merged;
+}
+
+function buildSyntheticLeveredSeries(priceSeries, priceSeriesOpen, options = {}) {
+  const baseSymbol = options.baseSymbol || BENCHMARK_SYMBOL;
+  const targetSymbol = options.targetSymbol || LEVERED_SYMBOL;
+  const leverage = Number.isFinite(options.leverage) ? Number(options.leverage) : 3;
+  if (!priceSeries || typeof priceSeries !== 'object') {
+    return {};
+  }
+  const baseClose = priceSeries[baseSymbol];
+  if (!Array.isArray(baseClose) || baseClose.length === 0) {
+    return {};
+  }
+  const close = new Array(baseClose.length).fill(null);
+  let syntheticClose = Number.isFinite(baseClose[0]) ? Number(baseClose[0]) : 100;
+  close[0] = syntheticClose;
+  for (let i = 1; i < baseClose.length; i += 1) {
+    const prevBase = Number(baseClose[i - 1]);
+    const currBase = Number(baseClose[i]);
+    let ret = 0;
+    if (Number.isFinite(prevBase) && prevBase !== 0 && Number.isFinite(currBase)) {
+      ret = currBase / prevBase - 1;
+    }
+    const leveredReturn = clampLeveredReturn(ret, leverage);
+    const prevSynthetic = Number.isFinite(close[i - 1]) ? close[i - 1] : syntheticClose;
+    syntheticClose = prevSynthetic * (1 + leveredReturn);
+    close[i] = syntheticClose;
+  }
+
+  const baseOpenSeries = priceSeriesOpen && priceSeriesOpen[baseSymbol];
+  const open = new Array(baseClose.length).fill(null);
+  if (Array.isArray(baseOpenSeries) && baseOpenSeries.length === baseClose.length) {
+    let syntheticOpen = Number.isFinite(baseOpenSeries[0]) ? Number(baseOpenSeries[0]) : close[0];
+    open[0] = syntheticOpen;
+    for (let i = 1; i < baseOpenSeries.length; i += 1) {
+      const prevBaseOpen = Number(baseOpenSeries[i - 1]);
+      const currBaseOpen = Number(baseOpenSeries[i]);
+      let ret = 0;
+      if (Number.isFinite(prevBaseOpen) && prevBaseOpen !== 0 && Number.isFinite(currBaseOpen)) {
+        ret = currBaseOpen / prevBaseOpen - 1;
+      }
+      const leveredReturn = clampLeveredReturn(ret, leverage);
+      const prevSynthetic = Number.isFinite(open[i - 1]) ? open[i - 1] : syntheticOpen;
+      syntheticOpen = prevSynthetic * (1 + leveredReturn);
+      open[i] = syntheticOpen;
+    }
+  } else {
+    for (let i = 0; i < open.length; i += 1) {
+      open[i] = close[i];
+    }
+  }
+
+  return {
+    [targetSymbol]: {
+      close,
+      open,
+    },
+  };
+}
+
+function clampLeveredReturn(ret, leverage) {
+  if (!Number.isFinite(ret) || !Number.isFinite(leverage)) {
+    return 0;
+  }
+  const scaled = ret * leverage;
+  if (scaled < -0.99) {
+    return -0.99;
+  }
+  if (scaled > 5) {
+    return 5;
+  }
+  return scaled;
 }
 
 function trimSeries(series, predicate) {
