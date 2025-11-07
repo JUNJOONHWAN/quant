@@ -1480,51 +1480,45 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const priceLevered = [];
   for (let idx = 0; idx < dates.length; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
-    const prevIndex = priceIndex - 1;
-    const openNow = Number.isFinite(opens?.[priceIndex]) ? Number(opens[priceIndex]) : null;
-    const openPrev = Number.isFinite(opens?.[prevIndex]) ? Number(opens[prevIndex]) : null;
-    let openReturn = 0;
+    const openToday = Number.isFinite(opens?.[priceIndex]) ? Number(opens[priceIndex]) : null;
+    const closeToday = Number.isFinite(prices?.[priceIndex]) ? Number(prices[priceIndex]) : null;
+    let openCloseReturn = 0;
     if (
-      openNow != null
-      && openPrev != null
-      && openPrev !== 0
+      openToday != null
+      && closeToday != null
+      && openToday !== 0
     ) {
-      openReturn = openNow / openPrev - 1;
+      openCloseReturn = closeToday / openToday - 1;
     } else if (
-      prices[priceIndex] != null
-      && prices[prevIndex] != null
-      && prices[prevIndex] !== 0
+      closeToday != null
+      && priceIndex > 0
+      && Number.isFinite(prices?.[priceIndex - 1])
+      && prices[priceIndex - 1] !== 0
     ) {
-      openReturn = prices[priceIndex] / prices[prevIndex] - 1;
+      openCloseReturn = closeToday / Number(prices[priceIndex - 1]) - 1;
     }
-    baseReturns.push(openReturn);
+    baseReturns.push(openCloseReturn);
+
+    const leveredOpenToday = Number.isFinite(leveredOpens?.[priceIndex])
+      ? Number(leveredOpens[priceIndex])
+      : openToday;
+    const leveredCloseToday = Number.isFinite(leveredCloses?.[priceIndex])
+      ? Number(leveredCloses[priceIndex])
+      : null;
     let leveredReturn = 0;
-    const leveredOpenNow = Number.isFinite(leveredOpens?.[priceIndex]) ? Number(leveredOpens[priceIndex]) : null;
-    const leveredOpenPrev = Number.isFinite(leveredOpens?.[prevIndex]) ? Number(leveredOpens[prevIndex]) : null;
     if (
-      leveredOpenNow != null
-      && leveredOpenPrev != null
-      && leveredOpenPrev !== 0
+      leveredOpenToday != null
+      && leveredCloseToday != null
+      && leveredOpenToday !== 0
     ) {
-      leveredReturn = leveredOpenNow / leveredOpenPrev - 1;
-    } else if (
-      leveredCloses[priceIndex] != null
-      && leveredCloses[prevIndex] != null
-      && leveredCloses[prevIndex] !== 0
-    ) {
-      leveredReturn = leveredCloses[priceIndex] / leveredCloses[prevIndex] - 1;
+      leveredReturn = leveredCloseToday / leveredOpenToday - 1;
     } else {
-      leveredReturn = leveragedReturn(openReturn, tradeConfig.leverage, 1);
+      leveredReturn = leveragedReturn(openCloseReturn, tradeConfig.leverage, 1);
     }
     leveredReturns.push(leveredReturn);
-    const qqqPrice = openNow != null
-      ? openNow
-      : (Number.isFinite(prices?.[priceIndex]) ? Number(prices[priceIndex]) : null);
-    const leveredPrice = leveredOpenNow != null
-      ? leveredOpenNow
-      : (Number.isFinite(leveredCloses?.[priceIndex]) ? Number(leveredCloses[priceIndex]) : null);
-    priceQQQ.push(qqqPrice);
-    priceLevered.push(leveredPrice);
+
+    priceQQQ.push(openToday != null ? openToday : closeToday);
+    priceLevered.push(leveredOpenToday != null ? leveredOpenToday : leveredCloseToday);
   }
 
   const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
