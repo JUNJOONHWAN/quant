@@ -1058,8 +1058,8 @@ def generate_market_report(
 
     # merge order: prefer Holdings path (FMP/Yahoo) → SoT
     x = _merge_feature_vectors(x_fmp, x_sot)
-    x_display = x.copy()
     x = _apply_feature_clamps(x)
+    x_display = x.copy()
 
     # Provide realized vol if FMP lacked it but SoT had it
     features_map = {k: float(v) if np.isfinite(v) else None for k, v in zip(FEATURES, x_display)}
