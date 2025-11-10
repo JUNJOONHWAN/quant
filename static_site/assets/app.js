@@ -1164,7 +1164,6 @@ function renderMarketReportPanel() {
 
   populateMarketReportDrivers(view.drivers);
   renderMarketReportGauge(view);
-  renderMarketReportDonut(view);
   renderMarketReportSparkline(view);
   renderMarketReportDriverChart(view.drivers);
   renderMarketReportFeatures(view.features);
@@ -1546,6 +1545,59 @@ function renderMarketReportSpreads(curveTs) {
       return;
     }
     chart.setOption({
+      grid: { left: 30, right: 10, top: 15, bottom: 24 },
+      xAxis: {
+        type: 'category',
+        data: dates,
+        axisLabel: { show: false },
+        axisLine: { show: false },
+        axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#cbd5ff', fontSize: 10 },
+        splitLine: { show: false },
+      },
+      tooltip: {
+        trigger: 'axis',
+        formatter: (params) => {
+          const first = params && params[0];
+          if (!first) return '';
+          return `${first.axisValue}<br>${Number(first.value).toFixed(2)}%`;
+        },
+      },
+      series: [
+        {
+          type: 'line',
+          data: values,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: cfg.color, width: 2 },
+          areaStyle: { color: `${cfg.color}33` },
+        },
+      ],
+    });
+  });
+}
+
+function renderMarketReportSpreads(curveTs) {
+  const configs = [
+    { id: 'spread-10y-3m', key: 'spr_10y_3m', color: '#38bdf8' },
+    { id: 'spread-10y-2y', key: 'spr_10y_2y', color: '#f97316' },
+    { id: 'spread-curvature', key: 'curvature', color: '#a855f7' },
+  ];
+  configs.forEach((cfg) => {
+    const element = document.getElementById(cfg.id);
+    if (!element) return;
+    const chart = charts[cfg.id] || echarts.init(element);
+    charts[cfg.id] = chart;
+    const dates = Array.isArray(curveTs?.dates) ? curveTs.dates.slice(-90) : [];
+    const values = Array.isArray(curveTs?.[cfg.key]) ? curveTs[cfg.key].slice(-90) : [];
+    if (!dates.length || !values.length) {
+      chart.clear();
+      return;
+    }
+    chart.setOption({
       grid: { left: 30, right: 10, top: 15, bottom: 22 },
       xAxis: {
         type: 'category',
@@ -1687,48 +1739,6 @@ function renderMarketReportGauge(view) {
         progress: { show: false },
         silent: true,
         z: 2,
-      },
-    ],
-  });
-}
-
-function renderMarketReportDonut(view) {
-  const element = document.getElementById('market-report-donut');
-  if (!element) return;
-  const chart = charts.marketReportDonut || echarts.init(element);
-  charts.marketReportDonut = chart;
-  const probability = clamp01(view.prob);
-  const remainder = Math.max(0, 1 - probability);
-  chart.setOption({
-    tooltip: {
-      formatter: (params) => `${params.name}: ${(params.value * 100).toFixed(1)}%`,
-    },
-    series: [
-      {
-        type: 'pie',
-        radius: ['60%', '82%'],
-        avoidLabelOverlap: false,
-        label: { show: false },
-        data: [
-          { value: probability, name: '상승', itemStyle: { color: '#22c55e' } },
-          { value: remainder, name: '하락', itemStyle: { color: '#ef4444' } },
-        ],
-      },
-      {
-        type: 'gauge',
-        startAngle: 90,
-        endAngle: -269.999,
-        pointer: { show: false },
-        axisLine: { show: false },
-        axisTick: { show: false },
-        splitLine: { show: false },
-        axisLabel: { show: false },
-        detail: {
-          formatter: `${(probability * 100).toFixed(1)}%`,
-          fontSize: 22,
-          color: TEXT_PRIMARY,
-        },
-        data: [{ value: probability }],
       },
     ],
   });

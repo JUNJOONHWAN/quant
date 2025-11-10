@@ -247,30 +247,6 @@ main {
   height: 280px;
 }
 
-.market-report-gauge-row {
-  display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(200px, 260px);
-  gap: 1rem;
-  align-items: stretch;
-}
-
-.market-report-donut-block {
-  background: rgba(15, 23, 42, 0.45);
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  border-radius: 1rem;
-  padding: 0.5rem;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-}
-
-.market-report-donut {
-  width: 100%;
-  height: 220px;
-}
-
-.donut-hint,
 .spread-hint {
   margin: 0.4rem 0 0;
   font-size: 0.8rem;
@@ -332,9 +308,9 @@ main {
   padding: 0.9rem 1rem;
 }
 
-.spread-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+.spread-stack {
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
 }
 
@@ -435,13 +411,6 @@ main {
   color: var(--color-highlight);
 }
 
-.market-report-features {
-  background: rgba(15, 23, 42, 0.45);
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  border-radius: 1rem;
-  padding: 0.9rem 1rem;
-}
-
 .feature-list {
   list-style: none;
   margin: 0.5rem 0 0;
@@ -485,6 +454,18 @@ main {
   border: 1px solid rgba(148, 163, 184, 0.25);
   border-radius: 1rem;
   padding: 0.9rem 1rem;
+}
+
+.market-report-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.secondary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
 }
 
 .market-report-markdown {
