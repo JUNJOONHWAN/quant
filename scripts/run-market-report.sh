@@ -14,7 +14,7 @@ JSON_PATH="$OUT_DIR/report.json"
 MD_PATH="$OUT_DIR/report.md"
 SUMMARY_PATH="$OUT_DIR/summary.txt"
 
-python3 stock_bench/market_analysis/market_report.py \
+python3 report_engine/market_analysis/market_report.py \
   --json \
   --horizon "$HORIZON" \
   --lookback "$LOOKBACK" \

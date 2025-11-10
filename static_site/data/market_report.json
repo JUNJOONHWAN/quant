@@ -1,0 +1,39 @@
+{
+  "prob": {
+    "p_up": 0.62,
+    "p_up_raw": 0.58
+  },
+  "drivers": [
+    ["ADR", 0.412],
+    ["Pct>MA50", 0.257],
+    ["10Y-3M", -0.183],
+    ["NH/NL", 0.142],
+    ["RV20", -0.098]
+  ],
+  "features": {
+    "ADR": 1.85,
+    "Pct>MA50": 0.64,
+    "Pct>MA200": 0.41,
+    "NH/NL": 1.25,
+    "RV20": 0.34,
+    "RV60": 0.28,
+    "SPR_10Y_3M": -0.55,
+    "SPR_10Y_2Y": -0.22,
+    "CURVATURE": -0.11
+  },
+  "refs": {
+    "base_symbol": "QQQ",
+    "horizon_days": 5,
+    "ctx_fmp": {
+      "sectors": [
+        {"sector": "Technology", "changesPercentage": 1.24},
+        {"sector": "Communication Services", "changesPercentage": 0.88},
+        {"sector": "Consumer Discretionary", "changesPercentage": 0.55},
+        {"sector": "Financial", "changesPercentage": -0.35},
+        {"sector": "Energy", "changesPercentage": -1.12},
+        {"sector": "Utilities", "changesPercentage": -0.28}
+      ]
+    }
+  },
+  "markdown": "## Sample Market Report\n- Placeholder for dev"
+}

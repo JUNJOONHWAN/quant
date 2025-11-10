@@ -264,7 +264,23 @@ const state = {
     leveredSymbol: SIGNAL.trade.leveredSymbol,
   },
   fusionNewgate: null,
+  marketReport: null,
+  marketReportError: '',
+  marketReportPath: 'market_report.json',
+  marketReportCacheSeed: '',
 };
+
+const MARKET_FEATURES = [
+  { key: 'ADR', label: 'ADR', min: 0.5, max: 3, format: (v) => formatNumberOrNA(v, 2), tooltip: 'Adv/Decl 비율' },
+  { key: 'Pct>MA50', label: '%>MA50', min: 0, max: 1, format: (v) => formatPercentOrNA(v, 0), tooltip: 'S&P500 50일선 상회 비중' },
+  { key: 'Pct>MA200', label: '%>MA200', min: 0, max: 1, format: (v) => formatPercentOrNA(v, 0), tooltip: 'S&P500 200일선 상회 비중' },
+  { key: 'NH/NL', label: 'NH/NL', min: 0, max: 4, format: (v) => formatNumberOrNA(v, 2), tooltip: '52주 신고/신저 비율' },
+  { key: 'RV20', label: 'RV20', min: 0.05, max: 0.6, format: (v) => v ? `${(v * 100).toFixed(1)}%` : 'N/A', tooltip: '20일 실현 변동성(연환산)' },
+  { key: 'RV60', label: 'RV60', min: 0.05, max: 0.6, format: (v) => v ? `${(v * 100).toFixed(1)}%` : 'N/A', tooltip: '60일 실현 변동성(연환산)' },
+  { key: 'SPR_10Y_3M', label: '10Y-3M', min: -3, max: 3, format: (v) => formatSignedNumber(v, 2), tooltip: '미 국채 10Y-3M 스프레드' },
+  { key: 'SPR_10Y_2Y', label: '10Y-2Y', min: -2, max: 2, format: (v) => formatSignedNumber(v, 2), tooltip: '미 국채 10Y-2Y 스프레드' },
+  { key: 'CURVATURE', label: 'Curvature', min: -3, max: 3, format: (v) => formatSignedNumber(v, 2), tooltip: '30Y + 3M − 2×10Y' },
+];
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
   const normalized = (nextMode === 'enhanced') ? 'enhanced'
@@ -421,6 +437,7 @@ async function init() {
     }
 
     hydrateFromPrecomputed(precomputed);
+    await loadMarketReport();
     hideError();
     populateControls();
     renderAll();
@@ -749,6 +766,10 @@ async function loadData() {
     manifest && typeof manifest === 'object' && typeof manifest.data === 'string' && manifest.data.trim()
       ? manifest.data.trim()
       : 'precomputed.json';
+  const reportFile =
+    manifest && typeof manifest === 'object' && typeof manifest.report === 'string' && manifest.report.trim()
+      ? manifest.report.trim()
+      : 'market_report.json';
   const cacheSeed =
     manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
   let targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
@@ -762,7 +783,7 @@ async function loadData() {
 
   try {
     const json = JSON.parse(text);
-    return { json, byteLength };
+    return { json, byteLength, cacheSeed, reportFile };
   } catch (parseError) {
     const error = new Error('INVALID_JSON');
     error.cause = parseError;
@@ -773,7 +794,9 @@ async function loadData() {
 async function loadPrecomputed() {
   try {
     setDataInfo('데이터 크기를 계산 중입니다...');
-    const { json, byteLength } = await loadData();
+    const { json, byteLength, cacheSeed, reportFile } = await loadData();
+    state.marketReportPath = reportFile || 'market_report.json';
+    state.marketReportCacheSeed = cacheSeed || `${Date.now()}`;
     if (json && json.status === 'no_data') {
       setDataInfo('데이터 파일이 비어 있습니다. 다시 생성해 주세요.', 'error');
       showEmptyState('데이터 파일이 비어 있습니다.', 'scripts/generate-data.js를 실행해 최신 precomputed.json을 생성해야 합니다.');
@@ -802,6 +825,25 @@ async function loadPrecomputed() {
       showEmptyState('데이터를 불러오지 못했습니다.');
     }
     return null;
+  }
+}
+
+async function loadMarketReport() {
+  const reportPath = state.marketReportPath || 'market_report.json';
+  const cacheSeed = state.marketReportCacheSeed || `${Date.now()}`;
+  try {
+    const response = await fetch(`./data/${reportPath}?ts=${encodeURIComponent(cacheSeed)}`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const text = await response.text();
+    const data = JSON.parse(text);
+    state.marketReport = data;
+    state.marketReportError = '';
+  } catch (error) {
+    console.warn('Failed to load market report payload', error);
+    state.marketReport = null;
+    state.marketReportError = '마켓 리포트를 불러오지 못했습니다.';
   }
 }
 
@@ -1088,11 +1130,11 @@ function renderMarketReportPanel() {
   const panel = document.getElementById('market-report-panel');
   if (!panel) return;
   const notice = document.getElementById('market-report-empty');
-  const snapshot = computeMarketReportSnapshot();
+  const view = buildMarketReportView();
 
-  if (!snapshot) {
+  if (!view) {
     if (notice) {
-      notice.textContent = '마켓 리포트 데이터를 불러오지 못했습니다. 표시 범위와 윈도우를 확인해 주세요.';
+      notice.textContent = state.marketReportError || '마켓 리포트 데이터를 불러오지 못했습니다. 표시 범위와 윈도우를 확인해 주세요.';
       notice.classList.remove('hidden');
     }
     if (charts.marketReportGauge) {
@@ -1101,6 +1143,7 @@ function renderMarketReportPanel() {
     if (charts.marketReportSparkline) {
       charts.marketReportSparkline.clear();
     }
+    populateMarketReportDrivers([]);
     return;
   }
 
@@ -1108,85 +1151,337 @@ function renderMarketReportPanel() {
     notice.classList.add('hidden');
   }
 
-  setMarketReportField('market-report-score-value', formatPercentOrNA(snapshot.score, 1));
-  setMarketReportField('market-report-confidence', `${(snapshot.low * 100).toFixed(0)}% ~ ${(snapshot.high * 100).toFixed(0)}%`);
-  setMarketReportField('market-report-range', snapshot.rangeLabel || `${state.range}일`);
-  setMarketReportField('market-report-date', snapshot.date || '-');
-  const slopeText = Number.isFinite(snapshot.slope)
-    ? `${snapshot.slope >= 0 ? '▲' : '▼'} ${Math.abs(snapshot.slope).toFixed(3)}`
+  setMarketReportField('market-report-score-value', formatPercentOrNA(view.prob, 1));
+  setMarketReportField('market-report-confidence', `${(view.low * 100).toFixed(0)}% ~ ${(view.high * 100).toFixed(0)}%`);
+  setMarketReportField('market-report-range', view.rangeLabel || `${state.range}일`);
+  setMarketReportField('market-report-date', view.date || '-');
+  const slopeText = Number.isFinite(view.slope)
+    ? `${view.slope >= 0 ? '▲' : '▼'} ${Math.abs(view.slope).toFixed(3)}`
     : '데이터 부족';
   setMarketReportField('market-report-slope', slopeText);
+  setMarketReportMeta(view.meta);
 
-  renderMarketReportGauge(snapshot);
-  renderMarketReportSparkline(snapshot);
+  populateMarketReportDrivers(view.drivers);
+  renderMarketReportGauge(view);
+  renderMarketReportSparkline(view);
+  renderMarketReportDriverChart(view.drivers);
+  renderMarketReportFeatures(view.features);
+  renderMarketReportSectors(view.sectors);
 }
 
-function computeMarketReportSnapshot() {
+function buildMarketReportView() {
+  const report = state.marketReport;
   const metrics = state.metrics[state.window];
-  if (!metrics) return null;
+  if (!report || !metrics) return null;
   const filtered = getFilteredRecords(metrics);
   if (!filtered || filtered.empty || !Array.isArray(filtered.records) || filtered.records.length === 0) {
     return null;
   }
-  const classicSeries = computeRiskSeriesClassic(metrics, filtered.records);
-  if (!classicSeries || !Array.isArray(classicSeries.score) || classicSeries.score.length === 0) {
-    return null;
-  }
-  const scoreSeries = classicSeries.score.filter((value) => Number.isFinite(value));
-  if (scoreSeries.length === 0) {
-    return null;
-  }
-  const latestScore = scoreSeries[scoreSeries.length - 1];
-  const sampleSize = Math.min(scoreSeries.length, 90);
-  const sample = scoreSeries.slice(-sampleSize);
-  const avg = mean(sample);
-  let variance = 0;
-  if (sample.length > 1) {
-    variance = sample.reduce((acc, value) => acc + ((value - avg) ** 2), 0) / sample.length;
-  }
-  const std = Math.sqrt(Math.max(variance, 1e-6));
-  const interval = Math.min(0.2, 1.28155 * std);
-  let low = clamp01(latestScore - interval);
-  let high = clamp01(latestScore + interval);
-  if (high - low < 0.01) {
-    const mid = (low + high) / 2;
-    low = clamp01(mid - 0.005);
-    high = clamp01(mid + 0.005);
-  }
 
-  const dates = filtered.records.map((item) => item.date);
+  const probability = Number(report?.prob?.p_up);
+  if (!Number.isFinite(probability)) {
+    return null;
+  }
+  const rawProbability = Number(report?.prob?.p_up_raw);
+  const drivers = Array.isArray(report?.drivers) ? report.drivers : [];
+  const features = report?.features && typeof report.features === 'object' ? report.features : {};
+  const refs = report?.refs && typeof report.refs === 'object' ? report.refs : {};
+  const sectors = extractSectorSeries(refs);
+  const interval = computeProbabilityInterval(probability, drivers);
   const stabilitySeries = filtered.records.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
-  const slopeValues = filtered.records
-    .slice(-10)
-    .map((item) => (Number.isFinite(item.delta) ? item.delta : null))
-    .filter((value) => Number.isFinite(value));
-  const slope = slopeValues.length ? (slopeValues.reduce((acc, value) => acc + value, 0) / slopeValues.length) : null;
+  const dates = filtered.records.map((item) => item.date);
   const latestRecord = filtered.records[filtered.records.length - 1] || {};
+  const slope = computeStabilitySlope(filtered.records);
 
   return {
-    score: latestScore,
-    low,
-    high,
+    prob: probability,
+    probRaw: Number.isFinite(rawProbability) ? rawProbability : null,
+    low: interval.low,
+    high: interval.high,
     date: latestRecord.date || '',
-    rangeLabel: filtered.rangeLabel || '',
+    rangeLabel: filtered.rangeLabel || `${state.range}일`,
     slope,
     stabilitySeries,
     dates,
+    drivers,
+    features,
+    meta: {
+      baseSymbol: refs.base_symbol || SIGNAL.trade.baseSymbol,
+      horizon: refs.horizon_days || 5,
+    },
+    sectors,
   };
 }
 
-function renderMarketReportGauge(snapshot) {
+function computeProbabilityInterval(probability, drivers) {
+  const driverStrength = Array.isArray(drivers)
+    ? drivers.reduce((acc, driver) => {
+        const value = Number(driver?.[1]);
+        if (!Number.isFinite(value)) return acc;
+        return acc + Math.abs(value);
+      }, 0)
+    : 0;
+  const normalized = Math.min(1, driverStrength / Math.max(1, drivers?.length || 1));
+  const baseWidth = 0.16 - (normalized * 0.08);
+  const width = Math.max(0.04, Math.min(0.22, baseWidth));
+  const half = width / 2;
+  return {
+    low: clamp01(probability - half),
+    high: clamp01(probability + half),
+  };
+}
+
+function computeStabilitySlope(records) {
+  if (!Array.isArray(records) || records.length === 0) return null;
+  const window = records.slice(-10);
+  const deltas = window
+    .map((item) => (Number.isFinite(item?.delta) ? item.delta : null))
+    .filter((value) => Number.isFinite(value));
+  if (deltas.length === 0) return null;
+  const sum = deltas.reduce((acc, value) => acc + value, 0);
+  return sum / deltas.length;
+}
+
+function populateMarketReportDrivers(drivers) {
+  const list = document.getElementById('market-report-driver-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!Array.isArray(drivers) || drivers.length === 0) {
+    const emptyItem = document.createElement('li');
+    emptyItem.textContent = '드라이버 데이터를 찾을 수 없습니다.';
+    list.appendChild(emptyItem);
+    return;
+  }
+  drivers.slice(0, 5).forEach(([name, value], index) => {
+    const li = document.createElement('li');
+    const rank = document.createElement('span');
+    rank.className = 'driver-rank';
+    rank.textContent = `#${index + 1}`;
+    const label = document.createElement('strong');
+    label.textContent = name || `지표 ${index + 1}`;
+    const val = document.createElement('span');
+    val.className = 'driver-value';
+    val.textContent = Number.isFinite(Number(value)) ? Number(value).toFixed(3) : 'N/A';
+    li.appendChild(rank);
+    li.appendChild(label);
+    li.appendChild(val);
+    list.appendChild(li);
+  });
+}
+
+function renderMarketReportDriverChart(drivers) {
+  const element = document.getElementById('market-report-driver-chart');
+  if (!element) return;
+  const chart = charts.marketReportDrivers || echarts.init(element);
+  charts.marketReportDrivers = chart;
+
+  if (!Array.isArray(drivers) || drivers.length === 0) {
+    chart.clear();
+    return;
+  }
+
+  const top = drivers.slice(0, 5).map((item) => ({
+    name: item?.[0] || '',
+    value: Number(item?.[1]) || 0,
+  }));
+
+  chart.setOption({
+    grid: { left: 60, right: 10, top: 10, bottom: 10 },
+    xAxis: {
+      type: 'value',
+      axisLabel: { color: '#cbd5ff' },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: 'category',
+      data: top.map((item) => item.name),
+      axisLabel: { color: '#cbd5ff' },
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params) => {
+        const first = params && params[0];
+        if (!first) return '';
+        return `${first.name}: ${Number(first.value).toFixed(3)}`;
+      },
+    },
+    series: [
+      {
+        type: 'bar',
+        data: top.map((item) => item.value),
+        barWidth: 14,
+        itemStyle: {
+          color: (params) => (params.value >= 0 ? '#4ade80' : '#f87171'),
+        },
+        label: {
+          show: true,
+          position: 'right',
+          color: '#f8fafc',
+          formatter: (params) => Number(params.value).toFixed(2),
+        },
+      },
+    ],
+  });
+}
+
+function renderMarketReportFeatures(features) {
+  const list = document.getElementById('market-report-feature-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!features || typeof features !== 'object') {
+    const empty = document.createElement('li');
+    empty.textContent = 'Feature 데이터를 찾지 못했습니다.';
+    list.appendChild(empty);
+    return;
+  }
+
+  MARKET_FEATURES.forEach((cfg) => {
+    const raw = Number(features[cfg.key]);
+    const normalized = Number.isFinite(raw)
+      ? Math.max(0, Math.min(1, (raw - cfg.min) / Math.max(1e-6, cfg.max - cfg.min)))
+      : null;
+    const li = document.createElement('li');
+    li.className = 'feature-line';
+
+    const header = document.createElement('header');
+    const label = document.createElement('span');
+    label.textContent = cfg.label;
+    if (cfg.tooltip) {
+      label.title = cfg.tooltip;
+    }
+    const value = document.createElement('strong');
+    value.textContent = Number.isFinite(raw) ? cfg.format(raw) : 'N/A';
+    header.appendChild(label);
+    header.appendChild(value);
+
+    const bar = document.createElement('div');
+    bar.className = 'feature-bar';
+    const fill = document.createElement('span');
+    if (normalized === null) {
+      fill.style.width = '0%';
+      fill.style.opacity = '0.3';
+    } else {
+      fill.style.width = `${(normalized * 100).toFixed(1)}%`;
+    }
+    bar.appendChild(fill);
+
+    li.appendChild(header);
+    li.appendChild(bar);
+    list.appendChild(li);
+  });
+}
+
+function setMarketReportMeta(meta) {
+  const element = document.getElementById('market-report-meta');
+  if (!element) return;
+  if (!meta) {
+    element.textContent = '';
+    return;
+  }
+  const base = meta.baseSymbol || SIGNAL.trade.baseSymbol;
+  const horizonValue = Number(meta.horizon);
+  const horizon = Number.isFinite(horizonValue) ? `${horizonValue}일` : '';
+  element.textContent = horizon ? `${base} 기반 · Horizon ${horizon}` : `${base} 기반`;
+}
+
+function renderMarketReportSectors(sectors) {
+  const element = document.getElementById('market-report-sectors-chart');
+  if (!element) return;
+  const chart = charts.marketReportSectors || echarts.init(element);
+  charts.marketReportSectors = chart;
+
+  if (!Array.isArray(sectors) || sectors.length === 0) {
+    chart.clear();
+    return;
+  }
+
+  const data = sectors.map((item) => {
+    const change = Number(item.change);
+    const pct = Number.isFinite(change) ? change * 100 : 0;
+    const label = `${item.name || 'N/A'}\n${pct.toFixed(1)}%`;
+    return {
+      name: label,
+      rawName: item.name,
+      value: Math.max(Math.abs(change), 0.0001),
+      change,
+    };
+  });
+
+  chart.setOption({
+    tooltip: {
+      formatter: (params) => {
+        const change = Number(params?.data?.change || 0);
+        return `${params?.data?.rawName || ''}: ${change >= 0 ? '+' : ''}${(change * 100).toFixed(2)}%`;
+      },
+    },
+    series: [
+      {
+        type: 'treemap',
+        roam: false,
+        breadcrumb: { show: false },
+        label: {
+          formatter: (info) => info.name,
+          color: '#f8fafc',
+        },
+        upperLabel: { show: false },
+        itemStyle: {
+          borderColor: 'rgba(15,23,42,0.6)',
+          borderWidth: 1,
+        },
+        levels: [
+          {
+            color: ['#16a34a', '#22c55e', '#f97316', '#ef4444'],
+            colorMappingBy: 'value',
+          },
+        ],
+        data: data.map((item) => ({
+          name: item.name,
+          value: item.value,
+          rawName: item.rawName,
+          change: item.change,
+          itemStyle: {
+            color: item.change >= 0 ? '#22c55e' : '#ef4444',
+          },
+        })),
+      },
+    ],
+  });
+}
+
+function extractSectorSeries(refs) {
+  const ctx = refs?.ctx_fmp;
+  if (!ctx || typeof ctx !== 'object') return [];
+  const raw = ctx.sectors;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      const name = item?.sector || item?.name || '';
+      let change = Number(item?.changesPercentage);
+      if (!Number.isFinite(change)) {
+        change = Number(item?.percentageChange);
+      }
+      if (!Number.isFinite(change)) return null;
+      if (Math.abs(change) > 5) {
+        change /= 100;
+      }
+      return { name, change };
+    })
+    .filter((item) => item && item.name);
+}
+
+function renderMarketReportGauge(view) {
   const element = document.getElementById('market-report-gauge');
   if (!element) return;
   const chart = charts.marketReportGauge || echarts.init(element);
   charts.marketReportGauge = chart;
 
-  const low = Math.max(0, Math.min(snapshot.low, snapshot.high));
-  const high = Math.min(1, Math.max(snapshot.low, snapshot.high));
+  const low = Math.max(0, Math.min(view.low, view.high));
+  const high = Math.min(1, Math.max(view.low, view.high));
 
   chart.setOption({
     tooltip: {
-      formatter: () => `상승 확률: ${(snapshot.score * 100).toFixed(1)}%\n신뢰 구간: ${(low * 100).toFixed(0)}% ~ ${(high * 100).toFixed(0)}%`,
+      formatter: () => `상승 확률: ${(view.prob * 100).toFixed(1)}%\n신뢰 구간: ${(low * 100).toFixed(0)}% ~ ${(high * 100).toFixed(0)}%`,
     },
     series: [
       {
@@ -1217,7 +1512,7 @@ function renderMarketReportGauge(snapshot) {
           color: TEXT_PRIMARY,
           offsetCenter: [0, '60%'],
         },
-        data: [{ value: clamp01(snapshot.score) }],
+        data: [{ value: clamp01(view.prob) }],
       },
       {
         name: 'interval',
@@ -1250,14 +1545,14 @@ function renderMarketReportGauge(snapshot) {
   });
 }
 
-function renderMarketReportSparkline(snapshot) {
+function renderMarketReportSparkline(view) {
   const element = document.getElementById('market-report-sparkline');
   if (!element) return;
   const chart = charts.marketReportSparkline || echarts.init(element);
   charts.marketReportSparkline = chart;
   const maxPoints = 90;
-  const dates = snapshot.dates.slice(-maxPoints);
-  const values = snapshot.stabilitySeries.slice(-maxPoints);
+  const dates = view.dates.slice(-maxPoints);
+  const values = view.stabilitySeries.slice(-maxPoints);
 
   chart.setOption({
     grid: { left: 6, right: 6, top: 4, bottom: 16 },

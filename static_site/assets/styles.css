@@ -285,6 +285,21 @@ main {
   height: 90px;
 }
 
+.driver-chart {
+  height: 140px;
+}
+
+.sector-chart {
+  height: 200px;
+}
+
+.market-report-meta {
+  margin: 0.3rem 0 0.6rem;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
 .market-report-body {
   display: flex;
   flex-direction: column;
@@ -323,6 +338,95 @@ main {
   margin: 0.75rem 0 0;
   font-size: 0.85rem;
   color: var(--color-text-muted);
+}
+
+.market-report-drivers ol {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.market-report-drivers li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.6rem;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.driver-rank {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  width: 2.4rem;
+}
+
+.market-report-drivers strong {
+  flex: 1;
+  font-size: 0.95rem;
+}
+
+.driver-value {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.9rem;
+  color: var(--color-highlight);
+}
+
+.market-report-features {
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 0.9rem 1rem;
+}
+
+.feature-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.feature-line {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.feature-line header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}
+
+.feature-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  overflow: hidden;
+}
+
+.feature-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #a855f7);
+  width: 0;
+}
+
+.market-report-sectors {
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 0.9rem 1rem;
 }
 
 .cheat-chip {

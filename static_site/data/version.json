@@ -1,4 +1,5 @@
 {
   "build": "dev",
-  "data": "precomputed.json"
+  "data": "precomputed.json",
+  "report": "market_report.json"
 }

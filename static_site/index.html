@@ -74,6 +74,7 @@
             <p class="market-report-date" id="market-report-date">-</p>
           </div>
           <div id="market-report-gauge" class="chart market-report-gauge"></div>
+          <p class="market-report-meta" id="market-report-meta">-</p>
           <dl class="market-report-stats">
             <div>
               <dt>현재 추정</dt>
@@ -96,6 +97,10 @@
             <div class="sparkline-header">결합 강도 스파크라인</div>
             <div id="market-report-sparkline" class="market-report-mini-chart"></div>
           </div>
+          <div class="market-report-driver-chart-block">
+            <div class="sparkline-header">드라이버 기여도 (LLR)</div>
+            <div id="market-report-driver-chart" class="market-report-mini-chart driver-chart"></div>
+          </div>
         </div>
         <div class="market-report-body">
           <div class="market-report-problem">
@@ -104,6 +109,15 @@
               <li><strong>문제</strong>: 확률과 기여도를 텍스트/Markdown으로만 노출해 직관성이 낮고, 지표 정의 역시 리포트 본문에서만 확인할 수 있었습니다.</li>
               <li><strong>해결</strong>: 리치 시각화를 갖춘 전용 패널을 Risk-On/OFF 게이지 위에 배치해, 확률·시계열·드라이버 툴팁을 한 번에 제공하고 기존 TXT/CSV 출력은 그대로 유지합니다.</li>
             </ul>
+          </div>
+          <div class="market-report-drivers">
+            <h3>상위 드라이버 (LLR)</h3>
+            <ol id="market-report-driver-list"></ol>
+            <p class="cheatsheet-hint">로그우도비(LLR) 기준 상위 5개 지표</p>
+          </div>
+          <div class="market-report-features">
+            <h3>ETF 기반 Breadth · Curve 지표</h3>
+            <ul id="market-report-feature-list" class="feature-list"></ul>
           </div>
           <div class="market-report-cheatsheet">
             <div class="cheatsheet-header">Driver tooltip cheat sheet</div>
@@ -285,7 +299,7 @@
   <section class="info-popover" id="info-market-report">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>확률형 마켓 리포트</h3>
-    <p>상승 확률 게이지, Stability 스파크라인, 그리고 드라이버 정의 툴팁을 묶어 풀 리포트의 핵심을 상단에서 바로 확인하도록 구성했습니다. TXT/CSV 리포트와 동일한 데이터만 사용하며, 값이 비어 있을 경우 명확한 안내를 띄웁니다.</p>
+    <p>상승 확률 게이지, Stability 스파크라인, 그리고 드라이버 정의 툴팁을 묶어 풀 리포트의 핵심을 상단에서 바로 확인하도록 구성했습니다. GitHub Actions가 매일 생성하는 <code>market_report.json</code>을 로드하며, 파일이 비어 있을 경우 명확한 안내를 띄웁니다.</p>
   </section>
   <section class="info-popover" id="info-stability">
     <button type="button" class="popover-close" aria-label="닫기">×</button>

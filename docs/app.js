@@ -220,7 +220,15 @@ function getInitialRiskMode() {
   }
   try {
     const saved = window.localStorage?.getItem(RISK_MODE_STORAGE_KEY);
-    if (saved === 'classic' || saved === 'enhanced' || saved === 'ffl' || saved === 'ffl_exp' || saved === 'ffl_stab' || saved === 'fll_fusion') {
+    if (
+      saved === 'classic'
+      || saved === 'enhanced'
+      || saved === 'ffl'
+      || saved === 'ffl_exp'
+      || saved === 'ffl_stab'
+      || saved === 'fll_fusion'
+      || saved === 'fusion_newgate'
+    ) {
       return saved;
     }
   } catch (error) {
@@ -236,6 +244,7 @@ const state = {
   normalizedPrices: {},
   priceSeries: {},
   priceSeriesOpen: {},
+  leveredSeries: {},
   priceSeriesSource: 'actual',
   analysisDates: [],
   generatedAt: null,
@@ -250,14 +259,36 @@ const state = {
   },
   riskMode: getInitialRiskMode(),
   heatmapDate: null,
+  benchmark: {
+    symbol: SIGNAL.trade.baseSymbol,
+    leveredSymbol: SIGNAL.trade.leveredSymbol,
+  },
+  fusionNewgate: null,
+  marketReport: null,
+  marketReportError: '',
+  marketReportPath: 'market_report.json',
+  marketReportCacheSeed: '',
 };
+
+const MARKET_FEATURES = [
+  { key: 'ADR', label: 'ADR', min: 0.5, max: 3, format: (v) => formatNumberOrNA(v, 2), tooltip: 'Adv/Decl 비율' },
+  { key: 'Pct>MA50', label: '%>MA50', min: 0, max: 1, format: (v) => formatPercentOrNA(v, 0), tooltip: 'S&P500 50일선 상회 비중' },
+  { key: 'Pct>MA200', label: '%>MA200', min: 0, max: 1, format: (v) => formatPercentOrNA(v, 0), tooltip: 'S&P500 200일선 상회 비중' },
+  { key: 'NH/NL', label: 'NH/NL', min: 0, max: 4, format: (v) => formatNumberOrNA(v, 2), tooltip: '52주 신고/신저 비율' },
+  { key: 'RV20', label: 'RV20', min: 0.05, max: 0.6, format: (v) => v ? `${(v * 100).toFixed(1)}%` : 'N/A', tooltip: '20일 실현 변동성(연환산)' },
+  { key: 'RV60', label: 'RV60', min: 0.05, max: 0.6, format: (v) => v ? `${(v * 100).toFixed(1)}%` : 'N/A', tooltip: '60일 실현 변동성(연환산)' },
+  { key: 'SPR_10Y_3M', label: '10Y-3M', min: -3, max: 3, format: (v) => formatSignedNumber(v, 2), tooltip: '미 국채 10Y-3M 스프레드' },
+  { key: 'SPR_10Y_2Y', label: '10Y-2Y', min: -2, max: 2, format: (v) => formatSignedNumber(v, 2), tooltip: '미 국채 10Y-2Y 스프레드' },
+  { key: 'CURVATURE', label: 'Curvature', min: -3, max: 3, format: (v) => formatSignedNumber(v, 2), tooltip: '30Y + 3M − 2×10Y' },
+];
 
 function applyRiskMode(nextMode, { persist = true } = {}) {
   const normalized = (nextMode === 'enhanced') ? 'enhanced'
     : (nextMode === 'ffl' ? 'ffl'
     : (nextMode === 'ffl_exp' ? 'ffl_exp'
     : (nextMode === 'ffl_stab' ? 'ffl_stab'
-    : (nextMode === 'fll_fusion' ? 'fll_fusion' : 'classic'))));
+    : (nextMode === 'fll_fusion' ? 'fll_fusion'
+    : (nextMode === 'fusion_newgate' ? 'fusion_newgate' : 'classic')))));
   state.riskMode = normalized;
   if (persist) {
     try {
@@ -406,6 +437,7 @@ async function init() {
     }
 
     hydrateFromPrecomputed(precomputed);
+    await loadMarketReport();
     hideError();
     populateControls();
     renderAll();
@@ -498,6 +530,23 @@ function cloneSeriesMap(seriesMap) {
   );
 }
 
+function alignArrayLength(values, targetLength) {
+  if (!Number.isFinite(targetLength) || targetLength <= 0) {
+    return Array.isArray(values) ? values.slice() : [];
+  }
+  const normalized = Array.isArray(values)
+    ? values.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+    : [];
+  if (normalized.length === targetLength) {
+    return normalized;
+  }
+  if (normalized.length > targetLength) {
+    return normalized.slice(normalized.length - targetLength);
+  }
+  const padding = new Array(targetLength - normalized.length).fill(null);
+  return padding.concat(normalized);
+}
+
 function buildAlignedOpenSeries(dates, seriesList) {
   const opens = {};
   if (!Array.isArray(dates)) {
@@ -541,6 +590,45 @@ function findMissingSymbols(seriesMap, symbols) {
     }
   });
   return missing;
+}
+
+function normalizeFusionNewgate(payload) {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.dates) || payload.dates.length === 0) {
+    return null;
+  }
+  const dates = payload.dates.map((date) => (typeof date === 'string' ? date : null));
+  const indexByDate = new Map();
+  dates.forEach((date, idx) => {
+    if (date != null && !indexByDate.has(date)) {
+      indexByDate.set(date, idx);
+    }
+  });
+  const toNumericArray = (values) => alignArrayLength(values, dates.length);
+  const toIntArray = (values) => {
+    const aligned = alignArrayLength(values, dates.length);
+    return aligned.map((value) => {
+      if (Number.isFinite(value)) {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
+      }
+      return 0;
+    });
+  };
+  return {
+    preset: typeof payload.preset === 'string' ? payload.preset : 'aggressive_plus',
+    dates,
+    indexByDate,
+    state: toIntArray(payload.state),
+    executedState: toIntArray(payload.executedState),
+    score: toNumericArray(payload.score),
+    wClassic: toNumericArray(payload.wClassic),
+    wFFL: toNumericArray(payload.wFFL),
+    scCorr: toNumericArray(payload.scCorr),
+    safeNeg: toNumericArray(payload.safeNeg),
+    mm: toNumericArray(payload.mm),
+    diag: typeof payload.diag === 'object' && payload.diag !== null ? payload.diag : null,
+  };
 }
 
 function hydrateFromPrecomputed(data) {
@@ -598,6 +686,25 @@ function hydrateFromPrecomputed(data) {
   state.priceSeries = priceSeries;
   state.priceSeriesOpen = priceSeriesOpen;
   state.normalizedPrices = normalizedPrices;
+  state.benchmark = {
+    symbol: data?.benchmark?.symbol || SIGNAL.trade.baseSymbol,
+    leveredSymbol: data?.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol,
+  };
+  state.leveredSeries = {};
+  if (data.leveredSeries && typeof data.leveredSeries === 'object') {
+    const targetLength = Array.isArray(state.analysisDates) ? state.analysisDates.length : 0;
+    Object.entries(data.leveredSeries).forEach(([symbol, series]) => {
+      const closes = Array.isArray(series?.close) ? series.close.slice() : [];
+      const opens = Array.isArray(series?.open) ? series.open.slice() : [];
+      const alignedClose = alignArrayLength(closes, targetLength);
+      const alignedOpen = alignArrayLength(opens.length ? opens : closes, targetLength);
+      state.leveredSeries[symbol] = {
+        close: alignedClose,
+        open: alignedOpen,
+      };
+    });
+  }
+  state.fusionNewgate = normalizeFusionNewgate(data.fusionNewgate);
   state.priceSeriesSource = 'actual';
   state.metrics = {};
   if (data.windows && typeof data.windows === 'object') {
@@ -659,6 +766,10 @@ async function loadData() {
     manifest && typeof manifest === 'object' && typeof manifest.data === 'string' && manifest.data.trim()
       ? manifest.data.trim()
       : 'precomputed.json';
+  const reportFile =
+    manifest && typeof manifest === 'object' && typeof manifest.report === 'string' && manifest.report.trim()
+      ? manifest.report.trim()
+      : 'market_report.json';
   const cacheSeed =
     manifest?.build || manifest?.buildId || manifest?.generatedAt || manifest?.timestamp || `${now}`;
   let targetUrl = `./data/${dataFile}?ts=${encodeURIComponent(cacheSeed)}`;
@@ -672,7 +783,7 @@ async function loadData() {
 
   try {
     const json = JSON.parse(text);
-    return { json, byteLength };
+    return { json, byteLength, cacheSeed, reportFile };
   } catch (parseError) {
     const error = new Error('INVALID_JSON');
     error.cause = parseError;
@@ -683,7 +794,9 @@ async function loadData() {
 async function loadPrecomputed() {
   try {
     setDataInfo('데이터 크기를 계산 중입니다...');
-    const { json, byteLength } = await loadData();
+    const { json, byteLength, cacheSeed, reportFile } = await loadData();
+    state.marketReportPath = reportFile || 'market_report.json';
+    state.marketReportCacheSeed = cacheSeed || `${Date.now()}`;
     if (json && json.status === 'no_data') {
       setDataInfo('데이터 파일이 비어 있습니다. 다시 생성해 주세요.', 'error');
       showEmptyState('데이터 파일이 비어 있습니다.', 'scripts/generate-data.js를 실행해 최신 precomputed.json을 생성해야 합니다.');
@@ -712,6 +825,25 @@ async function loadPrecomputed() {
       showEmptyState('데이터를 불러오지 못했습니다.');
     }
     return null;
+  }
+}
+
+async function loadMarketReport() {
+  const reportPath = state.marketReportPath || 'market_report.json';
+  const cacheSeed = state.marketReportCacheSeed || `${Date.now()}`;
+  try {
+    const response = await fetch(`./data/${reportPath}?ts=${encodeURIComponent(cacheSeed)}`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const text = await response.text();
+    const data = JSON.parse(text);
+    state.marketReport = data;
+    state.marketReportError = '';
+  } catch (error) {
+    console.warn('Failed to load market report payload', error);
+    state.marketReport = null;
+    state.marketReportError = '마켓 리포트를 불러오지 못했습니다.';
   }
 }
 
@@ -819,7 +951,22 @@ function populateControls() {
       opt4.textContent = 'FLL-Fusion';
       riskModeSelect.appendChild(opt4);
     }
+    let fusionOption = Array.from(riskModeSelect.options).find((option) => option.value === 'fusion_newgate');
+    if (!fusionOption) {
+      fusionOption = document.createElement('option');
+      fusionOption.value = 'fusion_newgate';
+      fusionOption.textContent = 'Fusion-Newgate';
+      riskModeSelect.appendChild(fusionOption);
+    }
+    fusionOption.disabled = !state.fusionNewgate;
+    fusionOption.title = state.fusionNewgate ? '' : 'Fusion-Newgate 데이터가 포함된 사전 계산 파일이 필요합니다.';
     const supportedModes = ['classic', 'enhanced', 'ffl', 'ffl_exp', 'ffl_stab', 'fll_fusion'];
+    if (state.fusionNewgate) {
+      supportedModes.push('fusion_newgate');
+    }
+    if (!supportedModes.includes(state.riskMode)) {
+      applyRiskMode('classic');
+    }
     const currentMode = supportedModes.includes(state.riskMode) ? state.riskMode : 'classic';
     if (riskModeSelect.value !== currentMode) {
       riskModeSelect.value = currentMode;
@@ -836,6 +983,7 @@ function populateControls() {
 
   const refreshButton = document.getElementById('refresh-button');
   const downloadButton = document.getElementById('download-report');
+  const downloadCsvButton = document.getElementById('download-csv-report');
   const startInput = document.getElementById('custom-start');
   const endInput = document.getElementById('custom-end');
 
@@ -861,6 +1009,13 @@ function populateControls() {
       downloadButton.dataset.bound = 'true';
     }
   }
+  if (downloadCsvButton) {
+    downloadCsvButton.disabled = !canBuildTextReport();
+    if (!downloadCsvButton.dataset.bound) {
+      downloadCsvButton.addEventListener('click', handleDownloadCsv);
+      downloadCsvButton.dataset.bound = 'true';
+    }
+  }
 
   const handleCustomRangeChange = () => {
     state.customRange.start = startInput?.value || null;
@@ -882,13 +1037,14 @@ function populateControls() {
       return;
     }
 
-    if (hasSelection) {
-      setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
-    } else {
-      setCustomRangeFeedback('');
-    }
-    scheduleRender();
-  };
+  if (hasSelection) {
+    setCustomRangeFeedback('맞춤 기간이 설정되어 있습니다.');
+  } else {
+    setCustomRangeFeedback('');
+  }
+  updateDownloadButtonState();
+  scheduleRender();
+};
 
   if (startInput && !startInput.dataset.bound) {
     startInput.addEventListener('change', handleCustomRangeChange);
@@ -974,11 +1130,11 @@ function renderMarketReportPanel() {
   const panel = document.getElementById('market-report-panel');
   if (!panel) return;
   const notice = document.getElementById('market-report-empty');
-  const snapshot = computeMarketReportSnapshot();
+  const view = buildMarketReportView();
 
-  if (!snapshot) {
+  if (!view) {
     if (notice) {
-      notice.textContent = '마켓 리포트 데이터를 불러오지 못했습니다. 표시 범위와 윈도우를 확인해 주세요.';
+      notice.textContent = state.marketReportError || '마켓 리포트 데이터를 불러오지 못했습니다. 표시 범위와 윈도우를 확인해 주세요.';
       notice.classList.remove('hidden');
     }
     if (charts.marketReportGauge) {
@@ -987,6 +1143,7 @@ function renderMarketReportPanel() {
     if (charts.marketReportSparkline) {
       charts.marketReportSparkline.clear();
     }
+    populateMarketReportDrivers([]);
     return;
   }
 
@@ -994,85 +1151,337 @@ function renderMarketReportPanel() {
     notice.classList.add('hidden');
   }
 
-  setMarketReportField('market-report-score-value', formatPercentOrNA(snapshot.score, 1));
-  setMarketReportField('market-report-confidence', `${(snapshot.low * 100).toFixed(0)}% ~ ${(snapshot.high * 100).toFixed(0)}%`);
-  setMarketReportField('market-report-range', snapshot.rangeLabel || `${state.range}일`);
-  setMarketReportField('market-report-date', snapshot.date || '-');
-  const slopeText = Number.isFinite(snapshot.slope)
-    ? `${snapshot.slope >= 0 ? '▲' : '▼'} ${Math.abs(snapshot.slope).toFixed(3)}`
+  setMarketReportField('market-report-score-value', formatPercentOrNA(view.prob, 1));
+  setMarketReportField('market-report-confidence', `${(view.low * 100).toFixed(0)}% ~ ${(view.high * 100).toFixed(0)}%`);
+  setMarketReportField('market-report-range', view.rangeLabel || `${state.range}일`);
+  setMarketReportField('market-report-date', view.date || '-');
+  const slopeText = Number.isFinite(view.slope)
+    ? `${view.slope >= 0 ? '▲' : '▼'} ${Math.abs(view.slope).toFixed(3)}`
     : '데이터 부족';
   setMarketReportField('market-report-slope', slopeText);
+  setMarketReportMeta(view.meta);
 
-  renderMarketReportGauge(snapshot);
-  renderMarketReportSparkline(snapshot);
+  populateMarketReportDrivers(view.drivers);
+  renderMarketReportGauge(view);
+  renderMarketReportSparkline(view);
+  renderMarketReportDriverChart(view.drivers);
+  renderMarketReportFeatures(view.features);
+  renderMarketReportSectors(view.sectors);
 }
 
-function computeMarketReportSnapshot() {
+function buildMarketReportView() {
+  const report = state.marketReport;
   const metrics = state.metrics[state.window];
-  if (!metrics) return null;
+  if (!report || !metrics) return null;
   const filtered = getFilteredRecords(metrics);
   if (!filtered || filtered.empty || !Array.isArray(filtered.records) || filtered.records.length === 0) {
     return null;
   }
-  const classicSeries = computeRiskSeriesClassic(metrics, filtered.records);
-  if (!classicSeries || !Array.isArray(classicSeries.score) || classicSeries.score.length === 0) {
-    return null;
-  }
-  const scoreSeries = classicSeries.score.filter((value) => Number.isFinite(value));
-  if (scoreSeries.length === 0) {
-    return null;
-  }
-  const latestScore = scoreSeries[scoreSeries.length - 1];
-  const sampleSize = Math.min(scoreSeries.length, 90);
-  const sample = scoreSeries.slice(-sampleSize);
-  const avg = mean(sample);
-  let variance = 0;
-  if (sample.length > 1) {
-    variance = sample.reduce((acc, value) => acc + ((value - avg) ** 2), 0) / sample.length;
-  }
-  const std = Math.sqrt(Math.max(variance, 1e-6));
-  const interval = Math.min(0.2, 1.28155 * std);
-  let low = clamp01(latestScore - interval);
-  let high = clamp01(latestScore + interval);
-  if (high - low < 0.01) {
-    const mid = (low + high) / 2;
-    low = clamp01(mid - 0.005);
-    high = clamp01(mid + 0.005);
-  }
 
-  const dates = filtered.records.map((item) => item.date);
+  const probability = Number(report?.prob?.p_up);
+  if (!Number.isFinite(probability)) {
+    return null;
+  }
+  const rawProbability = Number(report?.prob?.p_up_raw);
+  const drivers = Array.isArray(report?.drivers) ? report.drivers : [];
+  const features = report?.features && typeof report.features === 'object' ? report.features : {};
+  const refs = report?.refs && typeof report.refs === 'object' ? report.refs : {};
+  const sectors = extractSectorSeries(refs);
+  const interval = computeProbabilityInterval(probability, drivers);
   const stabilitySeries = filtered.records.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
-  const slopeValues = filtered.records
-    .slice(-10)
-    .map((item) => (Number.isFinite(item.delta) ? item.delta : null))
-    .filter((value) => Number.isFinite(value));
-  const slope = slopeValues.length ? (slopeValues.reduce((acc, value) => acc + value, 0) / slopeValues.length) : null;
+  const dates = filtered.records.map((item) => item.date);
   const latestRecord = filtered.records[filtered.records.length - 1] || {};
+  const slope = computeStabilitySlope(filtered.records);
 
   return {
-    score: latestScore,
-    low,
-    high,
+    prob: probability,
+    probRaw: Number.isFinite(rawProbability) ? rawProbability : null,
+    low: interval.low,
+    high: interval.high,
     date: latestRecord.date || '',
-    rangeLabel: filtered.rangeLabel || '',
+    rangeLabel: filtered.rangeLabel || `${state.range}일`,
     slope,
     stabilitySeries,
     dates,
+    drivers,
+    features,
+    meta: {
+      baseSymbol: refs.base_symbol || SIGNAL.trade.baseSymbol,
+      horizon: refs.horizon_days || 5,
+    },
+    sectors,
   };
 }
 
-function renderMarketReportGauge(snapshot) {
+function computeProbabilityInterval(probability, drivers) {
+  const driverStrength = Array.isArray(drivers)
+    ? drivers.reduce((acc, driver) => {
+        const value = Number(driver?.[1]);
+        if (!Number.isFinite(value)) return acc;
+        return acc + Math.abs(value);
+      }, 0)
+    : 0;
+  const normalized = Math.min(1, driverStrength / Math.max(1, drivers?.length || 1));
+  const baseWidth = 0.16 - (normalized * 0.08);
+  const width = Math.max(0.04, Math.min(0.22, baseWidth));
+  const half = width / 2;
+  return {
+    low: clamp01(probability - half),
+    high: clamp01(probability + half),
+  };
+}
+
+function computeStabilitySlope(records) {
+  if (!Array.isArray(records) || records.length === 0) return null;
+  const window = records.slice(-10);
+  const deltas = window
+    .map((item) => (Number.isFinite(item?.delta) ? item.delta : null))
+    .filter((value) => Number.isFinite(value));
+  if (deltas.length === 0) return null;
+  const sum = deltas.reduce((acc, value) => acc + value, 0);
+  return sum / deltas.length;
+}
+
+function populateMarketReportDrivers(drivers) {
+  const list = document.getElementById('market-report-driver-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!Array.isArray(drivers) || drivers.length === 0) {
+    const emptyItem = document.createElement('li');
+    emptyItem.textContent = '드라이버 데이터를 찾을 수 없습니다.';
+    list.appendChild(emptyItem);
+    return;
+  }
+  drivers.slice(0, 5).forEach(([name, value], index) => {
+    const li = document.createElement('li');
+    const rank = document.createElement('span');
+    rank.className = 'driver-rank';
+    rank.textContent = `#${index + 1}`;
+    const label = document.createElement('strong');
+    label.textContent = name || `지표 ${index + 1}`;
+    const val = document.createElement('span');
+    val.className = 'driver-value';
+    val.textContent = Number.isFinite(Number(value)) ? Number(value).toFixed(3) : 'N/A';
+    li.appendChild(rank);
+    li.appendChild(label);
+    li.appendChild(val);
+    list.appendChild(li);
+  });
+}
+
+function renderMarketReportDriverChart(drivers) {
+  const element = document.getElementById('market-report-driver-chart');
+  if (!element) return;
+  const chart = charts.marketReportDrivers || echarts.init(element);
+  charts.marketReportDrivers = chart;
+
+  if (!Array.isArray(drivers) || drivers.length === 0) {
+    chart.clear();
+    return;
+  }
+
+  const top = drivers.slice(0, 5).map((item) => ({
+    name: item?.[0] || '',
+    value: Number(item?.[1]) || 0,
+  }));
+
+  chart.setOption({
+    grid: { left: 60, right: 10, top: 10, bottom: 10 },
+    xAxis: {
+      type: 'value',
+      axisLabel: { color: '#cbd5ff' },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: 'category',
+      data: top.map((item) => item.name),
+      axisLabel: { color: '#cbd5ff' },
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params) => {
+        const first = params && params[0];
+        if (!first) return '';
+        return `${first.name}: ${Number(first.value).toFixed(3)}`;
+      },
+    },
+    series: [
+      {
+        type: 'bar',
+        data: top.map((item) => item.value),
+        barWidth: 14,
+        itemStyle: {
+          color: (params) => (params.value >= 0 ? '#4ade80' : '#f87171'),
+        },
+        label: {
+          show: true,
+          position: 'right',
+          color: '#f8fafc',
+          formatter: (params) => Number(params.value).toFixed(2),
+        },
+      },
+    ],
+  });
+}
+
+function renderMarketReportFeatures(features) {
+  const list = document.getElementById('market-report-feature-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!features || typeof features !== 'object') {
+    const empty = document.createElement('li');
+    empty.textContent = 'Feature 데이터를 찾지 못했습니다.';
+    list.appendChild(empty);
+    return;
+  }
+
+  MARKET_FEATURES.forEach((cfg) => {
+    const raw = Number(features[cfg.key]);
+    const normalized = Number.isFinite(raw)
+      ? Math.max(0, Math.min(1, (raw - cfg.min) / Math.max(1e-6, cfg.max - cfg.min)))
+      : null;
+    const li = document.createElement('li');
+    li.className = 'feature-line';
+
+    const header = document.createElement('header');
+    const label = document.createElement('span');
+    label.textContent = cfg.label;
+    if (cfg.tooltip) {
+      label.title = cfg.tooltip;
+    }
+    const value = document.createElement('strong');
+    value.textContent = Number.isFinite(raw) ? cfg.format(raw) : 'N/A';
+    header.appendChild(label);
+    header.appendChild(value);
+
+    const bar = document.createElement('div');
+    bar.className = 'feature-bar';
+    const fill = document.createElement('span');
+    if (normalized === null) {
+      fill.style.width = '0%';
+      fill.style.opacity = '0.3';
+    } else {
+      fill.style.width = `${(normalized * 100).toFixed(1)}%`;
+    }
+    bar.appendChild(fill);
+
+    li.appendChild(header);
+    li.appendChild(bar);
+    list.appendChild(li);
+  });
+}
+
+function setMarketReportMeta(meta) {
+  const element = document.getElementById('market-report-meta');
+  if (!element) return;
+  if (!meta) {
+    element.textContent = '';
+    return;
+  }
+  const base = meta.baseSymbol || SIGNAL.trade.baseSymbol;
+  const horizonValue = Number(meta.horizon);
+  const horizon = Number.isFinite(horizonValue) ? `${horizonValue}일` : '';
+  element.textContent = horizon ? `${base} 기반 · Horizon ${horizon}` : `${base} 기반`;
+}
+
+function renderMarketReportSectors(sectors) {
+  const element = document.getElementById('market-report-sectors-chart');
+  if (!element) return;
+  const chart = charts.marketReportSectors || echarts.init(element);
+  charts.marketReportSectors = chart;
+
+  if (!Array.isArray(sectors) || sectors.length === 0) {
+    chart.clear();
+    return;
+  }
+
+  const data = sectors.map((item) => {
+    const change = Number(item.change);
+    const pct = Number.isFinite(change) ? change * 100 : 0;
+    const label = `${item.name || 'N/A'}\n${pct.toFixed(1)}%`;
+    return {
+      name: label,
+      rawName: item.name,
+      value: Math.max(Math.abs(change), 0.0001),
+      change,
+    };
+  });
+
+  chart.setOption({
+    tooltip: {
+      formatter: (params) => {
+        const change = Number(params?.data?.change || 0);
+        return `${params?.data?.rawName || ''}: ${change >= 0 ? '+' : ''}${(change * 100).toFixed(2)}%`;
+      },
+    },
+    series: [
+      {
+        type: 'treemap',
+        roam: false,
+        breadcrumb: { show: false },
+        label: {
+          formatter: (info) => info.name,
+          color: '#f8fafc',
+        },
+        upperLabel: { show: false },
+        itemStyle: {
+          borderColor: 'rgba(15,23,42,0.6)',
+          borderWidth: 1,
+        },
+        levels: [
+          {
+            color: ['#16a34a', '#22c55e', '#f97316', '#ef4444'],
+            colorMappingBy: 'value',
+          },
+        ],
+        data: data.map((item) => ({
+          name: item.name,
+          value: item.value,
+          rawName: item.rawName,
+          change: item.change,
+          itemStyle: {
+            color: item.change >= 0 ? '#22c55e' : '#ef4444',
+          },
+        })),
+      },
+    ],
+  });
+}
+
+function extractSectorSeries(refs) {
+  const ctx = refs?.ctx_fmp;
+  if (!ctx || typeof ctx !== 'object') return [];
+  const raw = ctx.sectors;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      const name = item?.sector || item?.name || '';
+      let change = Number(item?.changesPercentage);
+      if (!Number.isFinite(change)) {
+        change = Number(item?.percentageChange);
+      }
+      if (!Number.isFinite(change)) return null;
+      if (Math.abs(change) > 5) {
+        change /= 100;
+      }
+      return { name, change };
+    })
+    .filter((item) => item && item.name);
+}
+
+function renderMarketReportGauge(view) {
   const element = document.getElementById('market-report-gauge');
   if (!element) return;
   const chart = charts.marketReportGauge || echarts.init(element);
   charts.marketReportGauge = chart;
 
-  const low = Math.max(0, Math.min(snapshot.low, snapshot.high));
-  const high = Math.min(1, Math.max(snapshot.low, snapshot.high));
+  const low = Math.max(0, Math.min(view.low, view.high));
+  const high = Math.min(1, Math.max(view.low, view.high));
 
   chart.setOption({
     tooltip: {
-      formatter: () => `상승 확률: ${(snapshot.score * 100).toFixed(1)}%\n신뢰 구간: ${(low * 100).toFixed(0)}% ~ ${(high * 100).toFixed(0)}%`,
+      formatter: () => `상승 확률: ${(view.prob * 100).toFixed(1)}%\n신뢰 구간: ${(low * 100).toFixed(0)}% ~ ${(high * 100).toFixed(0)}%`,
     },
     series: [
       {
@@ -1103,7 +1512,7 @@ function renderMarketReportGauge(snapshot) {
           color: TEXT_PRIMARY,
           offsetCenter: [0, '60%'],
         },
-        data: [{ value: clamp01(snapshot.score) }],
+        data: [{ value: clamp01(view.prob) }],
       },
       {
         name: 'interval',
@@ -1136,14 +1545,14 @@ function renderMarketReportGauge(snapshot) {
   });
 }
 
-function renderMarketReportSparkline(snapshot) {
+function renderMarketReportSparkline(view) {
   const element = document.getElementById('market-report-sparkline');
   if (!element) return;
   const chart = charts.marketReportSparkline || echarts.init(element);
   charts.marketReportSparkline = chart;
   const maxPoints = 90;
-  const dates = snapshot.dates.slice(-maxPoints);
-  const values = snapshot.stabilitySeries.slice(-maxPoints);
+  const dates = view.dates.slice(-maxPoints);
+  const values = view.stabilitySeries.slice(-maxPoints);
 
   chart.setOption({
     grid: { left: 6, right: 6, top: 4, bottom: 16 },
@@ -1336,7 +1745,9 @@ function renderRisk() {
   }
 
   const { records: filteredRecords2 } = getFilteredRecords(metrics);
-  const series = state.riskMode === 'enhanced'
+  const series = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(filteredRecords2)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, filteredRecords2)
     : (state.riskMode === 'fll_fusion')
       ? computeRiskSeriesFLLFusion(metrics, filteredRecords2)
@@ -1354,7 +1765,9 @@ function renderRisk() {
   const latestIdx = series.score.length - 1;
   const latestScore = series.score[latestIdx] || 0;
   const latestState = series.state[latestIdx] || 0;
-  const palette = state.riskMode === 'classic' ? RISK_CFG_CLASSIC.colors : RISK_CFG_ENH.colors;
+  const palette = (state.riskMode === 'classic' || state.riskMode === 'fusion_newgate')
+    ? RISK_CFG_CLASSIC.colors
+    : RISK_CFG_ENH.colors;
   const fragile = !!series.fragile?.[latestIdx];
   const stateLabel = latestState > 0 ? (fragile ? 'Risk-On (Fragile)' : 'Risk-On') : latestState < 0 ? 'Risk-Off' : 'Neutral';
   const stateColor = latestState > 0 ? (fragile ? (palette.onFragile || palette.on) : palette.on) : latestState < 0 ? palette.off : palette.neutral;
@@ -1435,6 +1848,13 @@ function renderRisk() {
           if (Number.isFinite(guardVal)) parts.push(`Guard ${(guardVal * 100).toFixed(0)}%`);
           if (Number.isFinite(combo)) parts.push(`공동모멘텀 ${(combo * 100).toFixed(1)}%`);
           if (Number.isFinite(breadthVal)) parts.push(`리스크폭 ${(breadthVal * 100).toFixed(0)}%`);
+        } else if (state.riskMode === 'fll_fusion' || state.riskMode === 'fusion_newgate') {
+          const wC = series.wClassic?.[idx];
+          const wF = series.wFFL?.[idx];
+          const mm = series.mm?.[idx];
+          if (Number.isFinite(wC)) parts.push(`wTA ${(wC * 100).toFixed(0)}%`);
+          if (Number.isFinite(wF)) parts.push(`wFlow ${(wF * 100).toFixed(0)}%`);
+          if (Number.isFinite(mm)) parts.push(`Absorption ${mm.toFixed(3)}`);
         }
         // Always include FFL overlays (Flux/FINT) for Classic/Enhanced tooltips
         if (fflOverlay) {
@@ -1522,54 +1942,107 @@ function computeAnnualizedReturn(equitySeries, sampleCount) {
   return Math.pow(finalEquity, 1 / years) - 1;
 }
 
+function computeRiskSeriesForMode(metrics, records) {
+  if (!metrics || !Array.isArray(records)) {
+    return null;
+  }
+  return state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(records)
+    : state.riskMode === 'enhanced'
+    ? computeRiskSeriesEnhanced(metrics, records)
+    : (state.riskMode === 'fll_fusion')
+      ? computeRiskSeriesFLLFusion(metrics, records)
+      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, records)
+        : computeRiskSeriesClassic(metrics, records));
+}
+
+function resolveBacktestContext() {
+  const metrics = state.metrics[state.window];
+  if (!metrics) {
+    return null;
+  }
+  const filtered = getFilteredRecords(metrics);
+  if (!filtered || filtered.empty || !Array.isArray(filtered.records) || filtered.records.length === 0) {
+    return null;
+  }
+  const riskSeries = computeRiskSeriesForMode(metrics, filtered.records);
+  if (!riskSeries) {
+    return null;
+  }
+  const backtest = evaluateBacktestSeries(riskSeries, metrics, filtered.records);
+  if (!backtest) {
+    return null;
+  }
+  return { metrics, filtered, riskSeries, backtest };
+}
+
 function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const tradeConfig = SIGNAL.trade;
   const baseSymbol = tradeConfig.baseSymbol;
+  const leveredSymbol = state.benchmark?.leveredSymbol || tradeConfig.leveredSymbol;
   const windowOffset = Math.max(1, Number(state.window) - 1);
   const firstDate = filteredRecords?.[0]?.date;
   let baseIdx = (metrics.records || []).findIndex((r) => r.date === firstDate);
   if (baseIdx < 0) baseIdx = 0;
 
   const dates = Array.isArray(riskSeries?.dates) ? riskSeries.dates : [];
-  if (dates.length === 0) {
+  if (dates.length <= 1) {
     return null;
   }
+  const executionDates = dates.slice(1);
+  const effectiveLength = executionDates.length;
 
   const prices = state.priceSeries[baseSymbol] || [];
   const opens = state.priceSeriesOpen?.[baseSymbol] || [];
+  const leveredCloses = state.leveredSeries?.[leveredSymbol]?.close || [];
+  const leveredOpens = state.leveredSeries?.[leveredSymbol]?.open || [];
 
   const baseReturns = [];
-  for (let idx = 0; idx < dates.length; idx += 1) {
+  const leveredReturns = [];
+  const priceQQQ = [];
+  const priceLevered = [];
+  for (let idx = 0; idx < effectiveLength; idx += 1) {
     const priceIndex = windowOffset + baseIdx + idx;
-    const prevIndex = priceIndex - 1;
-    let openReturn = 0;
+    const nextIndex = priceIndex + 1;
+    const openNext = Number.isFinite(opens?.[nextIndex]) ? Number(opens[nextIndex]) : null;
+    const closeNext = Number.isFinite(prices?.[nextIndex]) ? Number(prices[nextIndex]) : null;
+    const leveredOpenNext = Number.isFinite(leveredOpens?.[nextIndex])
+      ? Number(leveredOpens[nextIndex])
+      : openNext;
+    const leveredCloseNext = Number.isFinite(leveredCloses?.[nextIndex])
+      ? Number(leveredCloses[nextIndex])
+      : closeNext;
+    let openCloseReturn = 0;
     if (
-      opens[priceIndex] != null
-      && opens[prevIndex] != null
-      && opens[prevIndex] !== 0
+      openNext != null
+      && closeNext != null
+      && openNext !== 0
     ) {
-      openReturn = opens[priceIndex] / opens[prevIndex] - 1;
-    } else if (
-      prices[priceIndex] != null
-      && prices[prevIndex] != null
-      && prices[prevIndex] !== 0
-    ) {
-      openReturn = prices[priceIndex] / prices[prevIndex] - 1;
+      openCloseReturn = closeNext / openNext - 1;
+    } else {
+      openCloseReturn = 0;
     }
-    baseReturns.push(openReturn);
+    baseReturns.push(openCloseReturn);
+    const leveredReturn = leveragedReturn(openCloseReturn, tradeConfig.leverage, 1);
+    leveredReturns.push(leveredReturn);
+    priceQQQ.push(openNext != null ? openNext : closeNext);
+    priceLevered.push(leveredOpenNext != null ? leveredOpenNext : leveredCloseNext);
   }
 
-  const executedState = Array.isArray(riskSeries.executedState) && riskSeries.executedState.length === riskSeries.state.length
-    ? riskSeries.executedState
-    : riskSeries.state.map((value, idx) => (idx === 0 ? 0 : riskSeries.state[idx - 1] || 0));
+  const executedState = riskSeries.state.slice(0, effectiveLength).map((value) => (Number.isFinite(value) ? value : 0));
   const neutralWeight = Number.isFinite(tradeConfig.neutralWeight) ? tradeConfig.neutralWeight : 0;
 
   const stratReturns = executedState.map((regime, idx) => {
-    const baseRet = baseReturns[idx];
-    const onReturn = leveragedReturn(baseRet, tradeConfig.leverage, 1);
-    const neutralReturn = neutralWeight !== 0 ? leveragedReturn(baseRet, tradeConfig.leverage, neutralWeight) : 0;
+    const baseRet = Number.isFinite(baseReturns[idx]) ? baseReturns[idx] : 0;
+    const leveredRet = Number.isFinite(leveredReturns[idx])
+      ? leveredReturns[idx]
+      : leveragedReturn(baseRet, tradeConfig.leverage, 1);
+    const neutralReturn = neutralWeight !== 0
+      ? Math.max(-0.99, leveredRet * neutralWeight)
+      : 0;
     if (regime > 0) {
-      return onReturn;
+      return leveredRet;
     }
     if (regime < 0) {
       return 0;
@@ -1579,20 +2052,36 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
 
   const equityStrategy = [];
   const equityBenchmark = [];
+  const equityLevered = [];
   let eqStrat = 1;
   let eqBench = 1;
+  let eqLevered = 1;
   for (let i = 0; i < stratReturns.length; i += 1) {
     const stratRet = Number.isFinite(stratReturns[i]) ? stratReturns[i] : 0;
     const benchRet = Number.isFinite(baseReturns[i]) ? baseReturns[i] : 0;
+    const leveredRet = Number.isFinite(leveredReturns[i])
+      ? leveredReturns[i]
+      : leveragedReturn(benchRet, tradeConfig.leverage, 1);
     eqStrat *= 1 + stratRet;
     eqBench *= 1 + benchRet;
-    equityStrategy.push(Number(eqStrat.toFixed(6)));
-    equityBenchmark.push(Number(eqBench.toFixed(6)));
+    eqLevered *= 1 + leveredRet;
+    equityStrategy.push(Number(eqStrat.toFixed(8)));
+    equityBenchmark.push(Number(eqBench.toFixed(8)));
+    equityLevered.push(Number(eqLevered.toFixed(8)));
+  }
+  const normalizedLevered = equityLevered.slice();
+  const initialLevered = normalizedLevered.find((value) => Number.isFinite(value) && value !== 0);
+  if (Number.isFinite(initialLevered) && initialLevered !== 0) {
+    for (let i = 0; i < normalizedLevered.length; i += 1) {
+      if (Number.isFinite(normalizedLevered[i])) {
+        normalizedLevered[i] = Number((normalizedLevered[i] / initialLevered).toFixed(6));
+      }
+    }
   }
 
-  const ret = baseReturns;
+  const ret = baseReturns.slice();
   const fwd1 = ret.slice(1).map((_, i) => ret[i + 1]);
-  const state1 = riskSeries.state.slice(0, riskSeries.state.length - 1);
+  const state1 = executedState.slice(0, executedState.length - 1);
   const hit1 = computeHitRate(state1, fwd1);
 
   const horizon = 5;
@@ -1604,7 +2093,7 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     }
     fwd5.push(prod - 1);
   }
-  const state5 = riskSeries.state.slice(0, riskSeries.state.length - 1);
+  const state5 = executedState.slice(0, executedState.length - 1);
   const hit5 = computeHitRate(state5, fwd5.slice(0, state5.length));
 
   const maxDrawdownStrategy = computeMaxDrawdown(equityStrategy);
@@ -1613,12 +2102,14 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
   const cagrBenchmark = computeAnnualizedReturn(equityBenchmark, dates.length);
 
   return {
-    dates,
+    dates: executionDates,
     executedState,
     baseReturns,
+    leveredReturns,
     stratReturns,
     equityStrategy,
     equityBenchmark,
+    equityLevered: normalizedLevered,
     hit1,
     hit5,
     maxDrawdownStrategy,
@@ -1627,6 +2118,8 @@ function evaluateBacktestSeries(riskSeries, metrics, filteredRecords) {
     cagrBenchmark,
     cumulativeStrategy: equityStrategy.length > 0 ? equityStrategy[equityStrategy.length - 1] - 1 : 0,
     cumulativeBenchmark: equityBenchmark.length > 0 ? equityBenchmark[equityBenchmark.length - 1] - 1 : 0,
+    priceQQQ,
+    priceLevered,
   };
 }
 
@@ -1645,13 +2138,7 @@ function renderBacktest() {
     return;
   }
 
-  const series = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, filtered)
-      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, filtered)
-        : computeRiskSeriesClassic(metrics, filtered));
+  const series = computeRiskSeriesForMode(metrics, filtered);
   if (!series) return;
 
   const backtest = evaluateBacktestSeries(series, metrics, filtered);
@@ -1715,13 +2202,7 @@ function renderAlerts() {
   if (!box || !metrics) return;
   const { records: filtered, empty } = getFilteredRecords(metrics);
   if (empty) { box.innerHTML = ''; return; }
-  const series = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, filtered)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, filtered)
-      : ((state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, filtered)
-        : computeRiskSeriesClassic(metrics, filtered));
+  const series = computeRiskSeriesForMode(metrics, filtered);
   if (!series) { box.innerHTML = ''; return; }
   const dates = series.dates;
   const states = series.state;
@@ -2960,6 +3441,34 @@ function computeRiskSeriesFLLFusion(metrics, recordsOverride, opts = {}) {
   };
 }
 
+function computeRiskSeriesFusionNewgate(records) {
+  const fusion = state.fusionNewgate;
+  if (!fusion || !Array.isArray(records) || records.length === 0 || !(fusion.indexByDate instanceof Map)) {
+    return null;
+  }
+  const indices = records.map((record) => fusion.indexByDate.get(record.date));
+  if (indices.some((idx) => typeof idx !== 'number' || idx < 0)) {
+    return null;
+  }
+  const selectValues = (series, fallback = null) => indices.map(
+    (idx) => (Array.isArray(series) && idx < series.length ? (series[idx] ?? fallback) : fallback),
+  );
+  const mmSeries = selectValues(fusion.mm);
+  const fragile = mmSeries.map((value) => Number.isFinite(value) && value >= 0.88);
+  return {
+    dates: records.map((record) => record.date),
+    state: selectValues(fusion.state, 0).map((value) => (Number.isFinite(value) ? value : 0)),
+    executedState: selectValues(fusion.executedState, 0).map((value) => (Number.isFinite(value) ? value : 0)),
+    score: selectValues(fusion.score),
+    wClassic: selectValues(fusion.wClassic),
+    wFFL: selectValues(fusion.wFFL),
+    scCorr: selectValues(fusion.scCorr),
+    safeNeg: selectValues(fusion.safeNeg),
+    mm: mmSeries,
+    fragile,
+  };
+}
+
 function clamp01(value) {
   if (!Number.isFinite(value)) return 0;
   if (value <= 0) return 0;
@@ -3153,15 +3662,26 @@ function handleDownloadReport(event) {
   }
 }
 
+function handleDownloadCsv(event) {
+  if (event) {
+    event.preventDefault();
+  }
+  try {
+    const payload = buildBacktestCsv();
+    triggerCsvDownload(payload.csv, payload.filename);
+  } catch (error) {
+    console.error('CSV 다운로드 실패', error);
+    showError('CSV를 생성하지 못했습니다. 화면 데이터가 충분한지 확인한 뒤 다시 시도해 주세요.');
+  }
+}
+
 function buildTextReportPayload() {
-  const metrics = state.metrics[state.window];
-  if (!metrics) {
-    throw new Error('metrics-unavailable');
+  const contextInfo = resolveBacktestContext();
+  if (!contextInfo) {
+    throw new Error('backtest-unavailable');
   }
-  const { records, empty, rangeLabel } = getFilteredRecords(metrics);
-  if (empty || !Array.isArray(records) || records.length === 0) {
-    throw new Error('records-unavailable');
-  }
+  const { metrics, filtered, riskSeries, backtest } = contextInfo;
+  const { records, rangeLabel } = filtered;
   const latest = records[records.length - 1];
   if (!latest) {
     throw new Error('latest-record-missing');
@@ -3169,20 +3689,21 @@ function buildTextReportPayload() {
   const first = records[0];
   const generatedAt = state.generatedAt instanceof Date ? state.generatedAt : new Date();
   const rangeText = rangeLabel || `${state.range}일`;
-  const riskSeries = state.riskMode === 'enhanced'
-    ? computeRiskSeriesEnhanced(metrics, records)
-    : (state.riskMode === 'fll_fusion')
-      ? computeRiskSeriesFLLFusion(metrics, records)
-      : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-        ? computeRiskSeriesFFL(metrics, records)
-        : computeRiskSeriesClassic(metrics, records);
-  const backtestSummary = riskSeries ? evaluateBacktestSeries(riskSeries, metrics, records) : null;
+  const backtestSummary = backtest;
   const headerLines = [
     '자산 결합 강도 TXT 리포트',
     '================================',
     `생성 시각: ${formatDateTimeLocal(generatedAt)}`,
     `데이터 기준일: ${latest.date || 'N/A'}`,
-    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${state.riskMode === 'enhanced' ? 'Enhanced' : state.riskMode === 'ffl' ? 'FFL' : state.riskMode === 'ffl_exp' ? 'FFL+EXP' : state.riskMode === 'ffl_stab' ? 'FFL+STAB' : state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'}`,
+    `윈도우: ${state.window}일 | 표시 범위: ${rangeText} | 레짐 모드: ${
+      state.riskMode === 'enhanced' ? 'Enhanced'
+        : state.riskMode === 'ffl' ? 'FFL'
+        : state.riskMode === 'ffl_exp' ? 'FFL+EXP'
+        : state.riskMode === 'ffl_stab' ? 'FFL+STAB'
+        : state.riskMode === 'fll_fusion' ? 'FLL-Fusion'
+        : state.riskMode === 'fusion_newgate' ? 'Fusion-Newgate'
+        : 'Classic'
+    }`,
     '※ 결합 강도는 시장이 얼마나 동조화되어 있는지를 알려주는 맥락 지표이며, 실제 Risk-On/Off 판단은 모멘텀·Guard·Safe-NEG가 결합된 레짐 점수가 담당합니다. 값이 높을수록 자금이 한 방향으로 쏠린 것이므로 Guard·히트맵을 함께 확인하세요.',
     '',
     '[범위 요약]',
@@ -3225,6 +3746,21 @@ function triggerTextDownload(text, filename) {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename || 'stability-report.txt';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function triggerCsvDownload(csv, filename) {
+  if (!csv) {
+    throw new Error('empty-csv');
+  }
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename || 'backtest.csv';
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
@@ -3449,6 +3985,7 @@ function buildBacktestSummarySection(backtest, riskSeries) {
   lines.push(`- 연복리 수익률(CAGR): 전략 ${pct(backtest.cagrStrategy)} | 벤치마크 ${pct(backtest.cagrBenchmark)}`);
   lines.push(`- 최대 낙폭(MDD): 전략 ${pct(backtest.maxDrawdownStrategy)} | 벤치마크 ${pct(backtest.maxDrawdownBenchmark)}`);
   lines.push(`- 히트율: 1일 ${(backtest.hit1 * 100).toFixed(1)}% · 5일 ${(backtest.hit5 * 100).toFixed(1)}%`);
+  lines.push(`- 벤치마크: ${state.benchmark?.symbol || SIGNAL.trade.baseSymbol} (T+1 시초가 기준)`);
 
   if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
     const total = riskSeries.state.length;
@@ -3477,6 +4014,10 @@ function buildBacktestDailySection(backtest, riskSeries) {
   const executed = Array.isArray(backtest.executedState) ? backtest.executedState : [];
   const benchEquity = Array.isArray(backtest.equityBenchmark) ? backtest.equityBenchmark : [];
   const stratEquity = Array.isArray(backtest.equityStrategy) ? backtest.equityStrategy : [];
+  const qqqPrices = Array.isArray(backtest.priceQQQ) ? backtest.priceQQQ : [];
+  const leveredPrices = Array.isArray(backtest.priceLevered) ? backtest.priceLevered : [];
+  const leveredEquity = Array.isArray(backtest.equityLevered) ? backtest.equityLevered : [];
+  const leveredLabel = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
 
   const headers = [
     '날짜',
@@ -3484,8 +4025,11 @@ function buildBacktestDailySection(backtest, riskSeries) {
     'Executed',
     'ret_bench',
     'ret_strategy',
+    `${SIGNAL.trade.baseSymbol} 시초가`,
+    `${leveredLabel} 시초가`,
     'eq_strategy',
     'eq_benchmark',
+    'eq_tqqq',
   ];
 
   const rows = [];
@@ -3497,6 +4041,8 @@ function buildBacktestDailySection(backtest, riskSeries) {
     const stratReturn = Number.isFinite(backtest.stratReturns?.[i]) ? backtest.stratReturns[i] : 0;
     const eqStrat = Number.isFinite(stratEquity?.[i]) ? stratEquity[i] : 1;
     const eqBench = Number.isFinite(benchEquity?.[i]) ? benchEquity[i] : 1;
+    const qqqPrice = Number.isFinite(qqqPrices?.[i]) ? qqqPrices[i] : null;
+    const leveredPrice = Number.isFinite(leveredPrices?.[i]) ? leveredPrices[i] : null;
 
     rows.push([
       date,
@@ -3504,13 +4050,48 @@ function buildBacktestDailySection(backtest, riskSeries) {
       exec,
       formatDecimal(benchReturn, 8),
       formatDecimal(stratReturn, 8),
-      formatDecimal(eqStrat, 8),
-      formatDecimal(eqBench, 8),
+      formatDecimal(qqqPrice, 8, '0.00000000'),
+      formatDecimal(leveredPrice, 8, '0.00000000'),
+      formatDecimal(eqStrat, 8, '1.00000000'),
+      formatDecimal(eqBench, 8, '1.00000000'),
+      formatDecimal(leveredEquity?.[i], 8, '1.00000000'),
     ]);
   }
 
   lines.push(...formatTable(headers, rows));
   return lines;
+}
+
+function buildBacktestCsv() {
+  const contextInfo = resolveBacktestContext();
+  if (!contextInfo) {
+    throw new Error('backtest-unavailable');
+  }
+  const { riskSeries, backtest } = contextInfo;
+  const leveredLabel = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
+  const header = `date,regime,executed,ret_bench,ret_strategy,price_${SIGNAL.trade.baseSymbol.toLowerCase()},price_${leveredLabel.toLowerCase()},eq_strategy,eq_benchmark,eq_${leveredLabel.toLowerCase()}`;
+  const rows = [];
+  for (let i = 0; i < backtest.dates.length; i += 1) {
+    const date = backtest.dates[i];
+    const regime = Number.isFinite(riskSeries?.state?.[i]) ? riskSeries.state[i] : 0;
+    const executed = Number.isFinite(backtest.executedState?.[i])
+      ? backtest.executedState[i]
+      : (i === 0 ? 0 : backtest.executedState?.[i - 1] || 0);
+    const retBench = formatDecimal(backtest.baseReturns?.[i], 8);
+    const retStrat = formatDecimal(backtest.stratReturns?.[i], 8);
+    const priceQQQ = formatDecimal(backtest.priceQQQ?.[i], 8, '0.00000000');
+    const priceLevered = formatDecimal(backtest.priceLevered?.[i], 8, '0.00000000');
+    const eqStrat = formatDecimal(backtest.equityStrategy?.[i], 8, '1.00000000');
+    const eqBench = formatDecimal(backtest.equityBenchmark?.[i], 8, '1.00000000');
+    const eqLevered = formatDecimal(backtest.equityLevered?.[i], 8, '1.00000000');
+    rows.push([date, regime, executed, retBench, retStrat, priceQQQ, priceLevered, eqStrat, eqBench, eqLevered].join(','));
+  }
+  const csv = `${header}\n${rows.join('\n')}`;
+
+  const latest = backtest.dates[backtest.dates.length - 1] || 'export';
+  const stamp = latest.replace(/[^0-9]/g, '') || formatDateToken(new Date());
+  const filename = `backtest-${stamp}.csv`;
+  return { csv, filename };
 }
 
 function buildPriceSection(records) {
@@ -3521,23 +4102,28 @@ function buildPriceSection(records) {
   }
   const signalSymbol = SIGNAL.primaryStock;
   const benchmarkSymbol = SIGNAL.trade.baseSymbol;
+  const leveredSymbol = state.benchmark?.leveredSymbol || SIGNAL.trade.leveredSymbol;
   lines.push(`- 대상: 신호 주지수 ${signalSymbol}, 벤치마크 ${benchmarkSymbol}`);
   const rows = records.map((rec) => {
     const date = rec.date;
     const signalPrice = lookupPriceByDate(signalSymbol, date);
     const benchmarkPrice = lookupPriceByDate(benchmarkSymbol, date);
+    const leveredPrice = lookupPriceByDate(leveredSymbol, date);
     const signalRet = computeDailyReturnForSymbol(signalSymbol, date);
     const benchmarkRet = computeDailyReturnForSymbol(benchmarkSymbol, date);
+    const leveredRet = computeDailyReturnForSymbol(leveredSymbol, date);
     return [
       date,
       formatNumberOrNA(signalPrice, 2),
       formatSignedPercent(signalRet),
       formatNumberOrNA(benchmarkPrice, 2),
       formatSignedPercent(benchmarkRet),
+      formatNumberOrNA(leveredPrice, 2),
+      formatSignedPercent(leveredRet),
     ];
   });
   lines.push(...formatTable(
-    ['날짜', `${signalSymbol} 종가`, `${signalSymbol} 일간`, `${benchmarkSymbol} 종가`, `${benchmarkSymbol} 일간`],
+    ['날짜', `${signalSymbol} 종가`, `${signalSymbol} 일간`, `${benchmarkSymbol} 종가`, `${benchmarkSymbol} 일간`, `${leveredSymbol} 종가`, `${leveredSymbol} 일간`],
     rows,
   ));
   return lines;
@@ -3626,6 +4212,11 @@ function formatRegimeTransitionLine(riskSeries, idx) {
     const wF = Number.isFinite(riskSeries.wFFL?.[idx]) ? `${(riskSeries.wFFL[idx] * 100).toFixed(0)}%` : 'N/A';
     const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
     extras = `, wC=${wC}, wFFL=${wF}, Absorption=${mm}`;
+  } else if (state.riskMode === 'fusion_newgate') {
+    const wC = Number.isFinite(riskSeries.wClassic?.[idx]) ? `${(riskSeries.wClassic[idx] * 100).toFixed(0)}%` : 'N/A';
+    const wF = Number.isFinite(riskSeries.wFFL?.[idx]) ? `${(riskSeries.wFFL[idx] * 100).toFixed(0)}%` : 'N/A';
+    const mm = formatNumberOrNA(riskSeries.mm?.[idx]);
+    extras = `, wTA=${wC}, wFlow=${wF}, Absorption=${mm}`;
   }
   return `- ${riskSeries.dates[idx]} · ${label} (Score=${scoreValue}, Corr=${corrValue}, Safe-NEG=${safeValue}${extras})`;
 }
@@ -3659,7 +4250,13 @@ function lookupPriceByDate(symbol, date) {
   const dates = state.analysisDates || [];
   const idx = dates.indexOf(date);
   if (idx < 0) return null;
-  const series = state.priceSeries?.[symbol];
+  let series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series) || !series.length) {
+    const levered = state.leveredSeries?.[symbol]?.close;
+    if (Array.isArray(levered)) {
+      series = levered;
+    }
+  }
   if (!Array.isArray(series)) return null;
   const price = series[idx];
   return Number.isFinite(price) ? price : null;
@@ -3670,7 +4267,13 @@ function computeDailyReturnForSymbol(symbol, date) {
   const dates = state.analysisDates || [];
   const idx = dates.indexOf(date);
   if (idx <= 0) return null;
-  const series = state.priceSeries?.[symbol];
+  let series = state.priceSeries?.[symbol];
+  if (!Array.isArray(series) || !series.length) {
+    const levered = state.leveredSeries?.[symbol]?.close;
+    if (Array.isArray(levered)) {
+      series = levered;
+    }
+  }
   if (!Array.isArray(series)) return null;
   const current = series[idx];
   const prev = series[idx - 1];
@@ -3724,20 +4327,22 @@ function formatDateToken(value) {
 
 function canBuildTextReport() {
   try {
-    const metrics = state.metrics[state.window];
-    if (!metrics) return false;
-    const { records, empty } = getFilteredRecords(metrics);
-    if (empty || !Array.isArray(records) || records.length === 0) return false;
-    return true;
+    return Boolean(resolveBacktestContext());
   } catch (error) {
     return false;
   }
 }
 
 function updateDownloadButtonState() {
-  const button = document.getElementById('download-report');
-  if (!button) return;
-  button.disabled = !canBuildTextReport();
+  const txtButton = document.getElementById('download-report');
+  const csvButton = document.getElementById('download-csv-report');
+  const disabled = !canBuildTextReport();
+  if (txtButton) {
+    txtButton.disabled = disabled;
+  }
+  if (csvButton) {
+    csvButton.disabled = disabled;
+  }
 }
 
 async function maybeRefreshData() {
@@ -3884,7 +4489,9 @@ function renderGauge() {
   const rangeDescriptor = rangeLabel || `${averageWindowSize}일`;
 
   // Regime summary (Classic/Enhanced/FFL/FLL-Fusion)
-  const riskSeries = state.riskMode === 'enhanced'
+  const riskSeries = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(filteredRecords)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(state.metrics[state.window], filteredRecords)
     : (state.riskMode === 'fll_fusion')
       ? computeRiskSeriesFLLFusion(state.metrics[state.window], filteredRecords)
@@ -3901,7 +4508,8 @@ function renderGauge() {
       : (state.riskMode === 'ffl' ? 'FFL'
       : (state.riskMode === 'ffl_exp' ? 'FFL+EXP'
       : (state.riskMode === 'ffl_stab' ? 'FFL+STAB'
-      : (state.riskMode === 'fll_fusion' ? 'FLL-Fusion' : 'Classic'))));
+      : (state.riskMode === 'fll_fusion' ? 'FLL-Fusion'
+      : (state.riskMode === 'fusion_newgate' ? 'Fusion-Newgate' : 'Classic')))));
     const summary = `${modeLabel} 레짐: ${rLabel} • 점수 ${rScore} • 창 ${state.window}일 • ${rangeDescriptor}`;
     setGaugePanelFeedback(summary);
   }
@@ -4072,11 +4680,15 @@ function renderHistory() {
   if (!metrics) return;
 
   const { records: series, feedbackMessage, empty } = getFilteredRecords(metrics);
-  const riskSeries = state.riskMode === 'enhanced'
+  const riskSeries = state.riskMode === 'fusion_newgate'
+    ? computeRiskSeriesFusionNewgate(series)
+    : state.riskMode === 'enhanced'
     ? computeRiskSeriesEnhanced(metrics, series)
-    : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
-      ? computeRiskSeriesFFL(metrics, series)
-      : computeRiskSeriesClassic(metrics, series);
+    : state.riskMode === 'fll_fusion'
+      ? computeRiskSeriesFLLFusion(metrics, series)
+      : (state.riskMode === 'ffl' || state.riskMode === 'ffl_exp' || state.riskMode === 'ffl_stab')
+        ? computeRiskSeriesFFL(metrics, series)
+        : computeRiskSeriesClassic(metrics, series);
   let markAreas = [];
   if (riskSeries && Array.isArray(riskSeries.state) && riskSeries.state.length > 0) {
     const segments = computeRegimeSegments(riskSeries.dates, riskSeries.state) || [];
