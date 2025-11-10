@@ -27,8 +27,10 @@ from __future__ import annotations
 import os
 import io
 import json
+import re
 import math
 import time
+import random
 import logging
 import datetime as dt
 from dataclasses import dataclass
@@ -41,6 +43,13 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError(
         "numpy/pandas가 필요합니다. `pip install numpy pandas` 후 다시 실행하세요."
     ) from exc
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError("requests/urllib3가 필요합니다. `pip install requests` 후 다시 실행하세요.") from exc
 
 
 # Optional: use insights.resolve_effective_index if available for SoT payloads
@@ -62,6 +71,87 @@ if not LOG.handlers:
     LOG.addHandler(sh)
 
 
+HISTORY_FILE = os.path.join("ml_cache", "market_prob_history.jsonl")
+
+
+def _history_path() -> str:
+    os.makedirs("ml_cache", exist_ok=True)
+    return HISTORY_FILE
+
+
+def _append_history(entry: Dict[str, Any]) -> None:
+    try:
+        path = _history_path()
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        LOG.warning(f"히스토리 기록 실패: {exc}")
+
+
+def _extract_bench_snapshot(payload: Optional[Dict[str, Any]], base_symbol: str) -> Tuple[Optional[str], Optional[float]]:
+    if not payload or not isinstance(payload, dict):
+        return None, None
+    dates = payload.get("dates") or []
+    if not isinstance(dates, list) or not dates:
+        return None, None
+    dates_str = [str(d) for d in dates]
+    series_map = payload.get("series") or {}
+    bench_series = None
+    if isinstance(series_map, dict):
+        bench_series = series_map.get(base_symbol) or series_map.get(base_symbol.upper()) or series_map.get("QQQ")
+    if not isinstance(bench_series, list) or not bench_series:
+        bench_series = payload.get("series_bench") or payload.get("series_bench_close")
+    if not isinstance(bench_series, list) or not bench_series:
+        return dates_str[-1], None
+    idx = min(len(bench_series) - 1, len(dates_str) - 1)
+    try:
+        return dates_str[-1], float(bench_series[idx])
+    except Exception:
+        return dates_str[-1], None
+
+
+def _record_report_history(
+    report: Dict[str, Any],
+    *,
+    base_symbol: str,
+    horizon_days: int,
+    sot_payload: Optional[Dict[str, Any]],
+) -> None:
+    if not sot_payload:
+        return
+    asof_date, bench_close = _extract_bench_snapshot(sot_payload, base_symbol)
+    if not asof_date:
+        return
+    prob = ((report.get("prob") or {}).get("p_up"))
+    prob_raw = ((report.get("prob") or {}).get("p_up_raw"))
+    entry = {
+        "ts_utc": dt.datetime.utcnow().isoformat() + "Z",
+        "asof_date": asof_date,
+        "horizon_days": int(horizon_days),
+        "base_symbol": base_symbol,
+        "prob": float(prob) if prob is not None else None,
+        "prob_raw": float(prob_raw) if prob_raw is not None else None,
+        "bench_close": bench_close,
+        "drivers": report.get("drivers"),
+        "features": report.get("features"),
+        "refs": {
+            "sources": (report.get("refs") or {}).get("ctx_fmp", {}).get("sources"),
+            "quotes_count": (report.get("refs") or {}).get("ctx_fmp", {}).get("quotes_count"),
+        },
+    }
+    manifest = sot_payload.get("manifest") or {}
+    if manifest:
+        entry["manifest"] = {
+            "origin": manifest.get("origin"),
+            "mode": manifest.get("mode"),
+            "preset": manifest.get("preset"),
+        }
+    try:
+        _append_history(entry)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------
 # Small, local FMP client (graceful if no key/network)
 # ------------------------------------------------------------
@@ -72,14 +162,38 @@ class FMPClient:
         "https://financialmodelingprep.com/api/v3",
         "https://financialmodelingprep.com/api/v4",
     ]
+    RETRYABLE_EXC = (
+        requests.exceptions.SSLError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ReadTimeout,
+    )
 
-    def __init__(self, api_key: Optional[str] = None, pause: float = 0.2, timeout: int = 20):
-        import requests  # local import to avoid hard dependency in restricted env
-
-        self._requests = requests
+    def __init__(self, api_key: Optional[str] = None, pause: float = 0.8, timeout: int = 20):
         self.api_key = api_key or os.getenv("FMP_API_KEY", "").strip()
         self.pause = pause
         self.timeout = timeout
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update(
+            {
+                "User-Agent": "curl/8.6.0",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            }
+        )
+        retry = Retry(
+            total=6,
+            connect=6,
+            read=6,
+            backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD", "OPTIONS"],
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        self._session = session
 
     @property
     def enabled(self) -> bool:
@@ -87,12 +201,26 @@ class FMPClient:
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
         p = dict(params or {})
-        if self.api_key and "apikey" not in p:
-            p["apikey"] = self.api_key
-        r = self._requests.get(url, params=p, timeout=self.timeout)
-        r.raise_for_status()
-        time.sleep(self.pause)
-        return r.json()
+        if self.api_key:
+            p.setdefault("apikey", self.api_key)
+        last_exc: Optional[Exception] = None
+        for attempt in range(6):
+            try:
+                resp = self._session.get(url, params=p, timeout=(10, self.timeout))
+                resp.raise_for_status()
+                data = resp.json()
+                time.sleep(self.pause + random.uniform(0.0, 0.4))
+                return data
+            except self.RETRYABLE_EXC as exc:
+                last_exc = exc
+                if attempt >= 5:
+                    raise
+                backoff = 0.6 * (attempt + 1)
+                time.sleep(backoff)
+                continue
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("FMP request failed without exception")
 
     def _try(self, paths: List[str], params: Optional[Dict[str, Any]] = None) -> Any:
         last_err: Optional[Exception] = None
@@ -132,12 +260,34 @@ class FMPClient:
         return self._try(["sector-performance"])  # v3
 
     def etf_holdings(self, symbol: str) -> List[Dict[str, Any]]:
-        data = self._try_list([f"etf-holder/{symbol}"])
-        return data
+        """Fetch ETF constituents via documented v3 endpoint with API key enforced."""
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return []
+
+        if not self.api_key:
+            LOG.info("FMP_API_KEY 미설정 → ETF holdings 생략(%s)", sym)
+            return []
+
+        url = f"https://financialmodelingprep.com/api/v3/etf-holder/{sym}"
+        try:
+            data = self._get(url)
+            if isinstance(data, list):
+                return data
+        except Exception as exc:
+            LOG.info("ETF holdings(v3) 실패(%s): %s", sym, exc)
+        return []
 
     def batch_quote(self, symbols: List[str]) -> Any:
+        """Fetch quotes for many symbols with graceful fallback.
+
+        Some plans return HTTP 200 with an empty list for batch-quote; using _try_list
+        lets us continue to the next endpoint until we receive real data.
+        """
+        if not symbols:
+            return []
         syms = ",".join(symbols)
-        return self._try([f"batch-quote?symbols={syms}", f"quote/{syms}"])  # v3
+        return self._try_list([f"batch-quote?symbols={syms}", f"quote/{syms}"])  # v3
 
     def treasury_rates(self, frm: Optional[str] = None, to: Optional[str] = None) -> Any:
         p: Dict[str, Any] = {}
@@ -311,6 +461,11 @@ def predict_proba_nb(params: NBParams, x: np.ndarray) -> Tuple[float, np.ndarray
     return p_up, contrib
 
 
+def _stabilize_nb_params(params: NBParams, var_floor: float = 1e-3) -> None:
+    params.var_up = np.clip(params.var_up, var_floor, None)
+    params.var_dn = np.clip(params.var_dn, var_floor, None)
+
+
 def platt_scale(p: np.ndarray, y: np.ndarray, max_iter: int = 200, lr: float = 0.1) -> Tuple[float, float]:
     p = np.clip(p, 1e-5, 1 - 1e-5)
     z = np.log(p / (1 - p))
@@ -391,19 +546,44 @@ FEATURES = [
 ]
 
 
-ETF_BASKET = ["SPY", "VOO", "IVV"]
+ETF_BASKET = ["SPY", "VOO", "IVV", "QQQ"]
+
+FEATURE_CLAMPS: Dict[str, Tuple[Optional[float], Optional[float]]] = {
+    "ADR": (0.05, 5.0),
+    "NH/NL": (0.05, 8.0),
+    "Pct>MA50": (0.0, 1.0),
+    "Pct>MA200": (0.0, 1.0),
+}
+
+
+def _apply_feature_clamps(x: np.ndarray) -> np.ndarray:
+    capped = x.copy()
+    for idx, name in enumerate(FEATURES):
+        bounds = FEATURE_CLAMPS.get(name)
+        if not bounds:
+            continue
+        lo, hi = bounds
+        val = capped[idx]
+        if not np.isfinite(val):
+            continue
+        if lo is not None:
+            val = max(lo, val)
+        if hi is not None:
+            val = min(hi, val)
+        capped[idx] = float(val)
+    return capped
 
 
 def _features_from_etf(fmp: FMPClient) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Compute breadth from ETF holdings (default: SPY/VOO/IVV)."""
     ctx: Dict[str, Any] = {"sources": [], "holdings": []}
     holdings: List[str] = []
+    pattern = re.compile(r"^[A-Z0-9.\-]{1,10}$")
     for etf in ETF_BASKET:
         try:
             rows = fmp.etf_holdings(etf)
         except Exception as exc:
             LOG.info(f"ETF holdings 실패({etf}): {exc}")
-            continue
         if not rows:
             continue
         ctx["sources"].append(f"FMP etf-holder/{etf}")
@@ -416,14 +596,14 @@ def _features_from_etf(fmp: FMPClient) -> Tuple[np.ndarray, Dict[str, Any]]:
                         break
             elif isinstance(item, str):
                 ticker = item.upper()
-            if ticker and ticker not in holdings:
+            if ticker and pattern.match(ticker) and ticker not in holdings:
                 holdings.append(ticker)
     ctx["holdings"] = holdings
 
     quotes_df: Optional[pd.DataFrame] = None
     if holdings:
         rows: List[dict] = []
-        chunk = 100
+        chunk = 50
         for i in range(0, len(holdings), chunk):
             try:
                 rows.extend(fmp.batch_quote(holdings[i : i + chunk]))
@@ -693,7 +873,9 @@ def _detect_divergences(p_up: float, features: Dict[str, float]) -> List[str]:
     return notes
 
 
-def _build_narrative(p_up: float, drivers: List[Tuple[str, float]], feats: Dict[str, Optional[float]]) -> str:
+def _build_narrative(
+    p_up: float, drivers: List[Tuple[str, float]], feats: Dict[str, Optional[float]], include_header: bool = True
+) -> str:
     """Compose a concise, human-readable narrative and conclusion."""
     lines: List[str] = []
     # 1) Headline by probability
@@ -749,13 +931,73 @@ def _build_narrative(p_up: float, drivers: List[Tuple[str, float]], feats: Dict[
         breadth = ", ".join(parts)
 
     # 5) Compose
-    lines.append(f"### 🧠 서술형 요약")
+    if include_header:
+        lines.append("### 🧠 서술형 요약")
     lines.append(f"- 결론: **{headline}** · P(Up|H)={p_up:.1%}")
     lines.append(f"- 주된 근거(Top drivers): {drv_txt}")
     lines.append(f"- 거시/변동성 단서: {cue_txt}")
     lines.append(f"- 참가도(브레드스): {breadth}")
     lines.append("- 해석 가이드: 확률은 방향성, 브레드스는 랠리의 질, 스프레드는 거시·유동성 축을 의미. 세 축이 같은 방향이면 신뢰↑, 엇갈리면 분할·헷지 고려.")
     return "\n".join(lines)
+
+
+def _build_driver_notes(
+    drivers: List[Tuple[str, float]], feats: Dict[str, Optional[float]], p_up: float
+) -> List[str]:
+    notes: List[str] = []
+
+    def _pct(val: Optional[float]) -> str:
+        try:
+            return f"{val:.1%}"
+        except Exception:
+            return "N/A"
+
+    for name, llr in drivers:
+        raw = feats.get(name)
+        if raw is None:
+            continue
+        if name == "NH/NL":
+            clamp_hi = FEATURE_CLAMPS.get("NH/NL", (None, None))[1]
+            if clamp_hi is not None and raw >= clamp_hi:
+                notes.append(
+                    f"- NH/NL={raw:.2f}가 모델 상한({clamp_hi})을 넘어서 '과열 후 되돌림' 패턴으로 분류되어 로그우도비 {llr:+.3f}."
+                )
+            elif llr < 0:
+                notes.append(
+                    f"- NH/NL={raw:.2f}: 신고 대비 신저 비율이 둔화되어 되돌림 가능성을 키워 LLR {llr:+.3f}."
+                )
+            else:
+                notes.append(f"- NH/NL={raw:.2f}: 신고 강세가 유지돼 상승 쪽으로 LLR {llr:+.3f}.")
+            continue
+        if name in {"RV20", "RV60"}:
+            notes.append(
+                f"- {name}={raw:.3f}: 실현 변동성이 {'높아져' if llr < 0 else '안정돼'} "
+                f"{'하락' if llr < 0 else '상승'} 시나리오에 LLR {llr:+.3f}만큼 기여."
+            )
+            continue
+        if name == "ADR":
+            notes.append(
+                f"- ADR={raw:.2f}: 상승 종목 비중이 높지만 상승/하락 클래스 평균 차이가 작아 LLR {llr:+.3f} (중립에 가까움)."
+            )
+            continue
+        if name.startswith("Pct>MA"):
+            notes.append(
+                f"- {name}={_pct(raw)}: 장기/중기 추세 위 종목 비중 변동으로 LLR {llr:+.3f}."
+            )
+            continue
+        notes.append(f"- {name}={raw:.3f}: LLR {llr:+.3f}.")
+
+    adr = feats.get("ADR")
+    if isinstance(adr, (int, float)):
+        if p_up < 0.4 and adr > 1.5:
+            notes.append(
+                f"- 확률은 {p_up:.1%}로 낮지만 ADR={adr:.2f}>1.5라 참가도는 살아 있습니다. 하락 시나리오에도 급반등이 나올 수 있어 분할/헷지를 권장합니다."
+            )
+        elif p_up > 0.6 and adr < 1.0:
+            notes.append(
+                f"- 확률은 {p_up:.1%}로 높지만 ADR={adr:.2f}<1이라 상승 폭이 좁습니다. 추격 매수보다는 분할 접근이 유리합니다."
+            )
+    return notes
 
 
 def generate_market_report(
@@ -816,24 +1058,32 @@ def generate_market_report(
 
     # merge order: prefer Holdings path (FMP/Yahoo) → SoT
     x = _merge_feature_vectors(x_fmp, x_sot)
+    x_display = x.copy()
+    x = _apply_feature_clamps(x)
 
     # Provide realized vol if FMP lacked it but SoT had it
-    features_map = {k: float(v) if np.isfinite(v) else None for k, v in zip(FEATURES, x)}
+    features_map = {k: float(v) if np.isfinite(v) else None for k, v in zip(FEATURES, x_display)}
 
     # 2) Load model (or cold-start defaults)
+    cold_start = False
     loaded = load_model() if use_cache else None
     if loaded is not None:
         params, calib = loaded
+        _stabilize_nb_params(params)
     else:
-        # Cold-start: use naive priors (0.5) and unit variances; calibration identity
-        mu = np.nan_to_num(x, nan=0.0)
-        var = np.where(np.isfinite(x), 1.0, 10.0)
-        params = NBParams(mu_up=mu, var_up=var, mu_dn=-mu, var_dn=var, prior_up=0.5)
+        cold_start = True
+        zeros = np.zeros_like(x)
+        base_var = np.ones_like(x) * 10.0
+        params = NBParams(mu_up=zeros, var_up=base_var, mu_dn=zeros, var_dn=base_var, prior_up=0.5)
         calib = (1.0, 0.0)
 
     # 3) Inference
     p_raw, contrib = predict_proba_nb(params, np.nan_to_num(x, nan=0.0))
-    p_up = apply_platt(p_raw, *calib) if auto_calibrate else float(p_raw)
+    if cold_start:
+        p_up = 0.5
+        contrib = np.zeros_like(contrib)
+    else:
+        p_up = apply_platt(p_raw, *calib) if auto_calibrate else float(p_raw)
     order = np.argsort(-np.abs(contrib))
     top = [(FEATURES[i], float(contrib[i])) for i in order[:5]]
 
@@ -843,16 +1093,35 @@ def generate_market_report(
     if fmp.enabled:
         try:
             secs = fmp.sectors_performance()
+            if isinstance(secs, dict) and "sectorPerformance" in secs:
+                secs = secs["sectorPerformance"]
             if isinstance(secs, list) and secs:
-                # Expect list of {sector, changesPercentage}
                 df = pd.DataFrame(secs)
-                df = df[[c for c in df.columns if c.lower() in {"sector", "changespercentage"}]]
-                df.columns = ["sector", "changesPercentage"]
-                df = df.dropna().sort_values("changesPercentage", ascending=False)
-                lines = ["| 섹터 | 변화율(1d) |", "|:--|--:|"]
-                for _, r in df.iterrows():
-                    lines.append(f"| {r['sector']} | {_format_pct(r['changesPercentage']/100.0,2)} |")
-                sectors_md = "\n".join(lines)
+
+                def _lc(name: str) -> str:
+                    return str(name).strip().lower()
+
+                df = df.rename(columns={c: _lc(c) for c in df.columns})
+                sector_col = next((c for c in df.columns if _lc(c) in {"sector", "name"}), None)
+                pct_col = next(
+                    (c for c in df.columns if _lc(c) in {"changespercentage", "changepercent", "changes"}), None
+                )
+                if sector_col and pct_col:
+                    df = df[[sector_col, pct_col]].rename(columns={sector_col: "sector", pct_col: "pct_raw"})
+                    df["pct_clean"] = (
+                        df["pct_raw"].astype(str).str.replace("%", "", regex=False).str.replace("+", "", regex=False)
+                    )
+                    df["pct"] = pd.to_numeric(df["pct_clean"], errors="coerce")
+                    df["frac"] = df["pct"] / 100.0
+                    df = df.dropna(subset=["sector", "frac"]).sort_values("frac", ascending=False)
+                    lines = ["| 섹터 | 변화율(1d) |", "|:--|--:|"]
+                    for _, row in df.iterrows():
+                        frac = row.get("frac")
+                        sector = row.get("sector", "-")
+                        if pd.isna(frac):
+                            continue
+                        lines.append(f"| {sector} | {_format_pct(float(frac), 2)} |")
+                    sectors_md = "\n".join(lines)
         except Exception as e:
             LOG.info(f"섹터 스냅샷 실패: {e}")
         try:
@@ -885,7 +1154,11 @@ def generate_market_report(
     lines.append(f"- 예측 지평: H={horizon_days} 영업일")
     lines.append(f"- 상승 확률 P(Up|x): {_format_pct(p_up,1)} (원시 {_format_pct(p_raw,1)})")
     lines.append("")
-    narrative_text = _build_narrative(p_up, top, features_map)
+    if cold_start:
+        lines.append("- ⚠️ 모델 파라미터 미적재: 중립 폴백(확률 50%)")
+        lines.append("")
+    narrative_text = _build_narrative(p_up, top, features_map, include_header=True)
+    narrative_plain = _build_narrative(p_up, top, features_map, include_header=False)
     lines.append(narrative_text)
     lines.append("")
     if div_notes:
@@ -894,6 +1167,11 @@ def generate_market_report(
     lines.append("### 🔎 주요 드라이버(로그우도비)")
     lines.append(_driver_table(top))
     lines.append("")
+    driver_notes = _build_driver_notes(top, features_map, float(p_up))
+    if driver_notes:
+        lines.append("### 💬 드라이버 해석 가이드")
+        lines.extend(driver_notes)
+        lines.append("")
 
     lines.append("### 🧭 특징값 요약")
     kv = [
@@ -946,21 +1224,40 @@ def generate_market_report(
 
     markdown = "\n".join(lines)
 
-    return {
+    result = {
         "prob": {"p_up": float(p_up), "p_up_raw": float(p_raw)},
         "drivers": top,
         "features": features_map,
         "markdown": markdown,
-        "narrative": narrative_text,
+        "narrative": narrative_plain,
+        "driver_notes": driver_notes,
         "refs": {
             "base_symbol": base_symbol,
             "horizon_days": horizon_days,
             "fmp_enabled": fmp.enabled,
             "ctx_fmp": ctx_fmp,
             "ctx_sot": ctx_sot,
-            "policy": {"no_local_files": True, "breadth_universe": "ETF(SPY/VOO/IVV)", "no_yahoo_fallback": True},
+            "policy": {
+                "no_local_files": True,
+                "breadth_universe": "ETF(SPY/VOO/IVV)",
+                "no_yahoo_fallback": True,
+                "feature_clamps": {
+                    name: {"min": bounds[0], "max": bounds[1]} for name, bounds in FEATURE_CLAMPS.items()
+                },
+                "cold_start": cold_start,
+            },
         },
     }
+    try:
+        _record_report_history(
+            result,
+            base_symbol=base_symbol,
+            horizon_days=horizon_days,
+            sot_payload=sot_payload,
+        )
+    except Exception:
+        pass
+    return result
 
 
 # ------------------------------------------------------------

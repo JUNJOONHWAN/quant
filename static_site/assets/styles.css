@@ -247,6 +247,37 @@ main {
   height: 280px;
 }
 
+.market-report-gauge-row {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(200px, 260px);
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.market-report-donut-block {
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.market-report-donut {
+  width: 100%;
+  height: 220px;
+}
+
+.donut-hint,
+.spread-hint {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
 .market-report-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -291,6 +322,33 @@ main {
 
 .sector-chart {
   height: 200px;
+}
+
+.market-report-spreads {
+  margin-top: 1rem;
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 0.9rem 1rem;
+}
+
+.spread-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.spread-card {
+  background: rgba(2, 6, 17, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 0.75rem;
+  padding: 0.6rem;
+}
+
+.spread-card h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: var(--color-text-primary);
 }
 
 .market-report-meta {
@@ -427,6 +485,46 @@ main {
   border: 1px solid rgba(148, 163, 184, 0.25);
   border-radius: 1rem;
   padding: 0.9rem 1rem;
+}
+
+.market-report-markdown {
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 1rem 1.2rem;
+  max-height: 520px;
+  overflow-y: auto;
+  line-height: 1.45;
+  color: var(--color-text-primary);
+}
+
+.market-report-markdown h1,
+.market-report-markdown h2,
+.market-report-markdown h3 {
+  margin: 1rem 0 0.4rem;
+  color: var(--color-highlight);
+}
+
+.market-report-markdown p {
+  margin: 0.4rem 0;
+}
+
+.market-report-markdown ul {
+  margin: 0.4rem 0 0.4rem 1.2rem;
+  padding-left: 1.2rem;
+}
+
+.market-report-markdown pre {
+  margin: 0.6rem 0;
+  padding: 0.6rem 0.8rem;
+  background: rgba(2, 6, 23, 0.85);
+  border-radius: 0.6rem;
+  overflow-x: auto;
+}
+
+.market-report-markdown .empty {
+  color: var(--color-text-muted);
+  text-align: center;
 }
 
 .cheat-chip {

@@ -25,6 +25,10 @@ try:
 except Exception as _mr_exc:  # pragma: no cover
     generate_market_report = None  # type: ignore
 try:
+    from market_analysis.market_prob_backtest import run_backtest as run_market_prob_backtest
+except Exception as _mpb_exc:  # pragma: no cover
+    run_market_prob_backtest = None  # type: ignore
+try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except Exception:
@@ -2289,6 +2293,43 @@ def create_interface():
                     def _build_curve(dates, values, title):
                         if not go or not isinstance(values, list) or len(values) < 2:
                             return None
+                        try:
+                            xs = dates if isinstance(dates, list) and len(dates) == len(values) else None
+                            if xs is None:
+                                xs = list(range(len(values)))
+                            else:
+                                coerced = []
+                                for d in xs:
+                                    if isinstance(d, (int, float)):
+                                        coerced.append(d)
+                                    else:
+                                        try:
+                                            coerced.append(datetime.fromisoformat(str(d)).date())
+                                        except Exception:
+                                            coerced.append(str(d))
+                                xs = coerced
+                            fig = go.Figure(
+                                data=[
+                                    go.Scatter(
+                                        x=xs,
+                                        y=values,
+                                        mode="lines+markers",
+                                        line=dict(color="#3498db", width=2),
+                                        marker=dict(size=6, color="#1abc9c"),
+                                    )
+                                ]
+                            )
+                            fig.add_hline(y=0.0, line=dict(color="#7f8c8d", width=1, dash="dash"))
+                            fig.update_layout(
+                                title=title,
+                                height=260,
+                                margin=dict(l=40, r=10, t=40, b=40),
+                                xaxis_title="날짜",
+                                yaxis_title="수준",
+                            )
+                            return fig
+                        except Exception:
+                            return None
                     
                     def _build_sectors_treemap(sectors):
                         if not go or not isinstance(sectors, list) or not sectors:
@@ -2363,6 +2404,106 @@ def create_interface():
                     _run_market_report,
                     inputs=[mr_h, mr_use_rt, mr_sort],
                     outputs=[mr_conclusion, mr_md, mr_json_btn, mr_gauge, mr_drivers, mr_spr1, mr_spr2, mr_curv, mr_sectors, mr_diag],
+                )
+
+            # 📈 확률 백테스트
+            with gr.Tab("📈 확률 백테스트"):
+                gr.Markdown("""
+                ## 확률 히스토리 기반 QQQ 검증
+                - 확률 리포트 실행 시 저장된 기록을 사용해 H거래일 뒤 QQQ 수익률과 비교합니다.
+                - 룩어헤드 없이 trading-day offset으로 평가하므로, 충분한 히스토리가 쌓여야 합니다.
+                """)
+                with gr.Row():
+                    bt_start = gr.Textbox(label="시작일 (YYYY-MM-DD)", placeholder="옵션", scale=1)
+                    bt_end = gr.Textbox(label="종료일 (YYYY-MM-DD)", placeholder="옵션", scale=1)
+                    bt_h = gr.Slider(minimum=3, maximum=20, value=5, step=1, label="지평 H(거래일)", scale=1)
+                    bt_thresh = gr.Slider(minimum=0.3, maximum=0.8, value=0.5, step=0.05, label="상승 판정 임계값", scale=1)
+                    bt_btn = gr.Button("📈 백테스트 실행", variant="primary", scale=1)
+                bt_summary = gr.Markdown("히스토리를 기록한 뒤 백테스트를 실행하세요.")
+                bt_plot = gr.Plot(label="P(Up) vs QQQ 수익률", show_label=True)
+                bt_headers = ["신호일", "결과일", "P(Up)%", "QQQ %", "실제", "판정", "적중"]
+                bt_table = gr.Dataframe(headers=bt_headers, value=pd.DataFrame(columns=bt_headers), visible=True)
+                bt_download = gr.DownloadButton(label="💾 JSON 다운로드", value=None)
+                bt_diag = gr.Markdown("")
+
+                def _build_backtest_plot(rows, threshold):
+                    if not go or not rows:
+                        return None
+                    dates = [r["asof_date"] for r in rows]
+                    probs = [float(r["prob"]) for r in rows]
+                    rets = [float(r["realized_return"]) * 100 for r in rows]
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dates,
+                            y=probs,
+                            name="P(Up)",
+                            mode="lines+markers",
+                            line=dict(color="#2ecc71", width=2),
+                            marker=dict(size=6),
+                        )
+                    )
+                    fig.add_trace(
+                        go.Bar(
+                            x=dates,
+                            y=rets,
+                            name="QQQ 수익률(%)",
+                            yaxis="y2",
+                            marker_color="#95a5a6",
+                            opacity=0.65,
+                        )
+                    )
+                    fig.add_hline(y=threshold, line=dict(color="#e67e22", dash="dot"), annotation_text="임계값", annotation_position="top left")
+                    fig.update_layout(
+                        height=360,
+                        margin=dict(l=40, r=40, t=30, b=60),
+                        yaxis=dict(title="P(Up)", range=[0, 1]),
+                        yaxis2=dict(title="QQQ %", overlaying="y", side="right"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                        xaxis=dict(title="신호일"),
+                    )
+                    return fig
+
+                def _run_prob_backtest(start: str, end: str, horizon: int, threshold: float):
+                    if run_market_prob_backtest is None:
+                        empty = (go.Figure() if go else None)
+                        return ("❌ market_prob_backtest 모듈을 불러올 수 없습니다.", empty, pd.DataFrame(), None, "모듈 import 실패")
+                    try:
+                        result = run_market_prob_backtest(
+                            start_date=start or None,
+                            end_date=end or None,
+                            horizon_days=int(horizon),
+                            prob_threshold=float(threshold),
+                            base_symbol="QQQ",
+                        )
+                    except Exception as e:
+                        empty = (go.Figure() if go else None)
+                        return (f"❌ 백테스트 실패: {e}", empty, pd.DataFrame(), None, f"❌ {e}")
+                    fig = _build_backtest_plot(result.rows, threshold)
+                    df = pd.DataFrame(
+                        [
+                            {
+                                "신호일": r["asof_date"],
+                                "결과일": r["future_date"],
+                                "P(Up)%": round(r["prob"] * 100, 2),
+                                "QQQ %": round(r["realized_return"] * 100, 2),
+                                "실제": "상승" if r["actual_up"] else "하락",
+                                "판정": "상승" if r["predicted_up"] else "하락",
+                                "적중": "✅" if r["actual_up"] == r["predicted_up"] else "❌",
+                            }
+                            for r in result.rows
+                        ]
+                    )
+                    diag = (
+                        f"표본 {result.stats['samples']} · 정확도 {result.stats['accuracy']*100:.1f}% · "
+                        f"Hit-rate {result.stats['hit_rate']*100:.1f}%"
+                    )
+                    return (result.markdown, fig, df, result.json_path, diag)
+
+                bt_btn.click(
+                    _run_prob_backtest,
+                    inputs=[bt_start, bt_end, bt_h, bt_thresh],
+                    outputs=[bt_summary, bt_plot, bt_table, bt_download, bt_diag],
                 )
                 range_dd.change(
                     _run_realtime,

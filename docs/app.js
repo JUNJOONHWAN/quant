@@ -1115,6 +1115,7 @@ function populateControls() {
 function renderAll() {
   updateMeta();
   renderMarketReportPanel();
+  renderMarketReportMarkdown();
   renderGauge();
   renderSubGauges();
   renderRisk();
@@ -1163,10 +1164,23 @@ function renderMarketReportPanel() {
 
   populateMarketReportDrivers(view.drivers);
   renderMarketReportGauge(view);
+  renderMarketReportDonut(view);
   renderMarketReportSparkline(view);
   renderMarketReportDriverChart(view.drivers);
   renderMarketReportFeatures(view.features);
   renderMarketReportSectors(view.sectors);
+  renderMarketReportSpreads(view.curveTs);
+}
+
+function renderMarketReportMarkdown() {
+  const container = document.getElementById('market-report-markdown');
+  if (!container) return;
+  const markdown = state.marketReport?.markdown;
+  if (typeof markdown !== 'string' || !markdown.trim()) {
+    container.innerHTML = '<p class="empty">마켓 리포트 전문을 불러오지 못했습니다.</p>';
+    return;
+  }
+  container.innerHTML = convertSimpleMarkdown(markdown);
 }
 
 function buildMarketReportView() {
@@ -1187,6 +1201,7 @@ function buildMarketReportView() {
   const features = report?.features && typeof report.features === 'object' ? report.features : {};
   const refs = report?.refs && typeof report.refs === 'object' ? report.refs : {};
   const sectors = extractSectorSeries(refs);
+  const curveTs = extractCurveSeries(refs);
   const interval = computeProbabilityInterval(probability, drivers);
   const stabilitySeries = filtered.records.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
   const dates = filtered.records.map((item) => item.date);
@@ -1210,6 +1225,7 @@ function buildMarketReportView() {
       horizon: refs.horizon_days || 5,
     },
     sectors,
+    curveTs,
   };
 }
 
@@ -1385,6 +1401,69 @@ function setMarketReportMeta(meta) {
   element.textContent = horizon ? `${base} 기반 · Horizon ${horizon}` : `${base} 기반`;
 }
 
+function convertSimpleMarkdown(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const html = [];
+  let inList = false;
+  let tableBuffer = [];
+
+  function flushList() {
+    if (inList) {
+      html.push('</ul>');
+      inList = false;
+    }
+  }
+
+  function flushTable() {
+    if (tableBuffer.length > 0) {
+      const escaped = tableBuffer.map((line) => escapeHtml(line));
+      html.push(`<pre>${escaped.join('\n')}</pre>`);
+      tableBuffer = [];
+    }
+  }
+
+  lines.forEach((rawLine) => {
+    const line = rawLine || '';
+    const trimmed = line.trim();
+    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+      flushList();
+      tableBuffer.push(line);
+      return;
+    }
+    flushTable();
+    if (trimmed.startsWith('- ')) {
+      if (!inList) {
+        html.push('<ul>');
+        inList = true;
+      }
+      html.push(`<li>${escapeHtml(trimmed.slice(2).trim())}</li>`);
+      return;
+    }
+    flushList();
+    if (trimmed.startsWith('### ')) {
+      html.push(`<h3>${escapeHtml(trimmed.slice(4).trim())}</h3>`);
+    } else if (trimmed.startsWith('## ')) {
+      html.push(`<h2>${escapeHtml(trimmed.slice(3).trim())}</h2>`);
+    } else if (trimmed.startsWith('# ')) {
+      html.push(`<h1>${escapeHtml(trimmed.slice(2).trim())}</h1>`);
+    } else if (trimmed.length === 0) {
+      html.push('');
+    } else {
+      html.push(`<p>${escapeHtml(line)}</p>`);
+    }
+  });
+  flushList();
+  flushTable();
+  return html.join('\n');
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function renderMarketReportSectors(sectors) {
   const element = document.getElementById('market-report-sectors-chart');
   if (!element) return;
@@ -1449,6 +1528,59 @@ function renderMarketReportSectors(sectors) {
   });
 }
 
+function renderMarketReportSpreads(curveTs) {
+  const configs = [
+    { id: 'spread-10y-3m', key: 'spr_10y_3m', color: '#38bdf8' },
+    { id: 'spread-10y-2y', key: 'spr_10y_2y', color: '#f97316' },
+    { id: 'spread-curvature', key: 'curvature', color: '#a855f7' },
+  ];
+  configs.forEach((cfg) => {
+    const element = document.getElementById(cfg.id);
+    if (!element) return;
+    const chart = charts[cfg.id] || echarts.init(element);
+    charts[cfg.id] = chart;
+    const dates = Array.isArray(curveTs?.dates) ? curveTs.dates.slice(-90) : [];
+    const values = Array.isArray(curveTs?.[cfg.key]) ? curveTs[cfg.key].slice(-90) : [];
+    if (!dates.length || !values.length) {
+      chart.clear();
+      return;
+    }
+    chart.setOption({
+      grid: { left: 30, right: 10, top: 15, bottom: 22 },
+      xAxis: {
+        type: 'category',
+        data: dates,
+        axisLabel: { show: false },
+        axisLine: { show: false },
+        axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#cbd5ff', fontSize: 10 },
+        splitLine: { show: false },
+      },
+      tooltip: {
+        trigger: 'axis',
+        formatter: (params) => {
+          const first = params && params[0];
+          if (!first) return '';
+          return `${first.axisValue}<br>${Number(first.value).toFixed(2)}%`;
+        },
+      },
+      series: [
+        {
+          type: 'line',
+          data: values,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: cfg.color, width: 2 },
+          areaStyle: { color: `${cfg.color}33` },
+        },
+      ],
+    });
+  });
+}
+
 function extractSectorSeries(refs) {
   const ctx = refs?.ctx_fmp;
   if (!ctx || typeof ctx !== 'object') return [];
@@ -1468,6 +1600,21 @@ function extractSectorSeries(refs) {
       return { name, change };
     })
     .filter((item) => item && item.name);
+}
+
+function extractCurveSeries(refs) {
+  const ctx = refs?.ctx_fmp;
+  if (!ctx || typeof ctx !== 'object') return { dates: [], spr_10y_3m: [], spr_10y_2y: [], curvature: [] };
+  const raw = ctx.curve_ts;
+  if (!raw || typeof raw !== 'object') return { dates: [], spr_10y_3m: [], spr_10y_2y: [], curvature: [] };
+  const dates = Array.isArray(raw.dates) ? raw.dates : [];
+  const toSeries = (key) => (Array.isArray(raw[key]) ? raw[key] : []);
+  return {
+    dates,
+    spr_10y_3m: toSeries('spr_10y_3m'),
+    spr_10y_2y: toSeries('spr_10y_2y'),
+    curvature: toSeries('curvature'),
+  };
 }
 
 function renderMarketReportGauge(view) {
@@ -1540,6 +1687,48 @@ function renderMarketReportGauge(view) {
         progress: { show: false },
         silent: true,
         z: 2,
+      },
+    ],
+  });
+}
+
+function renderMarketReportDonut(view) {
+  const element = document.getElementById('market-report-donut');
+  if (!element) return;
+  const chart = charts.marketReportDonut || echarts.init(element);
+  charts.marketReportDonut = chart;
+  const probability = clamp01(view.prob);
+  const remainder = Math.max(0, 1 - probability);
+  chart.setOption({
+    tooltip: {
+      formatter: (params) => `${params.name}: ${(params.value * 100).toFixed(1)}%`,
+    },
+    series: [
+      {
+        type: 'pie',
+        radius: ['60%', '82%'],
+        avoidLabelOverlap: false,
+        label: { show: false },
+        data: [
+          { value: probability, name: '상승', itemStyle: { color: '#22c55e' } },
+          { value: remainder, name: '하락', itemStyle: { color: '#ef4444' } },
+        ],
+      },
+      {
+        type: 'gauge',
+        startAngle: 90,
+        endAngle: -269.999,
+        pointer: { show: false },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { show: false },
+        axisLabel: { show: false },
+        detail: {
+          formatter: `${(probability * 100).toFixed(1)}%`,
+          fontSize: 22,
+          color: TEXT_PRIMARY,
+        },
+        data: [{ value: probability }],
       },
     ],
   });

@@ -73,7 +73,13 @@
             <h3>상승 확률</h3>
             <p class="market-report-date" id="market-report-date">-</p>
           </div>
-          <div id="market-report-gauge" class="chart market-report-gauge"></div>
+          <div class="market-report-gauge-row">
+            <div id="market-report-gauge" class="chart market-report-gauge"></div>
+            <div class="market-report-donut-block">
+              <div id="market-report-donut" class="market-report-donut"></div>
+              <p class="donut-hint">도넛 = P(Up|H). 회색 점선은 불확실성 대역.</p>
+            </div>
+          </div>
           <p class="market-report-meta" id="market-report-meta">-</p>
           <dl class="market-report-stats">
             <div>
@@ -101,6 +107,24 @@
             <div class="sparkline-header">드라이버 기여도 (LLR)</div>
             <div id="market-report-driver-chart" class="market-report-mini-chart driver-chart"></div>
           </div>
+          <div class="market-report-spreads">
+            <div class="sparkline-header">수익률 스프레드 &amp; 곡률</div>
+            <div class="spread-grid">
+              <div class="spread-card">
+                <h4>10Y - 3M</h4>
+                <div id="spread-10y-3m" class="market-report-mini-chart spread-chart"></div>
+              </div>
+              <div class="spread-card">
+                <h4>10Y - 2Y</h4>
+                <div id="spread-10y-2y" class="market-report-mini-chart spread-chart"></div>
+              </div>
+              <div class="spread-card">
+                <h4>Curve (30Y+3M-2×10Y)</h4>
+                <div id="spread-curvature" class="market-report-mini-chart spread-chart"></div>
+              </div>
+            </div>
+            <p class="spread-hint">녹색↑: 리스프레드/정상화, 붉은색↓: 역전·긴장.</p>
+          </div>
         </div>
         <div class="market-report-body">
           <div class="market-report-problem">
@@ -118,6 +142,11 @@
           <div class="market-report-features">
             <h3>ETF 기반 Breadth · Curve 지표</h3>
             <ul id="market-report-feature-list" class="feature-list"></ul>
+          </div>
+          <div class="market-report-sectors">
+            <h3>섹터 히트맵</h3>
+            <div id="market-report-sectors-chart" class="sector-chart"></div>
+            <p class="cheatsheet-hint">면적=절대 등락, 색=방향(녹↑/적↓)</p>
           </div>
           <div class="market-report-cheatsheet">
             <div class="cheatsheet-header">Driver tooltip cheat sheet</div>
@@ -294,12 +323,26 @@
         함께 보면서 현재 시장이 어느 모드에 있는지 판단하면 지표의 가치를 극대화할 수 있습니다.
       </p>
     </section>
+
+    <section class="panel" id="market-report-full-panel">
+      <div class="panel-header">
+        <h2>마켓 리포트 전문</h2>
+        <button type="button" class="info" data-target="info-market-report-full">ⓘ</button>
+      </div>
+      <p class="panel-context">GitHub Actions가 생성한 최신 Markdown 리포트를 그대로 노출합니다. 섹션별로 스크롤하며 상세 서술과 테이블을 확인할 수 있습니다.</p>
+      <div id="market-report-markdown" class="market-report-markdown" aria-live="polite"></div>
+    </section>
   </main>
 
   <section class="info-popover" id="info-market-report">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>확률형 마켓 리포트</h3>
     <p>상승 확률 게이지, Stability 스파크라인, 그리고 드라이버 정의 툴팁을 묶어 풀 리포트의 핵심을 상단에서 바로 확인하도록 구성했습니다. GitHub Actions가 매일 생성하는 <code>market_report.json</code>을 로드하며, 파일이 비어 있을 경우 명확한 안내를 띄웁니다.</p>
+  </section>
+  <section class="info-popover" id="info-market-report-full">
+    <button type="button" class="popover-close" aria-label="닫기">×</button>
+    <h3>마켓 리포트 전문</h3>
+    <p>리포트 엔진이 생성한 Markdown 전문을 그대로 렌더링합니다. 단락·목록·표는 기본 스타일로 표시되며, 리포트가 비어 있으면 안내 메시지를 보여줍니다.</p>
   </section>
   <section class="info-popover" id="info-stability">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
