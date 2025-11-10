@@ -20,7 +20,7 @@ python3 report_engine/market_analysis/market_report.py \
   --lookback "$LOOKBACK" \
   > "$JSON_PATH"
 
-python3 - <<'PY'
+python3 - "$OUT_DIR" <<'PY'
 import json
 import pathlib
 import sys
@@ -48,7 +48,6 @@ summary = "\n".join(summary_lines)
 
 print(summary)
 PY
-"$OUT_DIR"
 
 echo "📄 Market report JSON: $JSON_PATH"
 echo "📝 Markdown preview: $MD_PATH"

@@ -1109,10 +1109,16 @@ def generate_market_report(
                 if sector_col and pct_col:
                     df = df[[sector_col, pct_col]].rename(columns={sector_col: "sector", pct_col: "pct_raw"})
                     df["pct_clean"] = (
-                        df["pct_raw"].astype(str).str.replace("%", "", regex=False).str.replace("+", "", regex=False)
+                        df["pct_raw"]
+                        .astype(str)
+                        .str.replace("%", "", regex=False)
+                        .str.replace("+", "", regex=False)
+                        .str.replace(",", "", regex=False)
+                        .str.strip()
                     )
                     df["pct"] = pd.to_numeric(df["pct_clean"], errors="coerce")
-                    df["frac"] = df["pct"] / 100.0
+                    df = df.dropna(subset=["pct"])
+                    df["frac"] = df["pct"].astype(float) / 100.0
                     df = df.dropna(subset=["sector", "frac"]).sort_values("frac", ascending=False)
                     lines = ["| 섹터 | 변화율(1d) |", "|:--|--:|"]
                     for _, row in df.iterrows():
