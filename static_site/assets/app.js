@@ -1072,6 +1072,7 @@ function populateControls() {
 
 function renderAll() {
   updateMeta();
+  renderMarketReportPanel();
   renderGauge();
   renderSubGauges();
   renderRisk();
@@ -1081,6 +1082,232 @@ function renderAll() {
   renderHeatmap();
   renderPair();
   updateDownloadButtonState();
+}
+
+function renderMarketReportPanel() {
+  const panel = document.getElementById('market-report-panel');
+  if (!panel) return;
+  const notice = document.getElementById('market-report-empty');
+  const snapshot = computeMarketReportSnapshot();
+
+  if (!snapshot) {
+    if (notice) {
+      notice.textContent = '마켓 리포트 데이터를 불러오지 못했습니다. 표시 범위와 윈도우를 확인해 주세요.';
+      notice.classList.remove('hidden');
+    }
+    if (charts.marketReportGauge) {
+      charts.marketReportGauge.clear();
+    }
+    if (charts.marketReportSparkline) {
+      charts.marketReportSparkline.clear();
+    }
+    return;
+  }
+
+  if (notice) {
+    notice.classList.add('hidden');
+  }
+
+  setMarketReportField('market-report-score-value', formatPercentOrNA(snapshot.score, 1));
+  setMarketReportField('market-report-confidence', `${(snapshot.low * 100).toFixed(0)}% ~ ${(snapshot.high * 100).toFixed(0)}%`);
+  setMarketReportField('market-report-range', snapshot.rangeLabel || `${state.range}일`);
+  setMarketReportField('market-report-date', snapshot.date || '-');
+  const slopeText = Number.isFinite(snapshot.slope)
+    ? `${snapshot.slope >= 0 ? '▲' : '▼'} ${Math.abs(snapshot.slope).toFixed(3)}`
+    : '데이터 부족';
+  setMarketReportField('market-report-slope', slopeText);
+
+  renderMarketReportGauge(snapshot);
+  renderMarketReportSparkline(snapshot);
+}
+
+function computeMarketReportSnapshot() {
+  const metrics = state.metrics[state.window];
+  if (!metrics) return null;
+  const filtered = getFilteredRecords(metrics);
+  if (!filtered || filtered.empty || !Array.isArray(filtered.records) || filtered.records.length === 0) {
+    return null;
+  }
+  const classicSeries = computeRiskSeriesClassic(metrics, filtered.records);
+  if (!classicSeries || !Array.isArray(classicSeries.score) || classicSeries.score.length === 0) {
+    return null;
+  }
+  const scoreSeries = classicSeries.score.filter((value) => Number.isFinite(value));
+  if (scoreSeries.length === 0) {
+    return null;
+  }
+  const latestScore = scoreSeries[scoreSeries.length - 1];
+  const sampleSize = Math.min(scoreSeries.length, 90);
+  const sample = scoreSeries.slice(-sampleSize);
+  const avg = mean(sample);
+  let variance = 0;
+  if (sample.length > 1) {
+    variance = sample.reduce((acc, value) => acc + ((value - avg) ** 2), 0) / sample.length;
+  }
+  const std = Math.sqrt(Math.max(variance, 1e-6));
+  const interval = Math.min(0.2, 1.28155 * std);
+  let low = clamp01(latestScore - interval);
+  let high = clamp01(latestScore + interval);
+  if (high - low < 0.01) {
+    const mid = (low + high) / 2;
+    low = clamp01(mid - 0.005);
+    high = clamp01(mid + 0.005);
+  }
+
+  const dates = filtered.records.map((item) => item.date);
+  const stabilitySeries = filtered.records.map((item) => (Number.isFinite(item.stability) ? item.stability : null));
+  const slopeValues = filtered.records
+    .slice(-10)
+    .map((item) => (Number.isFinite(item.delta) ? item.delta : null))
+    .filter((value) => Number.isFinite(value));
+  const slope = slopeValues.length ? (slopeValues.reduce((acc, value) => acc + value, 0) / slopeValues.length) : null;
+  const latestRecord = filtered.records[filtered.records.length - 1] || {};
+
+  return {
+    score: latestScore,
+    low,
+    high,
+    date: latestRecord.date || '',
+    rangeLabel: filtered.rangeLabel || '',
+    slope,
+    stabilitySeries,
+    dates,
+  };
+}
+
+function renderMarketReportGauge(snapshot) {
+  const element = document.getElementById('market-report-gauge');
+  if (!element) return;
+  const chart = charts.marketReportGauge || echarts.init(element);
+  charts.marketReportGauge = chart;
+
+  const low = Math.max(0, Math.min(snapshot.low, snapshot.high));
+  const high = Math.min(1, Math.max(snapshot.low, snapshot.high));
+
+  chart.setOption({
+    tooltip: {
+      formatter: () => `상승 확률: ${(snapshot.score * 100).toFixed(1)}%\n신뢰 구간: ${(low * 100).toFixed(0)}% ~ ${(high * 100).toFixed(0)}%`,
+    },
+    series: [
+      {
+        name: 'probability',
+        type: 'gauge',
+        startAngle: 210,
+        endAngle: -30,
+        min: 0,
+        max: 1,
+        splitNumber: 5,
+        axisLine: {
+          lineStyle: {
+            width: 18,
+            color: [
+              [0.4, '#f87171'],
+              [0.6, '#facc15'],
+              [1, '#4ade80'],
+            ],
+          },
+        },
+        axisLabel: { show: false },
+        axisTick: { show: false },
+        splitLine: { show: false },
+        pointer: { length: '65%', width: 4 },
+        detail: {
+          formatter: (value) => `${(value * 100).toFixed(1)}%`,
+          fontSize: 20,
+          color: TEXT_PRIMARY,
+          offsetCenter: [0, '60%'],
+        },
+        data: [{ value: clamp01(snapshot.score) }],
+      },
+      {
+        name: 'interval',
+        type: 'gauge',
+        startAngle: 210,
+        endAngle: -30,
+        min: 0,
+        max: 1,
+        axisLine: {
+          lineStyle: {
+            width: 10,
+            type: 'dashed',
+            color: [
+              [low, 'rgba(248,250,252,0)'],
+              [high, 'rgba(248,250,252,0.85)'],
+              [1, 'rgba(248,250,252,0)'],
+            ],
+          },
+        },
+        axisLabel: { show: false },
+        axisTick: { show: false },
+        splitLine: { show: false },
+        pointer: { show: false },
+        detail: { show: false },
+        progress: { show: false },
+        silent: true,
+        z: 2,
+      },
+    ],
+  });
+}
+
+function renderMarketReportSparkline(snapshot) {
+  const element = document.getElementById('market-report-sparkline');
+  if (!element) return;
+  const chart = charts.marketReportSparkline || echarts.init(element);
+  charts.marketReportSparkline = chart;
+  const maxPoints = 90;
+  const dates = snapshot.dates.slice(-maxPoints);
+  const values = snapshot.stabilitySeries.slice(-maxPoints);
+
+  chart.setOption({
+    grid: { left: 6, right: 6, top: 4, bottom: 16 },
+    xAxis: {
+      type: 'category',
+      data: dates,
+      boundaryGap: false,
+      axisTick: { show: false },
+      axisLine: { show: false },
+      axisLabel: { show: false },
+    },
+    yAxis: {
+      type: 'value',
+      min: 0,
+      max: 1,
+      axisTick: { show: false },
+      axisLine: { show: false },
+      axisLabel: { show: false },
+      splitLine: { show: false },
+    },
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params) => {
+        const first = params && params[0];
+        if (!first) return '';
+        const value = Number(first.data);
+        if (!Number.isFinite(value)) {
+          return first.axisValue;
+        }
+        return `${first.axisValue}\n결합 강도 ${value.toFixed(3)}`;
+      },
+    },
+    series: [
+      {
+        type: 'line',
+        data: values,
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { width: 2, color: '#38bdf8' },
+        areaStyle: { color: 'rgba(56, 189, 248, 0.2)' },
+      },
+    ],
+  });
+}
+
+function setMarketReportField(id, text) {
+  const node = document.getElementById(id);
+  if (node) {
+    node.textContent = text;
+  }
 }
 
 // --- Risk regime configs ---

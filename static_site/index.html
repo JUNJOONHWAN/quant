@@ -60,6 +60,97 @@
     <p id="custom-range-feedback" class="controls-helper"></p>
   </section>
   <main>
+    <section class="panel market-report-panel" id="market-report-panel">
+      <div class="panel-header">
+        <h2>확률형 마켓 리포트</h2>
+        <button type="button" class="info" data-target="info-market-report">ⓘ</button>
+      </div>
+      <p class="panel-context">풀 리포트에서 생성한 상승 확률과 핵심 드라이버를 한눈에 보여주는 상단 요약 카드입니다. 게이지·스파크라인·툴팁을 통해 리포트 텍스트를 읽지 않아도 현재 모드를 신속히 파악할 수 있습니다.</p>
+      <div id="market-report-empty" class="notice hidden" role="status"></div>
+      <div class="market-report-grid">
+        <div class="market-report-visual">
+          <div class="market-report-score-headline">
+            <h3>상승 확률</h3>
+            <p class="market-report-date" id="market-report-date">-</p>
+          </div>
+          <div id="market-report-gauge" class="chart market-report-gauge"></div>
+          <dl class="market-report-stats">
+            <div>
+              <dt>현재 추정</dt>
+              <dd id="market-report-score-value">--</dd>
+            </div>
+            <div>
+              <dt>신뢰 구간(점선)</dt>
+              <dd id="market-report-confidence">--</dd>
+            </div>
+            <div>
+              <dt>표시 범위</dt>
+              <dd id="market-report-range">--</dd>
+            </div>
+            <div>
+              <dt>Stability Δ (10일)</dt>
+              <dd id="market-report-slope">--</dd>
+            </div>
+          </dl>
+          <div class="market-report-sparkline">
+            <div class="sparkline-header">결합 강도 스파크라인</div>
+            <div id="market-report-sparkline" class="market-report-mini-chart"></div>
+          </div>
+        </div>
+        <div class="market-report-body">
+          <div class="market-report-problem">
+            <h3>문제/해결 요약</h3>
+            <ul>
+              <li><strong>문제</strong>: 확률과 기여도를 텍스트/Markdown으로만 노출해 직관성이 낮고, 지표 정의 역시 리포트 본문에서만 확인할 수 있었습니다.</li>
+              <li><strong>해결</strong>: 리치 시각화를 갖춘 전용 패널을 Risk-On/OFF 게이지 위에 배치해, 확률·시계열·드라이버 툴팁을 한 번에 제공하고 기존 TXT/CSV 출력은 그대로 유지합니다.</li>
+            </ul>
+          </div>
+          <div class="market-report-cheatsheet">
+            <div class="cheatsheet-header">Driver tooltip cheat sheet</div>
+            <ul>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="Adv/Decl 비율(상승 종목 수 / 하락 종목 수)" aria-label="ADR 정의">ADR</button>
+                <span>Adv/Decl 비율(상승 종목 수 / 하락 종목 수)</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="S&amp;P500 구성 종목의 50일 이동평균 상회 비중" aria-label="50일선 상회 비중">%&gt;MA50</button>
+                <span>S&amp;P500 구성 종목의 50일선 상회 비중</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="S&amp;P500 구성 종목의 200일 이동평균 상회 비중" aria-label="200일선 상회 비중">%&gt;MA200</button>
+                <span>S&amp;P500 구성 종목의 200일선 상회 비중</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="52주 신고/신저 비율(근접 기준)" aria-label="52주 신고/신저 비율">NH/NL</button>
+                <span>52주 신고/신저 비율(근접 기준)</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="20/60일 실현변동성(연환산)" aria-label="실현 변동성">RV20/60</button>
+                <span>20/60일 실현 변동성(연환산)</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="미 국채 10Y-3M, 10Y-2Y 수익률 스프레드" aria-label="수익률 스프레드">10Y-3M · 10Y-2Y</button>
+                <span>미 국채 10Y-3M / 10Y-2Y 수익률 스프레드</span>
+              </li>
+              <li>
+                <button type="button" class="cheat-chip" data-tooltip="Curvature = 30Y + 3M − 2×10Y (수익률곡선 곡률)" aria-label="곡률">Curvature</button>
+                <span>30Y + 3M − 2×10Y (수익률곡선 곡률)</span>
+              </li>
+            </ul>
+            <p class="cheatsheet-hint">드라이버 이름 위에 마우스를 올리거나 포커스하면 정의가 툴팁으로 나타납니다.</p>
+          </div>
+          <div class="market-report-next">
+            <h3>확장 제안</h3>
+            <ul>
+              <li>게이지 중앙에 교정 불확실성/신뢰 구간을 점선으로 겹치기</li>
+              <li>드라이버 막대를 절대값 순 ↔ 부호 순으로 토글</li>
+              <li>섹터 히트맵(트리맵) 또는 스프레드·곡률 미니 시계열 카드</li>
+            </ul>
+            <p>원하면 위 확장 안을 이어서 붙일 수 있습니다. 진행할까요?</p>
+          </div>
+        </div>
+      </div>
+    </section>
     <section class="panel" id="risk-panel">
       <div class="panel-header">
         <h2>리스크 레짐</h2>
@@ -191,6 +282,11 @@
     </section>
   </main>
 
+  <section class="info-popover" id="info-market-report">
+    <button type="button" class="popover-close" aria-label="닫기">×</button>
+    <h3>확률형 마켓 리포트</h3>
+    <p>상승 확률 게이지, Stability 스파크라인, 그리고 드라이버 정의 툴팁을 묶어 풀 리포트의 핵심을 상단에서 바로 확인하도록 구성했습니다. TXT/CSV 리포트와 동일한 데이터만 사용하며, 값이 비어 있을 경우 명확한 안내를 띄웁니다.</p>
+  </section>
   <section class="info-popover" id="info-stability">
     <button type="button" class="popover-close" aria-label="닫기">×</button>
     <h3>자산 결합 강도 (Stability Index)</h3>
