@@ -117,24 +117,30 @@
           </div>
         </div>
         <div class="market-report-body">
-          <div class="market-report-drivers">
-            <h3>상위 드라이버 (LLR)</h3>
-            <ol id="market-report-driver-list"></ol>
-            <p class="cheatsheet-hint">로그우도비(LLR) 기준 상위 5개 지표</p>
-          </div>
-          <div class="market-report-driver-chart-block">
-            <div class="sparkline-header">드라이버 기여도 (LLR)</div>
-            <div id="market-report-driver-chart" class="market-report-mini-chart driver-chart"></div>
-          </div>
-          <div class="secondary-grid">
-            <div class="market-report-features">
-              <h3>ETF 기반 Breadth · Curve 지표</h3>
-              <ul id="market-report-feature-list" class="feature-list"></ul>
+          <div class="market-report-column">
+            <div class="market-report-summary market-report-card">
+              <h3>서술형 요약</h3>
+              <div id="market-report-summary" class="summary-text">-</div>
             </div>
-            <div class="market-report-sectors">
+            <div class="market-report-drivers market-report-card">
+              <h3>상위 드라이버 (LLR)</h3>
+              <ol id="market-report-driver-list"></ol>
+              <p class="cheatsheet-hint">로그우도비(LLR) 기준 상위 5개 지표</p>
+            </div>
+            <div class="market-report-driver-chart-block market-report-card">
+              <div class="sparkline-header">드라이버 기여도 (LLR)</div>
+              <div id="market-report-driver-chart" class="market-report-mini-chart driver-chart"></div>
+            </div>
+            <div class="market-report-sectors market-report-card">
               <h3>섹터 히트맵</h3>
               <div id="market-report-sectors-chart" class="sector-chart"></div>
               <p class="cheatsheet-hint">면적=절대 등락, 색=방향</p>
+            </div>
+          </div>
+          <div class="market-report-column">
+            <div class="market-report-features market-report-card">
+              <h3>ETF 기반 Breadth · Curve 지표</h3>
+              <ul id="market-report-feature-list" class="feature-list"></ul>
             </div>
           </div>
         </div>

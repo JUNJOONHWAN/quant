@@ -1169,6 +1169,7 @@ function renderMarketReportPanel() {
   renderMarketReportFeatures(view.features);
   renderMarketReportSectors(view.sectors);
   renderMarketReportSpreads(view.curveTs);
+  renderMarketReportSummary(view);
 }
 
 function renderMarketReportMarkdown() {
@@ -1667,6 +1668,33 @@ function extractCurveSeries(refs) {
     spr_10y_2y: toSeries('spr_10y_2y'),
     curvature: toSeries('curvature'),
   };
+}
+
+function renderMarketReportSummary(view) {
+  const element = document.getElementById('market-report-summary');
+  if (!element) return;
+  const lines = [];
+  const probPct = (view.prob * 100).toFixed(1);
+  const band = `${(view.low * 100).toFixed(0)}% ~ ${(view.high * 100).toFixed(0)}%`;
+  lines.push(`P(Up|H=${view.meta?.horizon || 5}일) = <strong>${probPct}%</strong> (신뢰구간 ${band}).`);
+  if (Number.isFinite(view.slope)) {
+    lines.push(`Stability Δ(10일)은 ${view.slope >= 0 ? '상승' : '하락'} 기울기 (${view.slope >= 0 ? '▲' : '▼'} ${Math.abs(view.slope).toFixed(3)}).`);
+  }
+  const driverNames = (view.drivers || []).slice(0, 3).map((item) => item[0]).filter(Boolean);
+  if (driverNames.length) {
+    lines.push(`주요 드라이버: ${driverNames.join(', ')}.`);
+  }
+  if (Array.isArray(view.sectors) && view.sectors.length) {
+    const sorted = [...view.sectors].sort((a, b) => (Number(b.change) || 0) - (Number(a.change) || 0));
+    const top = sorted.slice(0, 2).map((item) => `${item.name || ''} ${((item.change || 0) * 100).toFixed(1)}%`);
+    const bottom = sorted.slice(-2).map((item) => `${item.name || ''} ${((item.change || 0) * 100).toFixed(1)}%`);
+    lines.push(`섹터: 상승 ${top.join(', ')} / 하락 ${bottom.join(', ')}.`);
+  }
+  if (Array.isArray(view.curveTs?.spr_10y_3m) && view.curveTs.spr_10y_3m.length) {
+    const latest = view.curveTs.spr_10y_3m[view.curveTs.spr_10y_3m.length - 1];
+    lines.push(`10Y-3M 스프레드는 ${Number(latest).toFixed(2)}% 수준.`);
+  }
+  element.innerHTML = lines.map((text) => `<p>${text}</p>`).join('');
 }
 
 function renderMarketReportGauge(view) {

@@ -462,10 +462,22 @@ main {
   gap: 1rem;
 }
 
-.secondary-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+.market-report-column {
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
+}
+
+.market-report-card {
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 1rem;
+  padding: 0.9rem 1rem;
+}
+
+.summary-text p {
+  margin: 0.35rem 0;
+  line-height: 1.4;
 }
 
 .market-report-markdown {
