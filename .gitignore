@@ -18,3 +18,5 @@ build/
 # Python caches
 __pycache__/
 *.pyc
+# Local Codex/DGX workspace artifacts
+.codex/
