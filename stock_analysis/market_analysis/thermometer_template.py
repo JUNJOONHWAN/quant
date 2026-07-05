@@ -11,13 +11,18 @@ from html import escape
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .dgx_paths import choose_output_dir
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE_PATH = PROJECT_ROOT / "reports/templates/thermometer_mobile420_base.html"
 LOCAL_THERMOMETER_DIR = PROJECT_ROOT / "sweet_spot_reports"
 ICLOUD_THERMOMETER_DIR = (
-    Path.home()
-    / "Library/Mobile Documents/com~apple~CloudDocs/STOCK/온도계"
+    choose_output_dir(
+        "STOCK_THERMOMETER_DIR",
+        "온도계",
+        legacy_mac_path=Path("/home/zooh/Documents/DGX_Outputs/STOCK/온도계"),
+    )
 )
 
 

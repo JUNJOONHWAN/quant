@@ -25,6 +25,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
+from .dgx_paths import choose_file_path, existing_nonlegacy_file
+
 try:  # pragma: no cover - present in the repo environment.
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover
@@ -57,9 +59,14 @@ DEFAULT_UNIVERSE = [
     "USO",
 ]
 DEFAULT_GOSTOP_HISTORY_DB_PATH = Path("sweet_spot_reports/etf_gostop_history.sqlite")
-DEFAULT_GOSTOP_ICLOUD_HISTORY_DB_PATH = (
-    Path.home()
-    / "Library/Mobile Documents/com~apple~CloudDocs/STOCK/ETF GoStop/data/etf_gostop_history.sqlite"
+DEFAULT_GOSTOP_ICLOUD_HISTORY_DB_PATH = choose_file_path(
+    "ETF_GOSTOP_ICLOUD_HISTORY_DB_PATH",
+    "ETF GoStop",
+    "data",
+    "etf_gostop_history.sqlite",
+    legacy_mac_path=Path(
+        "/home/zooh/Documents/DGX_Outputs/STOCK/ETF GoStop/data/etf_gostop_history.sqlite"
+    ),
 )
 KST = dt.timezone(dt.timedelta(hours=9), name="KST")
 
@@ -321,6 +328,30 @@ class MarketDataClient:
 
     def fmp_quote(self, symbols: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         if not self.fmp_key:
+            # Try local fundamental data as fallback
+            for p in [
+                Path(__file__).resolve().parents[2] / "STOCK" / "sweet_spot_reports" / "etf_fundamental_data.json",
+                Path(__file__).resolve().parents[1] / "STOCK" / "sweet_spot_reports" / "etf_fundamental_data.json",
+            ]:
+                if p.exists():
+                    try:
+                        data = json.load(open(p))
+                        price_data = data.get("price_data", {})
+                        return {
+                            s: {
+                                "symbol": s,
+                                "price": p_data.get("latest_price"),
+                                "priceAvg50": p_data.get("fiftyDayAverage"),
+                                "priceAvg200": p_data.get("twoHundredDayAverage"),
+                                "fiftyTwoWeekHigh": p_data.get("fiftyTwoWeekHigh"),
+                                "fiftyTwoWeekLow": p_data.get("fiftyTwoWeekLow"),
+                                "trailingPE": p_data.get("trailingPE"),
+                                "dividendYield": p_data.get("dividendYield"),
+                            }
+                            for s, p_data in price_data.items()
+                        }
+                    except Exception:
+                        pass
             return {}
         clean = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
         if not clean:
@@ -334,6 +365,29 @@ class MarketDataClient:
         self, symbol: str, *, from_date: str, to_date: str
     ) -> List[PricePoint]:
         if not self.fmp_key:
+            # Try local price history as fallback
+            for p in [
+                Path(__file__).resolve().parents[2] / "STOCK" / "sweet_spot_reports" / "etf_price_history.json",
+                Path(__file__).resolve().parents[1] / "STOCK" / "sweet_spot_reports" / "etf_price_history.json",
+            ]:
+                if p.exists():
+                    try:
+                        data = json.load(open(p))
+                        bars = data.get(symbol.upper(), {}).get("bars", [])
+                        return [
+                            PricePoint(
+                                date=b["date"][:10],
+                                close=_to_float(b["close"]),
+                                open=_to_float(b["open"]),
+                                high=_to_float(b["high"]),
+                                low=_to_float(b["low"]),
+                                volume=_to_float(b["volume"]),
+                            )
+                            for b in bars
+                            if _to_float(b["close"]) is not None
+                        ]
+                    except Exception:
+                        pass
             return []
         url = f"{FMP_BASE_URL}/api/v3/historical-price-full/{symbol.upper()}"
         data = self._get_json(
@@ -6063,16 +6117,21 @@ def append_gostop_google_sheet(
     spreadsheet_id: Optional[str] = None,
     sheet_name: Optional[str] = None,
 ) -> str:
-    """Append a GoStop audit row to Google Sheets using service-account credentials."""
+    """Append a GoStop audit row to Google Sheets.
 
-    credentials_file = str(
-        credentials_path
-        or os.getenv("ETF_GOSTOP_GOOGLE_CREDENTIALS")
-        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        or ""
-    ).strip()
-    if not credentials_file:
-        raise RuntimeError("Google Sheets credentials path is not configured")
+    Service-account credentials remain supported. On DGX, a stale Mac service
+    account path is ignored and the existing ``~/.clasprc.json`` OAuth token is
+    used as the fallback Sheets API credential.
+    """
+
+    credentials_file = existing_nonlegacy_file(
+        str(
+            credentials_path
+            or os.getenv("ETF_GOSTOP_GOOGLE_CREDENTIALS")
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or ""
+        ).strip()
+    )
 
     sheet_id = _extract_google_sheet_id(
         spreadsheet_id
@@ -6085,15 +6144,40 @@ def append_gostop_google_sheet(
 
     try:
         from google.auth.transport.requests import AuthorizedSession
+        from google.oauth2.credentials import Credentials
         from google.oauth2 import service_account
     except Exception as exc:
         raise RuntimeError(f"google-auth is not available: {exc}") from exc
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    credentials = service_account.Credentials.from_service_account_file(
-        credentials_file,
-        scopes=scopes,
-    )
+    auth_mode = "service_account"
+    if credentials_file:
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_file,
+            scopes=scopes,
+        )
+    else:
+        clasprc = Path(os.getenv("CLASPRC_PATH", str(Path.home() / ".clasprc.json"))).expanduser()
+        if not clasprc.exists():
+            raise RuntimeError(
+                "Google Sheets credentials are not configured and ~/.clasprc.json is missing"
+            )
+        data = json.loads(clasprc.read_text(encoding="utf-8"))
+        token_data = data.get("tokens", {}).get("default") if isinstance(data.get("tokens"), dict) else None
+        if not isinstance(token_data, dict):
+            token_data = data.get("tokens") if isinstance(data.get("tokens"), dict) else data
+        required = ("client_id", "client_secret", "refresh_token")
+        if not isinstance(token_data, dict) or not all(token_data.get(key) for key in required):
+            raise RuntimeError(f"Could not find clasp OAuth refresh token fields in {clasprc}")
+        credentials = Credentials(
+            token=None,
+            refresh_token=str(token_data["refresh_token"]),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=str(token_data["client_id"]),
+            client_secret=str(token_data["client_secret"]),
+            scopes=scopes,
+        )
+        auth_mode = "clasp_oauth"
     session = AuthorizedSession(credentials)
     base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values"
     target_sheet = sheet_name if sheet_name is not None else os.getenv("ETF_GOSTOP_SHEET_NAME", "")
@@ -6125,7 +6209,7 @@ def append_gostop_google_sheet(
     )
     append_resp.raise_for_status()
     updated_range = (append_resp.json().get("updates") or {}).get("updatedRange") or append_range
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#range={updated_range}"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#range={updated_range}&auth={auth_mode}"
 
 
 def _html_metric(label: str, value: str, caption: str = "", tone: str = "") -> str:
