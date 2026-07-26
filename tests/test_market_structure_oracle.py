@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -78,3 +79,67 @@ def test_preflight_stdout_contract_is_json_serializable(tmp_path, monkeypatch):
         "flow_policy_id": module.ETF_FLOW_POLICY_ID,
     }
     assert json.loads(json.dumps(payload))["status"] == "PREFLIGHT_PASS"
+
+
+def test_scope_resolution_keeps_global_context_and_supports_etf_baskets():
+    module = _load_module()
+    resolved = module._resolve_scope(
+        {"query": "반도체 섹터를 오라클로 분석해줘"}
+    )
+    assert resolved["scope_id"] == "semiconductors"
+    assert resolved["etfs"] == ["SMH", "SOXX"]
+    custom = module._resolve_scope(
+        {
+            "query": "내 금광 바스켓",
+            "scope": "my_gold",
+            "etfs": ["GDX", "GDXJ", "GDX"],
+        }
+    )
+    assert custom["scope_id"] == "my_gold"
+    assert custom["etfs"] == ["GDX", "GDXJ"]
+    assert module._resolve_scope({"scope": "full_market"}) is None
+
+
+def test_pit_membership_activates_only_on_available_date():
+    module = _load_module()
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        """
+        CREATE TABLE etf_constituent_observations (
+          etf_ticker TEXT, constituent_ticker TEXT, effective_date TEXT,
+          available_date TEXT, weight_percent REAL, pit_confidence TEXT
+        )
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO etf_constituent_observations
+        VALUES (?,?,?,?,?,?)
+        """,
+        [
+            ("TEST", "AAA", "2020-01-02", "2020-01-06", 60.0, "date_exact"),
+            ("TEST", "BBB", "2020-01-02", "2020-01-06", 40.0, "date_exact"),
+            ("TEST", "BBB", "2020-01-07", "2020-01-09", 30.0, "date_exact"),
+            ("TEST", "CCC", "2020-01-07", "2020-01-09", 70.0, "date_exact"),
+        ],
+    )
+    dates = [
+        "2020-01-02",
+        "2020-01-03",
+        "2020-01-06",
+        "2020-01-07",
+        "2020-01-08",
+        "2020-01-09",
+    ]
+    memberships, coverage = module._load_pit_scope_memberships(
+        connection,
+        dates=dates,
+        symbols=["AAA", "BBB", "CCC"],
+        etfs=["TEST"],
+    )
+    assert memberships[0] is None
+    assert memberships[1] is None
+    assert memberships[2][0].tolist() == [0, 1]
+    assert memberships[4][0].tolist() == [0, 1]
+    assert memberships[5][0].tolist() == [1, 2]
+    assert coverage["history_start"] == "2020-01-06"

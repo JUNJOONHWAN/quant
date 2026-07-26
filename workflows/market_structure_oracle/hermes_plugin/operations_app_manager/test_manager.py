@@ -261,6 +261,58 @@ class AppManagerContractTests(unittest.TestCase):
         self.assertTrue(receipt["preflight_only"])
         self.assertFalse(receipt["managed_completion_claim_allowed"])
 
+    def test_request_input_is_sealed_and_passed_by_file(self) -> None:
+        self.script.write_text(
+            "import json, os\n"
+            "path = os.environ['OPERATIONS_APP_INPUT_FILE']\n"
+            "print(json.dumps(json.load(open(path, encoding='utf-8')), "
+            "sort_keys=True))\n",
+            encoding="utf-8",
+        )
+        self.install(
+            self.manifest(
+                default_worker="hermes-worker-general",
+                bypass_operations_worker=False,
+                worker_skills=[],
+            )
+        )
+        context = SimpleNamespace(
+            shell_key="operations",
+            shell_id="shell_operations_v4",
+            executor_id="executor_hermes_worker_general",
+            task_id="t_input",
+            run_id=44,
+        )
+        request = {"query": "반도체 섹터", "scope": "semiconductors"}
+        with patch.object(
+            self.manager,
+            "_bound_operations_context",
+            return_value=context,
+        ):
+            receipt = self.manager.run(
+                "test-app",
+                request_id="e" * 32,
+                request_input=request,
+            )
+        self.assertEqual(json.loads(receipt["stdout"]), request)
+        self.assertTrue(receipt["request_input_present"])
+        self.assertEqual(receipt["request_input_bytes"], 53)
+        sealed = Path(receipt["request_input_file"])
+        self.assertEqual(json.loads(sealed.read_text(encoding="utf-8")), request)
+        self.assertNotIn("반도체", json.dumps(receipt, ensure_ascii=False))
+
+    def test_request_input_must_be_object_and_has_size_limit(self) -> None:
+        self.install(
+            self.manifest(
+                bypass_operations_worker=True,
+                bypass_reason="test-only direct execution",
+            )
+        )
+        with self.assertRaisesRegex(AppManagerError, "one JSON object"):
+            self.manager.run("test-app", request_input=["not", "object"])
+        with self.assertRaisesRegex(AppManagerError, "exceeds"):
+            self.manager.run("test-app", request_input={"query": "x" * 33000})
+
 
 if __name__ == "__main__":
     unittest.main()

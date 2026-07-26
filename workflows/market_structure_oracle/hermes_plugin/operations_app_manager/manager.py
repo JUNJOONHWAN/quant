@@ -32,6 +32,7 @@ from hermes_constants import get_hermes_home
 SCHEMA = "hermes-independent-app-v1"
 RECEIPT_SCHEMA = "hermes-app-run-receipt-v1"
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{1,95}$")
+REQUEST_INPUT_MAX_BYTES = 32 * 1024
 
 
 class AppManagerError(RuntimeError):
@@ -790,6 +791,42 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 fcntl.flock(lock_handle, fcntl.LOCK_UN)
         os.chmod(ledger, 0o600)
 
+    def _seal_request_input(
+        self,
+        app_id: str,
+        run_id: str,
+        request_input: dict[str, Any] | None,
+    ) -> tuple[Path | None, str | None, int]:
+        if request_input is None:
+            return None, None, 0
+        if not isinstance(request_input, dict):
+            raise AppManagerError("application input must be one JSON object")
+        try:
+            encoded = json.dumps(
+                request_input,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise AppManagerError(
+                f"application input is not finite JSON: {exc}"
+            ) from exc
+        if len(encoded) > REQUEST_INPUT_MAX_BYTES:
+            raise AppManagerError(
+                "application input exceeds "
+                f"{REQUEST_INPUT_MAX_BYTES} UTF-8 bytes"
+            )
+        input_path = (
+            self.runs_dir
+            / self._validate_id(app_id)
+            / "inputs"
+            / f"{run_id}.json"
+        )
+        _atomic_json(input_path, request_input)
+        return input_path, hashlib.sha256(encoded).hexdigest(), len(encoded)
+
     def run(
         self,
         app_id: str,
@@ -800,6 +837,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
         dry_run: bool = False,
         request_id: str | None = None,
         preflight_only: bool = False,
+        request_input: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         manifest = self._load_manifest(app_id)
         execution = dict(manifest.get("execution") or {})
@@ -818,6 +856,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 dry_run=dry_run,
                 request_id=request_id,
                 preflight_only=preflight_only,
+                request_input=request_input,
             )
         context = self._bound_operations_context()
         return self.execute_direct(
@@ -828,6 +867,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
             dry_run=dry_run,
             request_id=request_id,
             preflight_only=preflight_only,
+            request_input=request_input,
             operations_context=context,
         )
 
@@ -864,6 +904,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
         dry_run: bool = False,
         request_id: str | None = None,
         preflight_only: bool = False,
+        request_input: dict[str, Any] | None = None,
         operations_context: Any | None = None,
     ) -> dict[str, Any]:
         manifest = self._load_manifest(app_id)
@@ -890,6 +931,11 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
         run_id = str(request_id or uuid.uuid4().hex)
         if not re.fullmatch(r"[a-f0-9]{32}", run_id):
             raise AppManagerError(f"invalid request_id: {run_id}")
+        input_path, input_sha256, input_bytes = self._seal_request_input(
+            app_id,
+            run_id,
+            request_input,
+        )
         started = _utc_now()
         env = os.environ.copy()
         env.update(
@@ -901,6 +947,9 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 "OPERATIONS_APP_MANAGED": "1" if managed else "0",
             }
         )
+        if input_path is not None:
+            env["OPERATIONS_APP_INPUT_FILE"] = str(input_path)
+            env["OPERATIONS_APP_INPUT_SHA256"] = str(input_sha256)
         if preflight_only:
             preflight = manifest.get("preflight")
             if not isinstance(preflight, dict):
@@ -994,6 +1043,10 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 ),
                 "supervisor_controller_selected_agent": False,
                 "preflight_only": bool(preflight_only),
+                "request_input_present": input_path is not None,
+                "request_input_file": str(input_path) if input_path else None,
+                "request_input_sha256": input_sha256,
+                "request_input_bytes": input_bytes,
                 "started_at": started,
                 "finished_at": _utc_now(),
                 "duration_seconds": round(time.monotonic() - begin, 3),

@@ -1,8 +1,7 @@
 name: operations-app-manager
-version: 0.1.0
-description: "Operations-owned registry, execution ledger, and cron attachment layer for independent Hermes applications."
+version: 0.2.0
+description: "Operations-owned registry, sealed JSON request handoff, execution ledger, and cron attachment layer for independent Hermes applications."
 author: zooh
 kind: standalone
 platforms:
   - linux
-

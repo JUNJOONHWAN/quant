@@ -98,6 +98,16 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     run_p.add_argument("--passthrough", action="store_true")
     run_p.add_argument("--dry-run", action="store_true")
     run_p.add_argument("--preflight-only", action="store_true")
+    run_input = run_p.add_mutually_exclusive_group()
+    run_input.add_argument(
+        "--input-json",
+        help="Application request as one JSON object",
+    )
+    run_input.add_argument(
+        "--input-file",
+        type=Path,
+        help="Read the application request from a JSON file",
+    )
     run_p.add_argument("--json", action="store_true")
 
     execute_p = sub.add_parser(
@@ -114,6 +124,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     execute_p.add_argument("--request-id", required=True)
     execute_p.add_argument("--passthrough", action="store_true")
     execute_p.add_argument("--preflight-only", action="store_true")
+    execute_input = execute_p.add_mutually_exclusive_group()
+    execute_input.add_argument("--input-json")
+    execute_input.add_argument("--input-file", type=Path)
     execute_p.add_argument("--json", action="store_true")
 
     cap_p = sub.add_parser("capabilities", help="Inspect or refresh capability inventory")
@@ -168,6 +181,27 @@ def _operations_request_workspace(manager: AppManager, app_id: str) -> Path:
     return workspace
 
 
+def _parse_request_input(args: argparse.Namespace) -> dict[str, Any] | None:
+    raw = getattr(args, "input_json", None)
+    input_file = getattr(args, "input_file", None)
+    if input_file is not None:
+        try:
+            raw = input_file.expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AppManagerError(
+                f"unable to read application input file: {input_file}: {exc}"
+            ) from exc
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AppManagerError(f"application input is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise AppManagerError("application input must be one JSON object")
+    return payload
+
+
 def _request_operations_app_run(
     manager: AppManager,
     app_id: str,
@@ -177,6 +211,7 @@ def _request_operations_app_run(
     managed: bool,
     dry_run: bool,
     preflight_only: bool,
+    request_input: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Ask Hermes to route an app request through the Operations Role Shell."""
     from hermes_cli import kanban_db as kb
@@ -242,6 +277,8 @@ def _request_operations_app_run(
         "managed": bool(managed),
         "preflight_only": bool(preflight_only),
     }
+    if request_input is not None:
+        tool_args["input"] = request_input
     expected_status = "PREFLIGHT_PASS" if preflight_only else "PASS"
     body = (
         "Manage one registered independent application through App Manager. "
@@ -385,6 +422,7 @@ def apps_command(args: argparse.Namespace) -> int:
                 managed=not args.unmanaged,
                 dry_run=args.dry_run,
                 preflight_only=args.preflight_only,
+                request_input=_parse_request_input(args),
             )
             if args.passthrough:
                 stdout = str(receipt.get("stdout") or "")
@@ -404,6 +442,7 @@ def apps_command(args: argparse.Namespace) -> int:
                 source_job_id=args.source_job_id or None,
                 request_id=args.request_id,
                 preflight_only=args.preflight_only,
+                request_input=_parse_request_input(args),
             )
             if args.passthrough:
                 stdout = str(receipt.get("stdout") or "")

@@ -12,10 +12,22 @@
     "flow_policy_id": "massive_etf_flow_us_sessions_v1",
     "future_returns_role": "labels_only",
     "lookahead_in_features": false,
-    "output_schema": "quant.market_structure_oracle.v1",
+    "output_schema": "quant.market_structure_oracle.v2",
+    "request_input": {
+      "fields": [
+        "query",
+        "scope",
+        "etfs"
+      ],
+      "handoff": "sealed_json_file",
+      "max_bytes": 32768,
+      "type": "object"
+    },
+    "scope_formula": "scope future | full market state + scope internal structure + relative position + ETF Flow D+2",
+    "state_cube_schema": "quant.market_structure_state_cube.v1",
     "source_database_mode": "read_only_query_only"
   },
-  "description": "Hermes Worker가 동결된 전수 일봉과 ETF Flow D+2 관측 뷰로 시장 구조, 과거 유사 상태, 후속 경로 분포와 워크포워드 검증을 생성한다.",
+  "description": "Hermes Worker가 동결된 전수 일봉과 ETF Flow D+2 관측 뷰로 전시장 상태 큐브를 만들고, 전체 시장 또는 섹터·테마·ETF 바스켓의 조건부 구조와 후속 경로를 분석한다.",
   "execution": {
     "bypass_operations_worker": false,
     "default_worker": "hermes-worker-general",

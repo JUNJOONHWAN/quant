@@ -32,6 +32,13 @@ OPERATIONS_APP_RUN_SCHEMA: dict[str, Any] = {
             },
             "managed": {"type": "boolean"},
             "preflight_only": {"type": "boolean"},
+            "input": {
+                "type": "object",
+                "description": (
+                    "Application-owned JSON request. App Manager seals it in "
+                    "an immutable run input file and passes only the file path."
+                ),
+            },
         },
         "required": ["app_id", "trigger", "request_id"],
         "additionalProperties": False,
@@ -49,6 +56,7 @@ def handle_operations_app_run(args: dict[str, Any], **_kwargs: Any) -> str:
             managed=bool(args.get("managed", True)),
             request_id=str(args.get("request_id") or ""),
             preflight_only=bool(args.get("preflight_only", False)),
+            request_input=args.get("input"),
         )
     except AppManagerError as exc:
         return json.dumps(

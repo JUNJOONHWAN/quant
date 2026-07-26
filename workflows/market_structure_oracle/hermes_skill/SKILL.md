@@ -30,6 +30,41 @@ For live market data, also load `stock-research-skills` as the data-source
 access reference. That skill is not the analysis owner; it documents access
 patterns for Barchart, FMP, Massive, Topstep, KIS/KRX/DART, and community data.
 
+## Market Structure Oracle
+
+When the user says `오라클` or `Oracle`, use the managed
+`market-structure-oracle` application. Do not run its Python entrypoint
+directly.
+
+- Whole market: `hermes apps run market-structure-oracle --json`
+- Named sector/theme: resolve it to the canonical scope below and pass a JSON
+  request with `query` and `scope`.
+- Arbitrary ETF basket: pass `query`, a stable `scope`, and `etfs`.
+
+Example request:
+
+```bash
+hermes apps run market-structure-oracle \
+  --input-json '{"query":"반도체 섹터를 오라클로 분석해줘","scope":"semiconductors"}' \
+  --json
+```
+
+Canonical scopes include `technology`, `semiconductors`,
+`communication_services`, `consumer_discretionary`, `consumer_staples`,
+`energy`, `financials`, `healthcare`, `industrials`, `materials`,
+`real_estate`, `utilities`, `biotechnology`, `cybersecurity`,
+`clean_energy`, `defense`, `regional_banks`, `homebuilders`,
+`gold_miners`, and `uranium`.
+
+The app computes or reuses one full-market state cube, then conditions the
+scope view on the full market. Never describe a scope result as an isolated
+sector-only run. The governing formula is:
+
+`scope future | full market state + scope internal structure + relative position + ETF Flow D+2`
+
+Read the successful App Manager receipt and use the report paths in its stdout.
+If the receipt is not `PASS`, do not claim that the Oracle completed.
+
 ## Domain Map
 
 - `data_sources/barchart/`: Barchart Premier/CDP page contracts, option pages,
