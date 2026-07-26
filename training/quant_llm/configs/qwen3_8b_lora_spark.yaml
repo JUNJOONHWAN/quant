@@ -1,0 +1,108 @@
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 100
+  num_epochs: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /models/Qwen3-8B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: '*_proj'
+  dim: 8
+  alpha: 32
+  use_triton: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /data/checkpoints/qwen3_8b_quant_lora_v1
+  model_save_format: safetensors
+  save_consolidated: final
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /data/datasets/qwen3_8b_sft_v2/train.jsonl
+  split: train
+  column_mapping:
+    context: context
+    question: instruction
+    answer: response
+  answer_only_loss_mask: true
+  use_hf_chat_template: true
+  seq_length: 4096
+  truncation: do_not_truncate
+  padding: do_not_pad
+
+packed_sequence:
+  packed_sequence_size: 4096
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /data/datasets/qwen3_8b_sft_v2/validation.jsonl
+  split: validation
+  column_mapping:
+    context: context
+    question: instruction
+    answer: response
+  answer_only_loss_mask: true
+  use_hf_chat_template: true
+  seq_length: 4096
+  truncation: do_not_truncate
+  padding: do_not_pad
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0
+  fused: true
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+ci:
+  recipe_owner: quant
+  nproc_per_node: 1
+  cluster_tag: dgx-spark

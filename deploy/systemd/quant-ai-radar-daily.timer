@@ -1,0 +1,12 @@
+[Unit]
+Description=KST 09:15 Tue-Sat Quant AI Radar daily cycle (stored UTC)
+
+[Timer]
+# KST intent: Tue-Sat 09:15 Asia/Seoul. Stored/executed: Tue-Sat 00:15 UTC.
+OnCalendar=Tue..Sat *-*-* 00:15:00 UTC
+Persistent=true
+RandomizedDelaySec=0
+Unit=quant-ai-radar-daily.service
+
+[Install]
+WantedBy=timers.target

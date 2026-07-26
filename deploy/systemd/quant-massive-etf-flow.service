@@ -1,0 +1,18 @@
+[Unit]
+Description=Quant dataset Massive ETF Global flow backfill
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m quant_dataset backfill-etf-flows --from 2017-01-01 --to 2026-07-14 --limit 5000
+Restart=on-failure
+RestartSec=120
+TimeoutStopSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target

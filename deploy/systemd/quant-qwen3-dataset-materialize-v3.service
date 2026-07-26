@@ -1,0 +1,22 @@
+[Unit]
+Description=Qwen3-8B quant PIT candidate v3 seeded extension materialization
+After=network.target
+ConditionPathExists=!/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v3/manifest.json
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs
+ExecStart=/usr/bin/python3 -m training.quant_llm.build_selected_sft_from_db --pair-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/pair_selections/qwen3_8b_pairs_v3 --data-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET --output-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v3 --seed-output-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v2
+ExecStopPost=/usr/bin/python3 -m training.quant_llm.materialization_status /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v3 --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/status/qwen3_8b_materialization_v3_latest.json --append-jsonl /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/status/qwen3_8b_materialization_v3_history.jsonl
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=120
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+StandardOutput=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs/qwen3_8b_materialization_v3.log
+StandardError=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs/qwen3_8b_materialization_v3.log
+
+[Install]
+WantedBy=default.target

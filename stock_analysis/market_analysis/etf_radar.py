@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
-from .dgx_paths import choose_file_path, existing_nonlegacy_file
+from .dgx_paths import DGX_OUTPUT_ROOT, choose_file_path
 
 try:  # pragma: no cover - present in the repo environment.
     from dotenv import load_dotenv
@@ -58,7 +58,9 @@ DEFAULT_UNIVERSE = [
     "GLD",
     "USO",
 ]
-DEFAULT_GOSTOP_HISTORY_DB_PATH = Path("sweet_spot_reports/etf_gostop_history.sqlite")
+DEFAULT_GOSTOP_REPORT_DIR = DGX_OUTPUT_ROOT / "ETF GoStop"
+DEFAULT_GOSTOP_DATA_DIR = DEFAULT_GOSTOP_REPORT_DIR / "data"
+DEFAULT_GOSTOP_HISTORY_DB_PATH = DEFAULT_GOSTOP_DATA_DIR / "etf_gostop_history.sqlite"
 DEFAULT_GOSTOP_ICLOUD_HISTORY_DB_PATH = choose_file_path(
     "ETF_GOSTOP_ICLOUD_HISTORY_DB_PATH",
     "ETF GoStop",
@@ -330,6 +332,7 @@ class MarketDataClient:
         if not self.fmp_key:
             # Try local fundamental data as fallback
             for p in [
+                DEFAULT_GOSTOP_DATA_DIR / "etf_fundamental_data.json",
                 Path(__file__).resolve().parents[2] / "STOCK" / "sweet_spot_reports" / "etf_fundamental_data.json",
                 Path(__file__).resolve().parents[1] / "STOCK" / "sweet_spot_reports" / "etf_fundamental_data.json",
             ]:
@@ -367,6 +370,7 @@ class MarketDataClient:
         if not self.fmp_key:
             # Try local price history as fallback
             for p in [
+                DEFAULT_GOSTOP_DATA_DIR / "etf_price_history.json",
                 Path(__file__).resolve().parents[2] / "STOCK" / "sweet_spot_reports" / "etf_price_history.json",
                 Path(__file__).resolve().parents[1] / "STOCK" / "sweet_spot_reports" / "etf_price_history.json",
             ]:
@@ -1183,12 +1187,19 @@ def build_options_futures_reference(
             _first_metric_window(evidence, "IV Percentile"),
             "IV Percentile",
         ),
-        "implied_volatility_pct": _metric_after_label(options_data_iv, "Implied Volatility"),
+        "implied_volatility_pct": (
+            _metric_after_label(options_data_iv, "Implied Volatility")
+            or _metric_after_label(options_data_iv, "IV")
+        ),
         "atm_implied_volatility_pct": _metric_after_label(
             options_prices_iv,
             "Implied Volatility (ATM)",
         ),
-        "historical_volatility_pct": _metric_after_label(options_data_iv, "Historic Volatility"),
+        "historical_volatility_pct": (
+            _metric_after_label(options_data_iv, "Historic Volatility")
+            or _metric_after_label(options_data_iv, "Historical Volatility")
+            or _metric_after_label(options_data_iv, "HV")
+        ),
         "put_call_volume_ratio": _metric_after_label(option_prices_volume, "Put/Call Volume Ratio"),
         "put_call_oi_ratio": _metric_after_label(option_prices_oi, "Put/Call Open Interest Ratio"),
         "put_open_interest_total": _metric_after_label(option_prices_volume, "Put Open Interest Total"),
@@ -4473,7 +4484,7 @@ def auto_tune_gostop(
 def evaluate_gostop_history(
     current_report: Mapping[str, Any],
     *,
-    history_dir: str = "sweet_spot_reports",
+    history_dir: str = str(DEFAULT_GOSTOP_DATA_DIR),
     max_reports: int = 60,
     min_age_days: int = 1,
 ) -> Dict[str, Any]:
@@ -5547,16 +5558,38 @@ def generate_etf_radar_report(
         int(tune_history_days) + max_horizon + 45 if auto_tune else 0,
     )
     data_client = client or MarketDataClient()
+    try:
+        fetch_attempts = max(1, int(os.getenv("ETF_GOSTOP_INPUT_FETCH_ATTEMPTS", "4")))
+    except ValueError:
+        fetch_attempts = 4
+    try:
+        fetch_retry_sec = max(0.0, float(os.getenv("ETF_GOSTOP_INPUT_FETCH_RETRY_SEC", "2")))
+    except ValueError:
+        fetch_retry_sec = 2.0
+    fetch_diagnostics: Dict[str, Dict[str, Any]] = {"prices": {}, "flows": {}}
 
     def fetch_inputs(target_end: dt.date) -> Tuple[str, str, Dict[str, List[FlowPoint]], Dict[str, List[PricePoint]]]:
         target_start = target_end - dt.timedelta(days=analysis_lookback_days)
         start_text = target_start.isoformat()
         end_text = target_end.isoformat()
-        flow_points = data_client.massive_fund_flows(
-            universe,
-            processed_date_gte=start_text,
-            limit=min(max(len(universe) * (analysis_lookback_days + 20), 1000), 5000),
-        )
+        flow_points: List[FlowPoint] = []
+        flow_errors: List[str] = []
+        batch_attempts = 0
+        for attempt in range(1, fetch_attempts + 1):
+            batch_attempts = attempt
+            try:
+                flow_points = data_client.massive_fund_flows(
+                    universe,
+                    processed_date_gte=start_text,
+                    limit=min(max(len(universe) * (analysis_lookback_days + 20), 1000), 5000),
+                )
+            except Exception as exc:
+                flow_errors.append(type(exc).__name__)
+                flow_points = []
+            if flow_points:
+                break
+            if attempt < fetch_attempts and fetch_retry_sec:
+                time.sleep(fetch_retry_sec * attempt)
         fetched_flow_map: Dict[str, List[FlowPoint]] = {symbol: [] for symbol in universe}
         for point in flow_points:
             if point.composite_ticker in fetched_flow_map:
@@ -5564,14 +5597,61 @@ def generate_etf_radar_report(
         for points in fetched_flow_map.values():
             points.sort(key=lambda item: (item.effective_date, item.processed_date))
 
+        for symbol in universe:
+            attempts = batch_attempts
+            errors = list(flow_errors)
+            if not fetched_flow_map[symbol]:
+                for attempt in range(1, fetch_attempts + 1):
+                    attempts = batch_attempts + attempt
+                    try:
+                        points = data_client.massive_fund_flows(
+                            [symbol],
+                            processed_date_gte=start_text,
+                            limit=min(max(analysis_lookback_days + 20, 1000), 5000),
+                        )
+                    except Exception as exc:
+                        errors.append(type(exc).__name__)
+                        points = []
+                    fetched_flow_map[symbol] = sorted(
+                        [point for point in points if point.composite_ticker == symbol],
+                        key=lambda item: (item.effective_date, item.processed_date),
+                    )
+                    if fetched_flow_map[symbol]:
+                        break
+                    if attempt < fetch_attempts and fetch_retry_sec:
+                        time.sleep(fetch_retry_sec * attempt)
+            fetch_diagnostics["flows"][symbol] = {
+                "attempts": attempts,
+                "point_count": len(fetched_flow_map[symbol]),
+                "status": "complete" if fetched_flow_map[symbol] else "missing",
+                "error_types": errors,
+            }
+
         fetched_price_map: Dict[str, List[PricePoint]] = {}
         for symbol in universe:
-            try:
-                fetched_price_map[symbol] = data_client.fmp_historical_prices(
-                    symbol, from_date=start_text, to_date=end_text
-                )
-            except Exception:
-                fetched_price_map[symbol] = []
+            errors: List[str] = []
+            points: List[PricePoint] = []
+            attempts = 0
+            for attempt in range(1, fetch_attempts + 1):
+                attempts = attempt
+                try:
+                    points = data_client.fmp_historical_prices(
+                        symbol, from_date=start_text, to_date=end_text
+                    )
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+                    points = []
+                if points:
+                    break
+                if attempt < fetch_attempts and fetch_retry_sec:
+                    time.sleep(fetch_retry_sec * attempt)
+            fetched_price_map[symbol] = points
+            fetch_diagnostics["prices"][symbol] = {
+                "attempts": attempts,
+                "point_count": len(points),
+                "status": "complete" if points else "missing",
+                "error_types": errors,
+            }
         return start_text, end_text, fetched_flow_map, fetched_price_map
 
     def fetch_flow_persistence_inputs(target_end: dt.date) -> Dict[str, List[FlowPoint]]:
@@ -5615,6 +5695,77 @@ def generate_etf_radar_report(
                 flow_map=flow_map,
                 asof_date=end,
             )
+
+    required_price_bars = 2
+    required_flow_bars = 1
+    if auto_tune or recompute_history_days > 0:
+        required_price_bars = max(DDM_CORR_LOOKBACK_BARS + 1, max_horizon + 1)
+        required_flow_bars = 20
+    price_counts = {symbol: len(price_map.get(symbol) or []) for symbol in universe}
+    flow_counts = {symbol: len(flow_map.get(symbol) or []) for symbol in universe}
+    latest_price_dates = {
+        symbol: max((point.date for point in price_map.get(symbol) or []), default=None)
+        for symbol in universe
+    }
+    reference_price_date = max(
+        (value for value in latest_price_dates.values() if value),
+        default=None,
+    )
+    missing_price = [symbol for symbol in universe if price_counts[symbol] == 0]
+    missing_flow = [symbol for symbol in universe if flow_counts[symbol] == 0]
+    stale_price = [
+        symbol
+        for symbol in universe
+        if latest_price_dates[symbol]
+        and reference_price_date
+        and latest_price_dates[symbol] != reference_price_date
+    ]
+    insufficient_price = [
+        symbol for symbol in universe if 0 < price_counts[symbol] < required_price_bars
+    ]
+    insufficient_flow = [
+        symbol for symbol in universe if 0 < flow_counts[symbol] < required_flow_bars
+    ]
+    complete_price_symbols = [
+        symbol
+        for symbol in universe
+        if symbol not in missing_price
+        and symbol not in stale_price
+        and symbol not in insufficient_price
+    ]
+    complete_flow_symbols = [
+        symbol
+        for symbol in universe
+        if symbol not in missing_flow and symbol not in insufficient_flow
+    ]
+    audit_failures = missing_price + missing_flow + stale_price + insufficient_price + insufficient_flow
+    market_input_audit: Dict[str, Any] = {
+        "status": "complete" if not audit_failures else "partial",
+        "requested_symbol_count": len(universe),
+        "price_symbol_count": len(complete_price_symbols),
+        "flow_symbol_count": len(complete_flow_symbols),
+        "price_coverage_pct": round(100.0 * len(complete_price_symbols) / len(universe), 2),
+        "flow_coverage_pct": round(100.0 * len(complete_flow_symbols) / len(universe), 2),
+        "required_price_bars": required_price_bars,
+        "required_flow_bars": required_flow_bars,
+        "reference_price_date": reference_price_date,
+        "price_counts": price_counts,
+        "flow_counts": flow_counts,
+        "latest_price_dates": latest_price_dates,
+        "missing_price_symbols": missing_price,
+        "missing_flow_symbols": missing_flow,
+        "stale_price_symbols": stale_price,
+        "insufficient_price_history_symbols": insufficient_price,
+        "insufficient_flow_history_symbols": insufficient_flow,
+        "fetch_attempts_configured": fetch_attempts,
+        "fetch_retry_sec": fetch_retry_sec,
+        "fetch_diagnostics": fetch_diagnostics,
+    }
+    if audit_failures:
+        raise EtfRadarError(
+            "ETF GoStop market input completeness gate failed: "
+            + json.dumps(market_input_audit, ensure_ascii=False, sort_keys=True)
+        )
     market_state = classify_market_state(rows)
     warnings: List[str] = []
     missing_flow = [row.symbol for row in rows if not flow_map.get(row.symbol)]
@@ -5644,6 +5795,7 @@ def generate_etf_radar_report(
         "market_state": market_state,
         "gostop": asdict(gostop),
         "rows": [asdict(row) for row in rows],
+        "market_input_audit": market_input_audit,
         "warnings": warnings,
         "markdown": "",
     }
@@ -5776,7 +5928,7 @@ def _gostop_position_snapshot(report: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def build_gostop_ledger_row(report: Mapping[str, Any]) -> Dict[str, Any]:
-    """Flatten the daily GoStop report into a Google-Sheets-ready audit row."""
+    """Flatten the daily GoStop report into a local audit-ledger row."""
 
     position = _gostop_position_snapshot(report)
     decision = report.get("qqq_decision") or {}
@@ -5805,10 +5957,6 @@ def build_gostop_ledger_row(report: Mapping[str, Any]) -> Dict[str, Any]:
         "json_path": output_paths.get("json"),
         "html_path": output_paths.get("html"),
         "icloud_html_path": output_paths.get("icloud_html"),
-        "google_sheet_url": os.getenv(
-            "ETF_GOSTOP_SHEET_URL",
-            "https://docs.google.com/spreadsheets/d/16yR0Q1ctCsFAa5FDkTfQTiQSefX_JFn62QjybW_anHk/edit",
-        ),
         "action": decision.get("action"),
         "policy_key": decision.get("policy_key"),
         "headline": decision.get("headline"),
@@ -5875,7 +6023,7 @@ def build_gostop_ledger_row(report: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def append_gostop_ledger(report: Mapping[str, Any], ledger_path: str) -> str:
-    """Append a report row to a local CSV that can be imported by Google Sheets."""
+    """Append a report row to the local compatibility CSV ledger."""
 
     path = Path(ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5905,19 +6053,19 @@ def append_gostop_ledger(report: Mapping[str, Any], ledger_path: str) -> str:
 
 def _gostop_history_db_paths() -> List[Path]:
     local_raw = os.getenv("ETF_GOSTOP_HISTORY_DB_PATH", str(DEFAULT_GOSTOP_HISTORY_DB_PATH))
-    local = Path(os.path.expandvars(local_raw))
+    local = Path(os.path.expandvars(local_raw)).expanduser().resolve()
     cloud_default = str(DEFAULT_GOSTOP_ICLOUD_HISTORY_DB_PATH)
     cloud_raw = os.getenv("ETF_GOSTOP_ICLOUD_HISTORY_DB_PATH", cloud_default)
     paths = [local]
     if cloud_raw:
-        paths.append(Path(os.path.expandvars(cloud_raw)))
+        paths.append(Path(os.path.expandvars(cloud_raw)).expanduser().resolve())
     unique: List[Path] = []
     seen = set()
     for path in paths:
-        key = str(path.expanduser())
+        key = str(path)
         if key not in seen:
             seen.add(key)
-            unique.append(path.expanduser())
+            unique.append(path)
     return unique
 
 
@@ -6090,126 +6238,6 @@ def append_gostop_history_db(report: Mapping[str, Any]) -> List[str]:
     """Write the current GoStop report to local and iCloud SQLite history DBs."""
 
     return upsert_gostop_history_row(build_gostop_ledger_row(report))
-
-
-def _extract_google_sheet_id(value: Optional[str]) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    marker = "/spreadsheets/d/"
-    if marker in raw:
-        return raw.split(marker, 1)[1].split("/", 1)[0]
-    return raw
-
-
-def _sheet_range(sheet_name: Optional[str], a1_range: str) -> str:
-    name = str(sheet_name or "").strip()
-    if not name:
-        return a1_range
-    escaped = name.replace("'", "''")
-    return f"'{escaped}'!{a1_range}"
-
-
-def append_gostop_google_sheet(
-    report: Mapping[str, Any],
-    *,
-    credentials_path: Optional[str] = None,
-    spreadsheet_id: Optional[str] = None,
-    sheet_name: Optional[str] = None,
-) -> str:
-    """Append a GoStop audit row to Google Sheets.
-
-    Service-account credentials remain supported. On DGX, a stale Mac service
-    account path is ignored and the existing ``~/.clasprc.json`` OAuth token is
-    used as the fallback Sheets API credential.
-    """
-
-    credentials_file = existing_nonlegacy_file(
-        str(
-            credentials_path
-            or os.getenv("ETF_GOSTOP_GOOGLE_CREDENTIALS")
-            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            or ""
-        ).strip()
-    )
-
-    sheet_id = _extract_google_sheet_id(
-        spreadsheet_id
-        or os.getenv("ETF_GOSTOP_SHEET_ID")
-        or os.getenv("ETF_GOSTOP_SHEET_URL")
-        or "https://docs.google.com/spreadsheets/d/16yR0Q1ctCsFAa5FDkTfQTiQSefX_JFn62QjybW_anHk/edit"
-    )
-    if not sheet_id:
-        raise RuntimeError("Google Sheets spreadsheet id is not configured")
-
-    try:
-        from google.auth.transport.requests import AuthorizedSession
-        from google.oauth2.credentials import Credentials
-        from google.oauth2 import service_account
-    except Exception as exc:
-        raise RuntimeError(f"google-auth is not available: {exc}") from exc
-
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    auth_mode = "service_account"
-    if credentials_file:
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_file,
-            scopes=scopes,
-        )
-    else:
-        clasprc = Path(os.getenv("CLASPRC_PATH", str(Path.home() / ".clasprc.json"))).expanduser()
-        if not clasprc.exists():
-            raise RuntimeError(
-                "Google Sheets credentials are not configured and ~/.clasprc.json is missing"
-            )
-        data = json.loads(clasprc.read_text(encoding="utf-8"))
-        token_data = data.get("tokens", {}).get("default") if isinstance(data.get("tokens"), dict) else None
-        if not isinstance(token_data, dict):
-            token_data = data.get("tokens") if isinstance(data.get("tokens"), dict) else data
-        required = ("client_id", "client_secret", "refresh_token")
-        if not isinstance(token_data, dict) or not all(token_data.get(key) for key in required):
-            raise RuntimeError(f"Could not find clasp OAuth refresh token fields in {clasprc}")
-        credentials = Credentials(
-            token=None,
-            refresh_token=str(token_data["refresh_token"]),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=str(token_data["client_id"]),
-            client_secret=str(token_data["client_secret"]),
-            scopes=scopes,
-        )
-        auth_mode = "clasp_oauth"
-    session = AuthorizedSession(credentials)
-    base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values"
-    target_sheet = sheet_name if sheet_name is not None else os.getenv("ETF_GOSTOP_SHEET_NAME", "")
-    header_range = _sheet_range(target_sheet, "A1:ZZ1")
-    row = build_gostop_ledger_row(report)
-    desired_headers = list(row.keys())
-
-    header_resp = session.get(f"{base_url}/{requests.utils.quote(header_range, safe='')}")
-    header_resp.raise_for_status()
-    values = header_resp.json().get("values") or []
-    headers = [str(item) for item in values[0]] if values else []
-    if not headers:
-        headers = desired_headers
-    else:
-        headers = headers + [key for key in desired_headers if key not in headers]
-
-    update_resp = session.put(
-        f"{base_url}/{requests.utils.quote(header_range, safe='')}",
-        params={"valueInputOption": "RAW"},
-        json={"values": [headers]},
-    )
-    update_resp.raise_for_status()
-
-    append_range = _sheet_range(target_sheet, "A1")
-    append_resp = session.post(
-        f"{base_url}/{requests.utils.quote(append_range, safe='')}:append",
-        params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
-        json={"values": [[row.get(header, "") for header in headers]]},
-    )
-    append_resp.raise_for_status()
-    updated_range = (append_resp.json().get("updates") or {}).get("updatedRange") or append_range
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#range={updated_range}&auth={auth_mode}"
 
 
 def _html_metric(label: str, value: str, caption: str = "", tone: str = "") -> str:
@@ -6451,50 +6479,56 @@ def render_gostop_html(report: Mapping[str, Any]) -> str:
 <div class="section"><div class="sectionTitle">Correlated Basket Resistance</div><div class="scroll"><div class="tableWrap"><table class="data"><thead><tr><th>ETF</th><th>Corr</th><th>Pressure</th><th>5D Price</th><th>5D Flow/AUM</th><th>1D</th></tr></thead><tbody>{component_rows(ddm.get('resistance') or [])}</tbody></table></div></div></div>
 <div class="section"><div class="sectionTitle">Market Context</div><div class="noteBox"><div class="noteLine">State: {_html_escape(state.get('label'))} · Greed { _html_escape(state.get('greed_score'))}/100 · NowCast { _html_escape(nowcast.get('score'))}/100 · Risk day {_fmt_pct(_to_float(nowcast.get('risk_day_avg_pct')))}</div><div class="noteLine">{_html_escape(state.get('summary') or '')}</div></div></div>
 	<div class="section"><div class="sectionTitle">Barchart Options/Futures Reference</div><div class="noteBox"><div class="noteLine"><strong>Status:</strong> {_html_escape(options_ref.get('status'))} · QQQ options {_html_escape(options_ref.get('qqq_options_pages_confirmed') or 0)}/{_html_escape(options_ref.get('qqq_options_pages_total') or 0)} · futures {_html_escape(options_ref.get('futures_pages_confirmed') or 0)}</div><div class="noteLine">{_html_escape(options_ref.get('interpretation') or '')}</div><div class="noteLine"><strong>Options explanation:</strong> {_html_escape(options_ddm_explain.get('option_read') or '')}</div><div class="noteLine"><strong>Combined read:</strong> {_html_escape(options_ddm_explain.get('risk_read') or '')}</div><div class="noteLine">Evidence: {_html_escape(options_ref.get('evidence_path') or 'N/A')}</div></div><div class="scroll"><div class="tableWrap"><table class="data"><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>{options_rows}</tbody></table></div></div></div>
-<div class="footer">{_html_escape(freshness.get('futures_options_reference_line'))}<br>Automatically generated by ETF GoStop. Local CSV ledger is Google-Sheets-ready. Not investment advice.</div>
+<div class="footer">{_html_escape(freshness.get('futures_options_reference_line'))}<br>Automatically generated by ETF GoStop. Local CSV ledger is a compatibility export; SQLite is the history source of truth. Not investment advice.</div>
 </div></td></tr></table></td></tr></table></body></html>"""
 
 
 def save_report(
     report: Mapping[str, Any],
     *,
-    output_dir: str = "sweet_spot_reports",
+    output_dir: str = str(DEFAULT_GOSTOP_DATA_DIR),
     write_json: bool = True,
     write_html: bool = False,
     icloud_dir: Optional[str] = None,
     append_ledger: bool = False,
     ledger_path: Optional[str] = None,
     append_history_db: bool = True,
-    append_google_sheet: bool = False,
-    google_credentials_path: Optional[str] = None,
-    google_sheet_id: Optional[str] = None,
-    google_sheet_name: Optional[str] = None,
 ) -> Dict[str, str]:
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(KST).strftime("%Y%m%d_%H%M%S")
-    md_path = Path(output_dir) / f"etf_gostop_{stamp}.md"
+    md_path = output_root / f"etf_gostop_{stamp}.md"
     md_path.write_text(str(report.get("markdown") or ""), encoding="utf-8")
     paths = {"markdown": str(md_path)}
     if write_json:
-        json_path = Path(output_dir) / f"etf_gostop_{stamp}.json"
+        json_path = output_root / f"etf_gostop_{stamp}.json"
         json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         paths["json"] = str(json_path)
     if write_html:
         html_doc = str(report.get("html") or render_gostop_html(report))
-        html_path = Path(output_dir) / f"etf_gostop_{stamp}.html"
+        html_root = (
+            Path(icloud_dir).expanduser().resolve()
+            if icloud_dir
+            else output_root.parent
+            if output_root.name == "data"
+            else output_root
+        )
+        html_root.mkdir(parents=True, exist_ok=True)
+        html_path = html_root / f"etf_gostop_{stamp}.html"
         html_path.write_text(html_doc, encoding="utf-8")
         paths["html"] = str(html_path)
         if icloud_dir:
-            try:
-                cloud_dir = Path(icloud_dir)
-                cloud_dir.mkdir(parents=True, exist_ok=True)
-                cloud_path = cloud_dir / html_path.name
-                cloud_path.write_text(html_doc, encoding="utf-8")
-                paths["icloud_html"] = str(cloud_path)
-            except Exception as exc:
-                paths["icloud_error"] = str(exc)
+            # ``--icloud-dir`` is the historical compatibility name for the
+            # human-facing report root.  On DGX it intentionally resolves to
+            # the canonical DGX output directory rather than a Mac mount, but
+            # the ledger contract still requires the companion field.
+            paths["icloud_html"] = str(html_path)
     if append_ledger:
-        ledger = ledger_path or str(Path(output_dir) / "etf_gostop_sheet_rows.csv")
+        ledger = str(
+            Path(ledger_path or str(output_root / "etf_gostop_sheet_rows.csv"))
+            .expanduser()
+            .resolve()
+        )
         try:
             ledger_report = dict(report)
             ledger_report["output_paths"] = dict(paths)
@@ -6512,18 +6546,6 @@ def save_report(
                 paths["icloud_history_db"] = db_paths[1]
         except Exception as exc:
             paths["history_db_error"] = str(exc)
-    if append_google_sheet:
-        try:
-            sheet_report = dict(report)
-            sheet_report["output_paths"] = dict(paths)
-            paths["google_sheet"] = append_gostop_google_sheet(
-                sheet_report,
-                credentials_path=google_credentials_path,
-                spreadsheet_id=google_sheet_id,
-                sheet_name=google_sheet_name,
-            )
-        except Exception as exc:
-            paths["google_sheet_error"] = str(exc)
     return paths
 
 
@@ -6626,7 +6648,7 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--symbols", default=",".join(DEFAULT_UNIVERSE))
     parser.add_argument("--lookback-days", type=int, default=90)
     parser.add_argument("--asof-date", default=None)
-    parser.add_argument("--output-dir", default="sweet_spot_reports")
+    parser.add_argument("--output-dir", default=str(DEFAULT_GOSTOP_DATA_DIR))
     parser.add_argument("--no-json", action="store_true")
     parser.add_argument("--print", action="store_true", dest="print_report")
     args = parser.parse_args()

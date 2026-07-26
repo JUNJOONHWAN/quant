@@ -1,0 +1,25 @@
+[Unit]
+Description=Complete Qwen3-8B quant LoRA training frozen evaluation and release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONPATH=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/status
+ExecStart=/usr/bin/python3 -m training.quant_llm.complete_training_release --expected-final-step 14027 --wait-seconds 300 --max-resume-attempts 5
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=2
+TimeoutStartSec=infinity
+TimeoutStopSec=300
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+StandardOutput=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs/qwen3_8b_training_completion.log
+StandardError=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/logs/qwen3_8b_training_completion.log
+
+[Install]
+WantedBy=default.target

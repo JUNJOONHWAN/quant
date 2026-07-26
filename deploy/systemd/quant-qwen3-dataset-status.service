@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot Qwen3-8B quant dataset materialization progress
+ConditionPathExists=/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v2/materialization_state.sqlite3
+ConditionPathExists=!/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v2/manifest.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+ExecStart=/usr/bin/python3 -m training.quant_llm.materialization_status /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v2 --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/status/qwen3_8b_materialization_latest.json --append-jsonl /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/status/qwen3_8b_materialization_history.jsonl

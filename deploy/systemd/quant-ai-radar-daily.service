@@ -1,0 +1,23 @@
+[Unit]
+Description=Daily full-universe FMP Massive ETF RADAR trained-AI analysis
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/home/zooh/.config/quant/quant-ai-radar.env
+ConditionPathExists=/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/qwen3_8b_quant_lora_v1/release_manifest.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONPATH=/home/zooh/Documents/GitHub/quant
+EnvironmentFile=/home/zooh/.config/quant/quant-ai-radar.env
+ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs
+ExecStart=/home/zooh/Documents/GitHub/ETFRADAR/.venv/bin/python -m workflows.quant_ai_radar.run_daily_cycle
+TimeoutStartSec=infinity
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+StandardOutput=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs/daily.log
+StandardError=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs/daily.log
+
+[Install]
+WantedBy=default.target

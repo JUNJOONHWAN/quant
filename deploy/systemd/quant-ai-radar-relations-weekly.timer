@@ -1,0 +1,12 @@
+[Unit]
+Description=KST Sunday 14:00 ETF constituent refresh (stored UTC)
+
+[Timer]
+# KST intent: Sunday 14:00 Asia/Seoul. Stored/executed: Sunday 05:00 UTC.
+OnCalendar=Sun *-*-* 05:00:00 UTC
+Persistent=true
+RandomizedDelaySec=0
+Unit=quant-ai-radar-relations-weekly.service
+
+[Install]
+WantedBy=timers.target

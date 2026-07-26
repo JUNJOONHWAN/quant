@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly KST Qwen3-8B quant dataset materialization status snapshot
+
+[Timer]
+OnCalendar=*-*-* *:05:00 Asia/Seoul
+Persistent=true
+RandomizedDelaySec=0
+Unit=quant-qwen3-dataset-status.service
+
+[Install]
+WantedBy=timers.target

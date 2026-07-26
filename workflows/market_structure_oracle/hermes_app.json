@@ -1,0 +1,65 @@
+{
+  "app_id": "market-structure-oracle",
+  "capabilities": {
+    "required": [
+      "filesystem",
+      "terminal"
+    ]
+  },
+  "category": "report",
+  "contracts": {
+    "external_overlay": false,
+    "flow_policy_id": "massive_etf_flow_us_sessions_v1",
+    "future_returns_role": "labels_only",
+    "lookahead_in_features": false,
+    "output_schema": "quant.market_structure_oracle.v1",
+    "source_database_mode": "read_only_query_only"
+  },
+  "description": "Hermes Worker가 동결된 전수 일봉과 ETF Flow D+2 관측 뷰로 시장 구조, 과거 유사 상태, 후속 경로 분포와 워크포워드 검증을 생성한다.",
+  "execution": {
+    "bypass_operations_worker": false,
+    "default_worker": "hermes-worker-general",
+    "worker_skills": [
+      "quant-market-analysis"
+    ]
+  },
+  "final_gates": [
+    {
+      "equals": 0,
+      "type": "exit_code"
+    },
+    {
+      "type": "stdout_nonempty"
+    }
+  ],
+  "managed": true,
+  "name": "Market Structure Oracle",
+  "ownership": {
+    "control_plane": "operations",
+    "logic_owner": "application",
+    "multitool_runtime_dependency": false,
+    "supervisor_adapter_dependency": false
+  },
+  "preflight": {
+    "env": {
+      "MARKET_STRUCTURE_ORACLE_PREFLIGHT_ONLY": "1"
+    },
+    "production_completion_claim_allowed": false,
+    "success_status": "PREFLIGHT_PASS"
+  },
+  "registered_at": "2026-07-26T11:26:26.347454Z",
+  "runtime": {
+    "agent_selection": "not-applicable",
+    "entrypoint": "/home/zooh/Documents/GitHub/quant/workflows/market_structure_oracle/run_market_structure_oracle.py",
+    "kind": "script",
+    "timeout_seconds": 7200,
+    "workdir": "/home/zooh/Documents/GitHub/quant"
+  },
+  "schedule": {
+    "enabled": false,
+    "owner": "operations",
+    "timezone": "Asia/Seoul"
+  },
+  "schema": "hermes-independent-app-v1",
+  "updated_at": "2026-07-26T11:26:26.347473Z"
+}

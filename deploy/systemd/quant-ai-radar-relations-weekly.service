@@ -1,0 +1,20 @@
+[Unit]
+Description=Weekly FMP universe and PIT ETF constituent relationship refresh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONPATH=/home/zooh/Documents/GitHub/quant
+ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs
+ExecStart=/home/zooh/Documents/GitHub/ETFRADAR/.venv/bin/python -m workflows.quant_ai_radar.refresh_weekly_relations
+TimeoutStartSec=infinity
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+StandardOutput=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs/weekly_relations.log
+StandardError=append:/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs/weekly_relations.log
+
+[Install]
+WantedBy=default.target

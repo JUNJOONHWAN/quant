@@ -40,8 +40,8 @@ from market_analysis.etf_radar import (
 
 
 MANAGED_SYMBOLS = ("QQQ", "TQQQ")
-DEFAULT_OUTPUT_DIR = Path("sweet_spot_reports") / "backtests"
-DEFAULT_INTRADAY_CACHE_DIR = Path("sweet_spot_reports") / "intraday_cache"
+DEFAULT_OUTPUT_DIR = Path("/home/zooh/Documents/DGX_Outputs/STOCK/ETF GoStop/data/backtests")
+DEFAULT_INTRADAY_CACHE_DIR = Path("/home/zooh/Documents/DGX_Outputs/STOCK/ETF GoStop/data/intraday_cache")
 
 
 @dataclass(frozen=True)
