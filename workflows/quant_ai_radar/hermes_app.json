@@ -14,13 +14,16 @@
     "new_listing_policy": "Massive grouped daily discovers new securities; Massive flow and FMP profiles discover new ETFs; Oracle refreshes missing constituent snapshots first",
     "daily_default_action": "reference_publish",
     "daily_inference_policy": "dynamic material-evidence selection with maximum 64 ETFs and 192 stocks",
-    "flow_policy": "provider availability D+1/D+2 point-in-time; no post-as-of visibility",
+    "flow_policy": "provider availability D+1/D+2 point-in-time plus a 10-calendar-day current-observation gate and absolute flow-to-net-assets plausibility gate; no post-as-of visibility",
     "lookahead_in_features": false,
     "on_demand_policy": "explicit symbols bypass daily capacity selection but must pass the same packet and model gates",
+    "natural_request_policy": "action=ask accepts a bounded question, runs fresh trained-model inference for explicit tickers, and answers market, candidate, or rotation requests only from the latest Oracle-date-matched green AI Radar report",
     "output_schema": "quant.ai_radar_app_result.v1",
     "request_input": {
       "fields": [
         "action",
+        "question",
+        "query",
         "symbols",
         "shadow",
         "workers",

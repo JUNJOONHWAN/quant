@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from quant_dataset.etf_flow_exposure import ETF_CONSTITUENT_FLOW_POLICY_ID
 from workflows.quant_ai_radar.decision_support import (
     audit_report_quality,
     build_market_dashboard,
@@ -42,6 +43,7 @@ def judgement(symbol: str = "AAPL") -> dict:
                 "visible_observations": 0,
             },
             "etf_flow_to_constituent": {
+                "policy_id": ETF_CONSTITUENT_FLOW_POLICY_ID,
                 "eligible_etf_count": 396,
                 "excluded_etf_count": 310,
                 "positive_etf_count": 61,
@@ -181,6 +183,22 @@ class QuantAiRadarQualityTest(unittest.TestCase):
             market_semantic_issues(market, catalog),
         )
 
+    def test_market_semantic_gate_rejects_meta_placeholder_language(self):
+        issues = market_semantic_issues(
+            {
+                "summary": (
+                    "시장의 폭과 흐름, 회전, 분열을 한국어로 해석하며 "
+                    "근거를 제시하지 않음"
+                ),
+                "unknowns": ["한국어 제한"],
+                "confirmations": [],
+                "contradictions": [],
+            },
+            {},
+        )
+        self.assertIn("market_summary_contains_meta_language", issues)
+        self.assertIn("market_unknown_contains_meta_language", issues)
+
     def test_symbol_contract_rejects_signal_regime_mismatch(self):
         expected = judgement()
         observed = copy.deepcopy(expected)
@@ -203,7 +221,11 @@ class QuantAiRadarQualityTest(unittest.TestCase):
         value = {
             "market_state": "rotation",
             "confidence": 0.7,
-            "summary": "가격 폭과 ETF Flow, 회전 cluster, 구성종목 전달이 서로 다른 강도로 나타나 회전 상태로 해석합니다.",
+            "summary": (
+                "시장 가격 폭은 한 방향으로 수렴하지 않고 ETF 자금 흐름과 "
+                "섹터 회전이 엇갈리며, 구성종목 전달의 괴리와 지속 위험을 "
+                "함께 확인해야 하는 회전 국면입니다."
+            ),
             "confirmations": [
                 {
                     "evidence_id": "aggregate.regime_counts",
@@ -316,6 +338,7 @@ class QuantAiRadarQualityTest(unittest.TestCase):
             ).read_text(encoding="utf-8")
         self.assertIn("정확 집계 기반 시장 구조", market_html)
         self.assertIn("섹터·테마 회전", market_html)
+        self.assertIn("AI Radar 판단 후보군", market_html)
         self.assertIn("가격 구조", security_html)
         self.assertIn("ETF Flow 전달", security_html)
         self.assertIn("상위 ETF→종목 기여 경로", security_html)

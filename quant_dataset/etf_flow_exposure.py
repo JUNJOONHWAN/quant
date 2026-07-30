@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+from datetime import date
 from typing import Any, Dict, Mapping, Sequence
 
 
-ETF_CONSTITUENT_FLOW_POLICY_ID = "pit_etf_flow_to_constituent_weight_v1"
+ETF_CONSTITUENT_FLOW_POLICY_ID = "pit_etf_flow_to_constituent_weight_v2"
+MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS = 10
+MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT = 100.0
 
 
 def _number(value: object):
@@ -21,6 +24,49 @@ def _number(value: object):
 
 def _round(value, digits: int = 8):
     return round(value, digits) if value is not None and math.isfinite(value) else None
+
+
+def flow_age_calendar_days(as_of_date: str, effective_date: object) -> int | None:
+    """Return the non-negative calendar age of a provider flow observation."""
+
+    try:
+        age = (
+            date.fromisoformat(as_of_date)
+            - date.fromisoformat(str(effective_date))
+        ).days
+    except (TypeError, ValueError):
+        return None
+    return age
+
+
+def flow_quality_reasons(
+    *,
+    as_of_date: str,
+    effective_date: object,
+    processed_date: object,
+    available_date: object,
+    flow_to_net_assets_pct: object,
+) -> list[str]:
+    """Apply the shared fail-closed current-flow transmission policy."""
+
+    reasons: list[str] = []
+    age = flow_age_calendar_days(as_of_date, effective_date)
+    if age is None:
+        reasons.append("etf_flow_effective_date_invalid")
+    elif age < 0:
+        reasons.append("etf_flow_effective_date_after_as_of")
+    elif age > MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS:
+        reasons.append("etf_flow_stale_latest_observation")
+    if not processed_date or str(processed_date) > as_of_date:
+        reasons.append("etf_flow_processed_date_after_as_of_or_missing")
+    if not available_date or str(available_date) > as_of_date:
+        reasons.append("etf_flow_not_available_as_of")
+    flow_rate = _number(flow_to_net_assets_pct)
+    if flow_rate is None:
+        reasons.append("etf_flow_rate_missing_or_nonfinite")
+    elif abs(flow_rate) > MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT:
+        reasons.append("etf_flow_rate_outside_plausibility_gate")
+    return reasons
 
 
 def build_constituent_flow_exposure(
@@ -90,20 +136,11 @@ def build_constituent_flow_exposure(
         flow = flow_packet.get("latest")
         if not flow:
             reasons.append("no_etf_flow_visible_as_of")
-        elif str(flow.get("training_available_session_date") or "") > as_of_date:
-            reasons.append("etf_flow_not_available_as_of")
         fund_flow = _number(flow.get("fund_flow")) if flow else None
         if fund_flow is None:
             reasons.append("fund_flow_missing_or_nonfinite")
-        if reasons:
-            excluded_etfs += 1
-            for reason in reasons:
-                exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
-            continue
-
-        weight = membership["membership_weight_percent"]
-        nav = _number(flow.get("nav"))
-        shares = _number(flow.get("shares_outstanding"))
+        nav = _number(flow.get("nav")) if flow else None
+        shares = _number(flow.get("shares_outstanding")) if flow else None
         estimated_net_assets = (
             nav * shares if nav is not None and nav > 0 and shares is not None and shares > 0 else None
         )
@@ -112,6 +149,25 @@ def build_constituent_flow_exposure(
             if estimated_net_assets not in (None, 0.0)
             else None
         )
+        if flow:
+            reasons.extend(
+                flow_quality_reasons(
+                    as_of_date=as_of_date,
+                    effective_date=flow.get("effective_date"),
+                    processed_date=flow.get("processed_date"),
+                    available_date=flow.get(
+                        "training_available_session_date"
+                    ),
+                    flow_to_net_assets_pct=flow_rate_pct,
+                )
+            )
+        if reasons:
+            excluded_etfs += 1
+            for reason in sorted(set(reasons)):
+                exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+            continue
+
+        weight = membership["membership_weight_percent"]
         allocated = fund_flow * weight / 100.0
         rows.append(
             {
@@ -159,6 +215,15 @@ def build_constituent_flow_exposure(
         "as_of_date": as_of_date,
         "allocation_rule": "fund_flow * point_in_time_constituent_weight_percent / 100",
         "flow_visibility_rule": "massive_etf_flow_us_sessions_v1",
+        "flow_quality_policy": {
+            "maximum_observation_age_calendar_days": (
+                MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS
+            ),
+            "maximum_absolute_flow_to_net_assets_pct": (
+                MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT
+            ),
+            "fail_closed": True,
+        },
         "membership_visibility_rule": (
             "fmp_etf_constituent_next_us_session_v1: "
             "training_available_session_date <= as_of"

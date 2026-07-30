@@ -315,6 +315,34 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
         )
         for row in dashboard.get("affected_stocks") or []
     )
+    candidate_lanes = dashboard.get("candidate_lanes") or {}
+
+    def candidate_rows(key: str) -> str:
+        return "".join(
+            "<tr><td><a href=\"security_reports/{}.html\">{}</a></td>"
+            "<td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                _e(row.get("symbol")),
+                _e(row.get("symbol")),
+                _e(row.get("regime")),
+                _e(row.get("confidence")),
+                _e(
+                    row.get("latest_robust_zscore")
+                    if row.get("latest_robust_zscore") is not None
+                    else row.get("net_weighted_flow_rate_contribution_pct")
+                ),
+            )
+            for row in candidate_lanes.get(key) or []
+        )
+
+    positive_candidates = candidate_rows(
+        "positive_confirmation_etfs"
+    ) + candidate_rows("positive_confirmation_stocks")
+    negative_candidates = candidate_rows(
+        "negative_confirmation_etfs"
+    ) + candidate_rows("negative_confirmation_stocks")
+    divergence_candidates = candidate_rows("divergence_etfs") + candidate_rows(
+        "divergence_stocks"
+    )
     score_pills = "".join(
         f'<span class="pill">{_e(name)} {_e(score)}/10</span>'
         for name, score in (quality.get("scores") or {}).items()
@@ -343,6 +371,19 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
   <div><div class="muted">ETF Flow 양수 비중</div><div class="metric">{_e(breadth.get("etf_flow_positive_pct"))}%</div></div>
   <div><div class="muted">확인 국면</div><div class="metric">{_e(breadth.get("confirmation_count"))}</div></div>
   <div><div class="muted">괴리 국면</div><div class="metric">{_e(breadth.get("divergence_count"))}</div></div>
+ </div>
+</section>
+<section class="card"><h2>AI Radar 판단 후보군</h2>
+ <p class="muted">가격과 ETF Flow가 함께 확인된 관찰 후보와 약세 위험 후보를
+ 분리합니다. 매수·매도 주문 신호가 아니며, 괴리 후보는 방향 확정 전에 추가
+ 확인이 필요합니다.</p>
+ <div class="grid">
+  <div><h3>강세 확인 관찰</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+   <tbody>{positive_candidates or '<tr><td colspan="4">동시 확인 후보 없음</td></tr>'}</tbody></table></div>
+  <div><h3>약세 확인 위험</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+   <tbody>{negative_candidates or '<tr><td colspan="4">동시 약세 후보 없음</td></tr>'}</tbody></table></div>
+  <div><h3>가격–Flow 괴리</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+   <tbody>{divergence_candidates or '<tr><td colspan="4">괴리 후보 없음</td></tr>'}</tbody></table></div>
  </div>
 </section>
 <div class="grid">

@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
@@ -14,10 +14,21 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from quant_dataset.shared_market import SharedReadOnlyDatabase
 from quant_dataset.storage import canonical_json
+from quant_dataset.etf_flow_exposure import flow_quality_reasons
+from quant_dataset.point_in_time import (
+    US_EQUITY_SESSION_SQL,
+    derive_etf_flow_available_session,
+    normalize_trading_sessions,
+)
 from workflows.quant_ai_radar.universe import Candidate
 
 
 FEATURE_SCHEMA = "quant.oracle_market_features.v1"
+ETF_SELECTION_QUALITY_POLICY_ID = "training_aligned_current_etf_evidence_v2"
+MIN_ETF_OBSERVED_SESSIONS = 10
+MIN_ETF_NONZERO_VOLUME_RATIO = 0.75
+MIN_ETF_MEDIAN_DOLLAR_VOLUME = 1_000_000.0
+MAX_ABSOLUTE_ROBUST_Z_FOR_RANKING = 8.0
 
 
 def _finite(value: Any) -> float | None:
@@ -92,12 +103,15 @@ def _flow_history(
     start = (date.fromisoformat(as_of_date) - timedelta(days=220)).isoformat()
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
     with database.connect() as connection:
+        sessions = normalize_trading_sessions(
+            row[0] for row in connection.execute(US_EQUITY_SESSION_SQL)
+        )
         for chunk in _chunks(tickers):
             placeholders = ",".join("?" for _ in chunk)
             rows = connection.execute(
                 f"""
                 SELECT ticker,effective_date,processed_date,available_at_date,
-                       fund_flow,assets
+                       fund_flow,assets,nav,shares_outstanding
                 FROM etf_flow_observations
                 WHERE ticker IN ({placeholders})
                   AND effective_date BETWEEN ? AND ?
@@ -109,8 +123,24 @@ def _flow_history(
                 (*chunk, start, as_of_date, as_of_date, as_of_date, as_of_date),
             )
             for row in rows:
+                training_available = derive_etf_flow_available_session(
+                    row[1], row[2], sessions
+                )
+                if training_available is None or training_available > as_of_date:
+                    continue
                 fund_flow = _finite(row[4])
                 assets = _finite(row[5])
+                nav = _finite(row[6])
+                shares = _finite(row[7])
+                if assets is None or assets <= 0:
+                    assets = (
+                        nav * shares
+                        if nav is not None
+                        and nav > 0
+                        and shares is not None
+                        and shares > 0
+                        else None
+                    )
                 flow_rate = (
                     fund_flow / assets * 100.0
                     if fund_flow is not None and assets not in (None, 0.0)
@@ -120,9 +150,12 @@ def _flow_history(
                     {
                         "effective_date": str(row[1]),
                         "processed_date": str(row[2]),
-                        "available_at_date": str(row[3]),
+                        "provider_available_at_date": str(row[3]),
+                        "available_at_date": training_available,
                         "fund_flow": fund_flow,
                         "assets": assets,
+                        "nav": nav,
+                        "shares_outstanding": shares,
                         "flow_to_assets_pct": flow_rate,
                     }
                 )
@@ -199,13 +232,41 @@ def _etf_rows(
     etf_symbols: Sequence[str],
     prices: Mapping[str, Sequence[tuple[str, float, float]]],
     flows: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> list[dict[str, Any]]:
+    as_of_date: str,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     rows = []
+    exclusion_counts: Counter[str] = Counter()
     for ticker in etf_symbols:
         history = list(prices.get(ticker) or [])
         flow_history = list(flows.get(ticker) or [])
         if not history or not flow_history:
+            exclusion_counts["missing_price_or_flow_history"] += 1
             continue
+        liquidity_window = history[-20:]
+        positive_volume_rows = [
+            row for row in liquidity_window if float(row[2]) > 0
+        ]
+        dollar_volumes = [
+            float(row[1]) * float(row[2]) for row in positive_volume_rows
+        ]
+        quality_reasons: list[str] = []
+        if history[-1][0] != as_of_date:
+            quality_reasons.append("etf_no_same_session_price")
+        if len(liquidity_window) < MIN_ETF_OBSERVED_SESSIONS:
+            quality_reasons.append("etf_insufficient_trailing_sessions")
+        nonzero_ratio = (
+            len(positive_volume_rows) / len(liquidity_window)
+            if liquidity_window
+            else 0.0
+        )
+        if nonzero_ratio < MIN_ETF_NONZERO_VOLUME_RATIO:
+            quality_reasons.append("etf_low_nonzero_volume_ratio")
+        median_dollar_volume = median(dollar_volumes) if dollar_volumes else None
+        if (
+            median_dollar_volume is None
+            or median_dollar_volume < MIN_ETF_MEDIAN_DOLLAR_VOLUME
+        ):
+            quality_reasons.append("etf_low_median_dollar_volume")
         closes = [row[1] for row in history]
         flow_rates = [
             float(row["flow_to_assets_pct"])
@@ -214,13 +275,28 @@ def _etf_rows(
         ]
         latest = flow_history[-1]
         latest_rate = _finite(latest.get("flow_to_assets_pct"))
+        quality_reasons.extend(
+            flow_quality_reasons(
+                as_of_date=as_of_date,
+                effective_date=latest.get("effective_date"),
+                processed_date=latest.get("processed_date"),
+                available_date=latest.get("available_at_date"),
+                flow_to_net_assets_pct=latest_rate,
+            )
+        )
+        if quality_reasons:
+            exclusion_counts.update(set(quality_reasons))
+            continue
         zscore = _robust_z(flow_rates)
         ret_5d = _return(closes, 5)
         ret_21d = _return(closes, 21)
         flow_5d = sum(flow_rates[-5:]) if flow_rates else 0.0
         flow_21d = sum(flow_rates[-21:]) if flow_rates else 0.0
+        ranking_z = min(
+            abs(zscore or 0.0), MAX_ABSOLUTE_ROBUST_Z_FOR_RANKING
+        )
         score = (
-            abs(zscore or 0.0) * 20.0
+            ranking_z * 20.0
             + min(abs(flow_5d) * 50.0, 50.0)
             + min(abs(ret_21d or 0.0), 25.0)
         )
@@ -243,17 +319,29 @@ def _etf_rows(
                 "latest_available_at_date": latest["available_at_date"],
                 "latest_flow_to_assets_pct": latest_rate,
                 "latest_robust_zscore": zscore,
+                "robust_zscore_for_ranking": (
+                    math.copysign(ranking_z, zscore)
+                    if zscore not in (None, 0.0)
+                    else zscore
+                ),
+                "latest_extreme_outlier_flag": (
+                    abs(zscore) > MAX_ABSOLUTE_ROBUST_Z_FOR_RANKING
+                    if zscore is not None
+                    else False
+                ),
                 "flow_5d_to_assets": flow_5d,
                 "flow_21d_to_assets": flow_21d,
                 "ret_5d": ret_5d,
                 "ret_21d": ret_21d,
                 "dollar_volume": history[-1][1] * history[-1][2],
+                "median_dollar_volume_20s": median_dollar_volume,
+                "nonzero_volume_ratio_20s": nonzero_ratio,
             }
         )
     rows.sort(key=lambda row: (-row["priority_score"], row["ticker"]))
     for rank, row in enumerate(rows, 1):
         row["rank"] = rank
-    return rows
+    return rows, dict(sorted(exclusion_counts.items()))
 
 
 def _stock_rows(
@@ -416,7 +504,9 @@ def build_oracle_market_features(
     }
     prices = _price_history(database, etf_symbols, as_of_date)
     flows = _flow_history(database, etf_symbols, as_of_date)
-    etfs = _etf_rows(etf_symbols, prices, flows)
+    etfs, etf_quality_exclusion_counts = _etf_rows(
+        etf_symbols, prices, flows, as_of_date
+    )
     relation_etfs = [str(row["ticker"]) for row in etfs[:256]]
     constituents = _visible_constituents(database, relation_etfs, as_of_date)
     etf_by_ticker = {str(row["ticker"]): row for row in etfs}
@@ -461,6 +551,17 @@ def build_oracle_market_features(
         "master_flow_status_counts": {
             "visible_pit_flow": len(etfs),
             "missing_or_immaterial": max(len(etf_symbols) - len(etfs), 0),
+        },
+        "etf_evidence_quality": {
+            "policy_id": ETF_SELECTION_QUALITY_POLICY_ID,
+            "fail_closed": True,
+            "minimum_observed_sessions": MIN_ETF_OBSERVED_SESSIONS,
+            "minimum_nonzero_volume_ratio": MIN_ETF_NONZERO_VOLUME_RATIO,
+            "minimum_median_dollar_volume": MIN_ETF_MEDIAN_DOLLAR_VOLUME,
+            "maximum_absolute_robust_z_for_ranking": (
+                MAX_ABSOLUTE_ROBUST_Z_FOR_RANKING
+            ),
+            "exclusion_counts": etf_quality_exclusion_counts,
         },
     }
     payload["snapshot_sha256"] = hashlib.sha256(

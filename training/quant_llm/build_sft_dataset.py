@@ -28,7 +28,10 @@ from quant_dataset.point_in_time import (
     ETF_FLOW_POLICY_ID,
     US_EQUITY_SESSION_SQL,
 )
-from quant_dataset.etf_flow_exposure import ETF_CONSTITUENT_FLOW_POLICY_ID
+from quant_dataset.etf_flow_exposure import (
+    ETF_CONSTITUENT_FLOW_POLICY_ID,
+    flow_quality_reasons,
+)
 from training.quant_llm import DATASET_CONTRACT_VERSION, DATASET_SCHEMA_VERSION
 
 
@@ -397,6 +400,35 @@ def packet_eligibility(
         median_dollar_volume = _as_number(liquidity.get("median_dollar_volume"))
         if median_dollar_volume is None or median_dollar_volume < min_etf_median_dollar_volume:
             reasons.append("etf_low_median_dollar_volume")
+        if flow_rows:
+            latest_flow = flow_rows[-1]
+            fund_flow = _as_number(latest_flow.get("fund_flow"))
+            assets = _as_number(latest_flow.get("assets"))
+            nav = _as_number(latest_flow.get("nav"))
+            shares = _as_number(latest_flow.get("shares_outstanding"))
+            estimated_assets = (
+                assets
+                if assets is not None and assets > 0
+                else nav * shares
+                if nav is not None and nav > 0 and shares is not None and shares > 0
+                else None
+            )
+            flow_rate = (
+                fund_flow / estimated_assets * 100.0
+                if fund_flow is not None and estimated_assets not in (None, 0.0)
+                else None
+            )
+            reasons.extend(
+                flow_quality_reasons(
+                    as_of_date=str(packet.get("as_of_date") or ""),
+                    effective_date=latest_flow.get("effective_date"),
+                    processed_date=latest_flow.get("processed_date"),
+                    available_date=latest_flow.get(
+                        "training_available_session_date"
+                    ),
+                    flow_to_net_assets_pct=flow_rate,
+                )
+            )
     return {
         "eligible": not reasons,
         "is_etf_as_of_packet": is_etf,
@@ -415,6 +447,19 @@ def _flow_facts(observations: Sequence[Mapping[str, Any]]) -> dict:
     latest = observations[-1] if observations else None
     latest_flow = _as_number(latest.get("fund_flow")) if latest else None
     latest_assets = _as_number(latest.get("assets")) if latest else None
+    latest_nav = _as_number(latest.get("nav")) if latest else None
+    latest_shares = (
+        _as_number(latest.get("shares_outstanding")) if latest else None
+    )
+    if latest_assets is None or latest_assets <= 0:
+        latest_assets = (
+            latest_nav * latest_shares
+            if latest_nav is not None
+            and latest_nav > 0
+            and latest_shares is not None
+            and latest_shares > 0
+            else None
+        )
     currencies = sorted({str(row.get("currency")) for row in observations if row.get("currency")})
     comparable = len(currencies) <= 1
     median_flow = statistics.median(numeric) if numeric else None

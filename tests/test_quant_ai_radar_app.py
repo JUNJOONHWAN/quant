@@ -129,6 +129,77 @@ class QuantAiRadarAppTest(unittest.TestCase):
             ["AAPL", "NVDA"],
         )
 
+    def test_natural_question_routes_explicit_ticker_to_fresh_analysis(self):
+        with mock.patch.object(
+            app_cli,
+            "run_analysis",
+            return_value={"status": "PASS", "results": [{"symbol": "AAPL"}]},
+        ) as run_analysis:
+            result = app_cli.run_question("AI Radar에 AAPL 분석해줘")
+        run_analysis.assert_called_once_with(["AAPL"])
+        self.assertEqual(result["intent"], "explicit_symbol_analysis")
+        self.assertEqual(
+            result["answer_basis"], "fresh_on_demand_trained_model_inference"
+        )
+
+    def test_natural_candidate_question_uses_only_fresh_green_report(self):
+        report = {
+            "as_of_date": "2026-07-29",
+            "quality_audit": {
+                "schema_version": app_cli.QUALITY_SCHEMA_VERSION,
+                "status": "green",
+                "publishable_reference_report": True,
+                "scores": {"flow_evidence_quality": 10.0},
+            },
+            "market_judgement": {
+                "market_state": "rotation",
+                "confidence": 0.7,
+                "summary": "검증된 시장 요약",
+            },
+            "market_dashboard": {
+                "candidate_lanes": {
+                    "positive_confirmation_stocks": [{"symbol": "AAPL"}]
+                }
+            },
+            "source_status": {"quant_dataset": {"status": "confirmed"}},
+        }
+
+        def read_json(path):
+            if Path(path).name == "latest.json":
+                return report
+            return {"target_as_of_date": "2026-07-29"}
+
+        with mock.patch.object(app_cli, "_read_json", side_effect=read_json):
+            with mock.patch.object(app_cli, "write_json"):
+                result = app_cli.run_question("강세와 약세 종목 후보는?")
+        self.assertEqual(result["intent"], "candidates")
+        self.assertEqual(
+            result["candidate_lanes"]["positive_confirmation_stocks"][0][
+                "symbol"
+            ],
+            "AAPL",
+        )
+
+    def test_natural_question_fails_closed_when_report_is_stale(self):
+        report = {
+            "as_of_date": "2026-07-28",
+            "quality_audit": {
+                "schema_version": app_cli.QUALITY_SCHEMA_VERSION,
+                "status": "green",
+                "publishable_reference_report": True,
+                "scores": {"flow_evidence_quality": 10.0},
+            },
+        }
+
+        def read_json(path):
+            if Path(path).name == "latest.json":
+                return report
+            return {"target_as_of_date": "2026-07-29"}
+
+        with mock.patch.object(app_cli, "_read_json", side_effect=read_json):
+            with self.assertRaisesRegex(app_cli.AppCliError, "stale"):
+                app_cli.run_question("오늘 시장 분석 보여줘")
+
     def test_request_rejects_unknown_fields_and_mixed_direct_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "request.json"

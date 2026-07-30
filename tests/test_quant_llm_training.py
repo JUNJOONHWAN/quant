@@ -79,8 +79,8 @@ def packet(as_of_date: str, packet_id: str) -> dict:
             "availability_policy": {"policy_id": ETF_FLOW_POLICY_ID},
             "observations": [
                 {
-                    "effective_date": "2020-01-02",
-                    "processed_date": "2020-01-03",
+                    "effective_date": (end - timedelta(days=2)).isoformat(),
+                    "processed_date": (end - timedelta(days=1)).isoformat(),
                     "available_at_date": available,
                     "training_available_session_date": available,
                     "training_availability_policy_id": ETF_FLOW_POLICY_ID,
@@ -817,6 +817,69 @@ class QuantLlmTrainingTest(unittest.TestCase):
         self.assertEqual(result["rows"][0]["source_position_count"], 2)
         self.assertEqual(result["rows"][0]["membership_weight_percent"], 12.0)
         self.assertEqual(result["rows"][0]["allocated_flow_reported_units"], 120.0)
+
+    def test_constituent_flow_excludes_stale_and_implausible_latest_rows(self):
+        memberships = [
+            {
+                "etf_ticker": ticker,
+                "effective_date": "2026-06-30",
+                "available_date": "2026-07-01",
+                "weight_percent": 5.0,
+                "direct_equity_proxy_eligible": True,
+                "direct_equity_proxy_reasons": [],
+            }
+            for ticker in ("STALE", "EXTREME", "CURRENT")
+        ]
+        packets = {
+            "STALE": {
+                "latest": {
+                    "effective_date": "2024-03-20",
+                    "processed_date": "2024-03-20",
+                    "training_available_session_date": "2024-03-22",
+                    "training_availability_policy_id": ETF_FLOW_POLICY_ID,
+                    "fund_flow": 1_000.0,
+                    "nav": 100.0,
+                    "shares_outstanding": 1_000.0,
+                }
+            },
+            "EXTREME": {
+                "latest": {
+                    "effective_date": "2026-07-27",
+                    "processed_date": "2026-07-27",
+                    "training_available_session_date": "2026-07-29",
+                    "training_availability_policy_id": ETF_FLOW_POLICY_ID,
+                    "fund_flow": -2_000_000.0,
+                    "nav": 10.0,
+                    "shares_outstanding": 10_000.0,
+                }
+            },
+            "CURRENT": {
+                "latest": {
+                    "effective_date": "2026-07-27",
+                    "processed_date": "2026-07-27",
+                    "training_available_session_date": "2026-07-29",
+                    "training_availability_policy_id": ETF_FLOW_POLICY_ID,
+                    "fund_flow": 10_000.0,
+                    "nav": 10.0,
+                    "shares_outstanding": 10_000.0,
+                }
+            },
+        }
+        result = build_constituent_flow_exposure(
+            "AAPL", "2026-07-29", memberships, packets
+        )
+        self.assertEqual(result["eligible_etf_count"], 1)
+        self.assertEqual(result["rows"][0]["etf_ticker"], "CURRENT")
+        self.assertEqual(
+            result["exclusion_counts"]["etf_flow_stale_latest_observation"],
+            1,
+        )
+        self.assertEqual(
+            result["exclusion_counts"][
+                "etf_flow_rate_outside_plausibility_gate"
+            ],
+            1,
+        )
 
     def test_balanced_selector_keeps_each_task_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

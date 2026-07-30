@@ -30,6 +30,9 @@ from quant_dataset.shared_market import (  # noqa: E402
     load_shared_market_binding,
 )
 from workflows.quant_ai_radar.model_runtime import load_model_release  # noqa: E402
+from workflows.quant_ai_radar.decision_support import (  # noqa: E402
+    QUALITY_SCHEMA_VERSION,
+)
 from workflows.quant_ai_radar.relation_index import (  # noqa: E402
     DEFAULT_RELATION_INDEX,
 )
@@ -51,6 +54,8 @@ APP_STATE_PATH = DEFAULT_OUTPUT_ROOT / "status" / "app_cli.json"
 REQUEST_FIELDS = frozenset(
     {
         "action",
+        "question",
+        "query",
         "symbols",
         "shadow",
         "workers",
@@ -60,6 +65,12 @@ REQUEST_FIELDS = frozenset(
     }
 )
 SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,14}$")
+QUESTION_TICKER_PATTERN = re.compile(
+    r"(?<![A-Z0-9.\-])([A-Z][A-Z0-9.\-]{0,14})(?![A-Z0-9.\-])"
+)
+QUESTION_TICKER_STOPWORDS = frozenset(
+    {"AI", "ETF", "FLOW", "RADAR", "US", "KST", "FMP", "MASSIVE", "QWEN"}
+)
 
 
 class AppCliError(RuntimeError):
@@ -371,6 +382,146 @@ def run_analysis(symbols: list[str]) -> dict[str, Any]:
     return result
 
 
+def _question_text(value: Any) -> str:
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value)
+    if not isinstance(value, str) or not value.strip():
+        raise AppCliError("question must be a non-empty string")
+    question = re.sub(r"\s+", " ", value).strip()
+    if len(question.encode("utf-8")) > 4096:
+        raise AppCliError("question exceeds the 4096-byte limit")
+    return question
+
+
+def _question_symbols(question: str) -> list[str]:
+    symbols = []
+    for match in QUESTION_TICKER_PATTERN.finditer(question.upper()):
+        symbol = match.group(1)
+        if symbol in QUESTION_TICKER_STOPWORDS:
+            continue
+        if SYMBOL_PATTERN.fullmatch(symbol) and symbol not in symbols:
+            symbols.append(symbol)
+    if len(symbols) > 8:
+        raise AppCliError("one natural-language request may analyze at most 8 symbols")
+    return symbols
+
+
+def _latest_accepted_report() -> dict[str, Any]:
+    report = _read_json(DEFAULT_OUTPUT_ROOT / "status" / "latest.json")
+    if report is None:
+        raise AppCliError(
+            "accepted AI Radar daily report is missing; run `ai-radar daily` first"
+        )
+    quality = report.get("quality_audit") or {}
+    if (
+        quality.get("schema_version") != QUALITY_SCHEMA_VERSION
+        or quality.get("status") != "green"
+        or not quality.get("publishable_reference_report")
+        or float((quality.get("scores") or {}).get("flow_evidence_quality", 0))
+        < 8.0
+    ):
+        raise AppCliError("latest AI Radar report did not pass all quality gates")
+    oracle = _read_json(DEFAULT_ORACLE_STATUS) or {}
+    oracle_date = str(oracle.get("target_as_of_date") or "")
+    report_date = str(report.get("as_of_date") or "")
+    if oracle_date and report_date != oracle_date:
+        raise AppCliError(
+            "latest AI Radar report is stale relative to Oracle: "
+            f"report={report_date} oracle={oracle_date}; run `ai-radar daily`"
+        )
+    return report
+
+
+def _question_intent(question: str) -> str:
+    compact = question.lower()
+    if any(token in compact for token in ("상태", "status", "준비", "작동")):
+        return "status"
+    if any(
+        token in compact
+        for token in (
+            "후보",
+            "강세",
+            "약세",
+            "위험 종목",
+            "관찰 종목",
+            "어느 종목",
+        )
+    ):
+        return "candidates"
+    if any(
+        token in compact
+        for token in ("회전", "로테이션", "rotation", "섹터", "테마")
+    ):
+        return "rotation"
+    return "market"
+
+
+def run_question(question: str) -> dict[str, Any]:
+    """Answer Oracle-style requests from accepted AI Radar artifacts."""
+
+    normalized = _question_text(question)
+    symbols = _question_symbols(normalized)
+    if symbols:
+        result = run_analysis(symbols)
+        return {
+            **result,
+            "action": "ask",
+            "intent": "explicit_symbol_analysis",
+            "question": normalized,
+            "answer_basis": "fresh_on_demand_trained_model_inference",
+        }
+    intent = _question_intent(normalized)
+    if intent == "status":
+        return {
+            **status(),
+            "action": "ask",
+            "intent": intent,
+            "question": normalized,
+            "answer_basis": "live_runtime_status",
+        }
+    report = _latest_accepted_report()
+    market = report.get("market_judgement") or {}
+    dashboard = report.get("market_dashboard") or {}
+    answer: dict[str, Any] = {
+        "schema_version": "quant.ai_radar_natural_answer.v1",
+        "status": "PASS",
+        "app_id": APP_ID,
+        "action": "ask",
+        "intent": intent,
+        "question": normalized,
+        "as_of_date": report.get("as_of_date"),
+        "answer_basis": "latest_accepted_trained_model_report",
+        "market_state": market.get("market_state"),
+        "confidence": market.get("confidence"),
+        "summary": market.get("summary"),
+        "source_status": report.get("source_status"),
+        "quality_audit": report.get("quality_audit"),
+        "market_report_html": str(
+            DEFAULT_OUTPUT_ROOT
+            / "runs"
+            / str(report.get("as_of_date"))
+            / "market_report.html"
+        ),
+        "completed_at_kst": _now_kst(),
+    }
+    if intent == "candidates":
+        answer["candidate_lanes"] = dashboard.get("candidate_lanes") or {}
+    elif intent == "rotation":
+        answer["rotation_clusters"] = dashboard.get("rotation_clusters") or []
+        answer["accumulation_clusters"] = (
+            dashboard.get("accumulation_clusters") or []
+        )
+    else:
+        answer["breadth"] = dashboard.get("breadth") or {}
+        answer["candidate_lanes"] = dashboard.get("candidate_lanes") or {}
+        answer["rotation_clusters"] = dashboard.get("rotation_clusters") or []
+        answer["confirmations"] = market.get("confirmations") or []
+        answer["contradictions"] = market.get("contradictions") or []
+        answer["unknowns"] = market.get("unknowns") or []
+    write_json(APP_STATE_PATH, answer)
+    return answer
+
+
 def _models_url(endpoint: str) -> str:
     parsed = urlsplit(endpoint)
     path = parsed.path
@@ -568,6 +719,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("symbols", nargs="+")
 
+    ask = sub.add_parser(
+        "ask", help="Ask for market, rotation, candidates, or symbol analysis"
+    )
+    ask.add_argument("question", nargs="+")
+
     sub.add_parser("status", help="Show model, Oracle, and output status")
     sub.add_parser("preflight", help="Validate the app without running inference")
     return parser
@@ -577,7 +733,7 @@ def _request_action(
     request: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
     action = str(request.get("action") or "daily").strip().lower()
-    if action not in {"daily", "analyze", "status", "preflight"}:
+    if action not in {"daily", "analyze", "ask", "status", "preflight"}:
         raise AppCliError(f"unsupported action: {action!r}")
     return action, request
 
@@ -635,6 +791,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return run_daily(**values)
     if action == "analyze":
         return run_analysis(normalize_symbols(source.get("symbols")))
+    if action == "ask":
+        return run_question(source.get("question") or source.get("query"))
     if action == "status":
         return status()
     if action == "preflight":

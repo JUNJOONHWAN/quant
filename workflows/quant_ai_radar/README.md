@@ -26,6 +26,13 @@ ai-radar daily --shadow
 # Explicit symbols bypass the daily capacity selection while retaining every
 # packet, point-in-time, release, and response-contract gate.
 ai-radar analyze AAPL NVDA
+
+# Oracle처럼 자연어로 호출. 명시 ticker는 즉시 on-demand 분석하고,
+# 시장·후보·회전 질문은 Oracle 기준일과 일치하는 최신 green 리포트로 답한다.
+ai-radar ask "오늘 AI Radar 시장 분석 보여줘"
+ai-radar ask "강세와 약세 종목 후보는?"
+ai-radar ask "현재 섹터 로테이션은?"
+ai-radar ask "AAPL 분석해줘"
 ```
 
 Hermes uses the same entrypoint through Operations App Manager:
@@ -39,6 +46,10 @@ hermes apps run quant-ai-radar \
 
 hermes apps run quant-ai-radar \
   --input-json '{"action":"analyze","symbols":["AAPL","NVDA"]}' \
+  --json
+
+hermes apps run quant-ai-radar \
+  --input-json '{"action":"ask","question":"현재 섹터 로테이션과 종목 후보를 보여줘"}' \
   --json
 ```
 
@@ -121,8 +132,22 @@ The SFT liquidity and leakage gates are reused unchanged:
   and USD 1 million median dollar volume;
 - raw one-session discontinuity below 45% unless a PIT corporate action exists;
 - Massive ETF flow visible only under `massive_etf_flow_us_sessions_v1`;
+- current-signal ETF Flow must be no more than 10 calendar days old, must
+  normalize through provider assets or `NAV * shares`, and must remain within
+  the absolute 100% flow-to-net-assets plausibility gate;
 - FMP ETF membership visible only after its derived next-session gate;
 - no present-day active list removes a historically valid observation.
+
+The current-signal gate does not delete history. It only prevents an ETF whose
+last visible observation is stale, malformed, or outside the plausibility
+contract from transmitting that old value into today's stock ranking. ETF
+selection also repeats the training liquidity contract: same-session price,
+at least 10 trailing sessions, at least 75% positive-volume sessions, and at
+least USD 1 million median dollar volume.
+
+The market report publishes separate reference lanes for price/Flow positive
+confirmation, price/Flow negative confirmation, and price/Flow divergence.
+They are watchlists and risk lists, never order instructions.
 
 Selected securities are written to the restartable inference queue. The
 25-item leader arrays in the final market report are presentation-only; every

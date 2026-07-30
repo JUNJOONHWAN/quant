@@ -1222,6 +1222,14 @@ class QuantAiRadarTest(unittest.TestCase):
         aggregate = aggregate_judgements(rows)
         self.assertEqual(aggregate["analyzed_security_count"], 30)
         self.assertEqual(len(aggregate["etf_leaders"]), 25)
+        self.assertEqual(
+            len(
+                aggregate["candidate_rankings"]["etfs_by_regime"][
+                    "mixed_or_flat"
+                ]
+            ),
+            10,
+        )
         self.assertIn(
             "dynamically selected",
             aggregate["presentation_policy"],
@@ -1376,7 +1384,11 @@ class QuantAiRadarTest(unittest.TestCase):
                 return {
                     "market_state": "mixed",
                     "confidence": 0.5,
-                    "summary": "수리된 시장 해석",
+                    "summary": (
+                        "시장 가격 폭은 한 방향으로 수렴하지 않고 ETF 자금 흐름과 "
+                        "섹터 회전이 엇갈리며, 괴리 신호가 남아 혼조 국면의 지속성을 "
+                        "더 확인해야 합니다."
+                    ),
                     "confirmations": [
                         {
                             "evidence_id": "aggregate.regime_counts",
@@ -1425,7 +1437,7 @@ class QuantAiRadarTest(unittest.TestCase):
             aggregate=aggregate,
             radar=radar,
         )
-        self.assertEqual(synthesis["summary"], "수리된 시장 해석")
+        self.assertIn("섹터 회전", synthesis["summary"])
         self.assertEqual(trace["contract_attempts"], 2)
         self.assertTrue(trace["contract_repair_applied"])
         self.assertEqual(
@@ -1456,7 +1468,11 @@ class QuantAiRadarTest(unittest.TestCase):
                 return {
                     "market_state": "mixed",
                     "confidence": 0.5,
-                    "summary": "시장 신호가 서로 엇갈립니다.",
+                    "summary": (
+                        "시장 가격 폭은 한 방향으로 수렴하지 않고 ETF 자금 흐름과 "
+                        "섹터 회전이 엇갈리며, 괴리 신호가 남아 혼조 국면의 지속성을 "
+                        "더 확인해야 합니다."
+                    ),
                     "confirmations": [
                         {
                             "evidence_id": "aggregate.regime_counts",
@@ -1502,7 +1518,7 @@ class QuantAiRadarTest(unittest.TestCase):
                 "integrated_rotation_clusters": [],
             },
         )
-        self.assertEqual(synthesis["summary"], "시장 신호가 서로 엇갈립니다.")
+        self.assertIn("ETF 자금 흐름", synthesis["summary"])
         self.assertEqual(trace["contract_attempts"], 2)
         self.assertIn("ModelResponseParseError", trace["initial_contract_error"])
 

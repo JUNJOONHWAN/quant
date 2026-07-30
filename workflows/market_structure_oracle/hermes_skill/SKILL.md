@@ -77,8 +77,17 @@ its Python modules directly.
   `hermes apps run quant-ai-radar --input-json '{"action":"daily","shadow":true}' --json`
 - Explicit symbols:
   `hermes apps run quant-ai-radar --input-json '{"action":"analyze","symbols":["AAPL","NVDA"]}' --json`
+- Oracle-style natural request:
+  `hermes apps run quant-ai-radar --input-json '{"action":"ask","question":"현재 섹터 로테이션과 종목 후보를 보여줘"}' --json`
 - Runtime status:
   `hermes apps run quant-ai-radar --input-json '{"action":"status"}' --json`
+
+For `AI Radar로 오늘 시장 분석`, `AI Radar 후보`, `AI Radar 섹터 회전`,
+or `AI Radar에 AAPL 물어봐`, prefer `action=ask` and preserve the user's
+question verbatim. Explicit uppercase tickers trigger fresh on-demand trained
+model inference. Market, candidate, and rotation questions read only the latest
+green AI Radar report when its date matches the sealed Oracle date; stale or
+failed reports must not be summarized as current.
 
 The daily 64 ETF / 192 stock values are maximum inference capacities, not fixed
 universes. An explicitly requested symbol bypasses that daily selection but

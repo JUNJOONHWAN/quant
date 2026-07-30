@@ -16,11 +16,34 @@ from collections import Counter
 from statistics import fmean
 from typing import Any, Mapping, Sequence
 
+from quant_dataset.etf_flow_exposure import (
+    ETF_CONSTITUENT_FLOW_POLICY_ID,
+    MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT,
+    MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS,
+    flow_age_calendar_days,
+)
 
-QUALITY_SCHEMA_VERSION = "quant.ai_radar_quality_audit.v1"
+QUALITY_SCHEMA_VERSION = "quant.ai_radar_quality_audit.v2"
 SECURITY_BRIEF_SCHEMA_VERSION = "quant.ai_radar_security_brief.v1"
-MARKET_DASHBOARD_SCHEMA_VERSION = "quant.ai_radar_market_dashboard.v1"
+MARKET_DASHBOARD_SCHEMA_VERSION = "quant.ai_radar_market_dashboard.v2"
 MIN_QUALITY_SCORE = 8.0
+MIN_MARKET_SUMMARY_KOREAN_CHARS = 40
+MIN_MARKET_UNKNOWN_KOREAN_CHARS = 8
+MARKET_META_LANGUAGE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"근거를\s*제시하지\s*않",
+        r"한국어\s*(?:제한|로\s*(?:작성|해석|요약))",
+        r"(?:요청|지시|프롬프트|스키마|JSON).*(?:따르|작성|출력)",
+        r"(?:시장|데이터).*(?:해석하며|설명하며).*(?:근거|한국어)",
+    )
+)
+MARKET_CONCEPT_GROUPS = (
+    re.compile(r"가격|시장\s*폭|강세|약세"),
+    re.compile(r"ETF|Flow|플로우|자금"),
+    re.compile(r"회전|로테이션|섹터|테마"),
+    re.compile(r"괴리|분화|반대|위험|불확실"),
+)
 
 
 def _number(value: Any) -> float | None:
@@ -352,6 +375,29 @@ def market_semantic_issues(
     """Detect numeric and directional contradictions in market prose."""
 
     issues: list[str] = []
+    summary = str(market.get("summary") or "").strip()
+    korean_character_count = len(re.findall(r"[가-힣]", summary))
+    if korean_character_count < MIN_MARKET_SUMMARY_KOREAN_CHARS:
+        issues.append(
+            f"market_summary_too_shallow:korean_chars={korean_character_count}"
+        )
+    if any(pattern.search(summary) for pattern in MARKET_META_LANGUAGE_PATTERNS):
+        issues.append("market_summary_contains_meta_language")
+    concept_count = sum(
+        1 for pattern in MARKET_CONCEPT_GROUPS if pattern.search(summary)
+    )
+    if concept_count < 3:
+        issues.append(f"market_summary_missing_core_concepts:{concept_count}")
+    for item in market.get("unknowns") or []:
+        text = str(item).strip()
+        korean_count = len(re.findall(r"[가-힣]", text))
+        if korean_count < MIN_MARKET_UNKNOWN_KOREAN_CHARS:
+            issues.append(
+                f"market_unknown_too_generic:korean_chars={korean_count}"
+            )
+        if any(pattern.search(text) for pattern in MARKET_META_LANGUAGE_PATTERNS):
+            issues.append("market_unknown_contains_meta_language")
+
     rows = [
         *list(market.get("confirmations") or []),
         *list(market.get("contradictions") or []),
@@ -454,6 +500,91 @@ def build_market_dashboard(
                 "top_related_stocks": row.get("top_related_stocks") or [],
             }
         )
+    def lane(
+        rows: Sequence[Mapping[str, Any]],
+        regimes: set[str],
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        selected = []
+        for row in rows:
+            if str(row.get("regime") or "") not in regimes:
+                continue
+            selected.append(
+                {
+                    key: row.get(key)
+                    for key in (
+                        "symbol",
+                        "regime",
+                        "confidence",
+                        "price_signal",
+                        "etf_flow_signal",
+                        "latest_effective_date",
+                        "latest_robust_zscore",
+                        "net_weighted_flow_rate_contribution_pct",
+                        "eligible_etf_count",
+                    )
+                    if row.get(key) is not None
+                }
+            )
+            if len(selected) >= limit:
+                break
+        return selected
+
+    etf_leaders = list(aggregate.get("etf_leaders") or [])
+    stock_leaders = list(aggregate.get("stock_leaders") or [])
+    candidate_rankings = aggregate.get("candidate_rankings") or {}
+    etfs_by_regime = candidate_rankings.get("etfs_by_regime") or {}
+    stocks_by_regime = candidate_rankings.get("stocks_by_regime") or {}
+    positive = {"price_flow_positive_confirmation"}
+    negative = {"price_flow_negative_confirmation"}
+    divergence_regimes = {
+        "price_up_flow_out_divergence",
+        "price_down_flow_in_divergence",
+    }
+    candidate_lanes = {
+        "positive_confirmation_etfs": lane(
+            etfs_by_regime.get("price_flow_positive_confirmation", etf_leaders),
+            positive,
+        ),
+        "positive_confirmation_stocks": lane(
+            stocks_by_regime.get(
+                "price_flow_positive_confirmation", stock_leaders
+            ),
+            positive,
+        ),
+        "negative_confirmation_etfs": lane(
+            etfs_by_regime.get("price_flow_negative_confirmation", etf_leaders),
+            negative,
+        ),
+        "negative_confirmation_stocks": lane(
+            stocks_by_regime.get(
+                "price_flow_negative_confirmation", stock_leaders
+            ),
+            negative,
+        ),
+        "divergence_etfs": lane(
+            [
+                *etfs_by_regime.get("price_up_flow_out_divergence", []),
+                *etfs_by_regime.get("price_down_flow_in_divergence", []),
+            ]
+            or etf_leaders,
+            divergence_regimes,
+        ),
+        "divergence_stocks": lane(
+            [
+                *stocks_by_regime.get("price_up_flow_out_divergence", []),
+                *stocks_by_regime.get("price_down_flow_in_divergence", []),
+            ]
+            or stock_leaders,
+            divergence_regimes,
+        ),
+        "policy": (
+            "confirmation lanes are reference watchlists, not buy/sell orders; "
+            "positive requires price and ETF Flow positive, negative requires both "
+            "negative, and divergence remains a separate verification lane"
+        ),
+    }
     return {
         "schema_version": MARKET_DASHBOARD_SCHEMA_VERSION,
         "analyzed_security_count": total,
@@ -482,6 +613,7 @@ def build_market_dashboard(
         "accumulation_clusters": accumulation,
         "leading_etfs": list(aggregate.get("etf_leaders") or [])[:12],
         "affected_stocks": list(aggregate.get("stock_leaders") or [])[:12],
+        "candidate_lanes": candidate_lanes,
         "mean_model_confidence": aggregate.get("mean_model_confidence"),
         "interpretation": (
             f"가격 양수 비중 {_pct(positive_price / total * 100 if total else None)}와 "
@@ -517,6 +649,62 @@ def audit_report_quality(
     )
     numeric_faithfulness = 10.0 if not semantic_issues else 0.0
 
+    as_of_date = str(report.get("as_of_date") or "")
+    flow_quality_issues: list[str] = []
+    for item in results:
+        judgement = item.get("judgement") or {}
+        facts = judgement.get("facts") or {}
+        symbol = str(item.get("symbol") or facts.get("symbol") or "")
+        own_flow = facts.get("etf_flow") or {}
+        own_effective = own_flow.get("latest_effective_date")
+        if own_effective:
+            age = flow_age_calendar_days(as_of_date, own_effective)
+            if (
+                age is None
+                or age < 0
+                or age > MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS
+            ):
+                flow_quality_issues.append(
+                    f"{symbol}:stale_or_invalid_own_etf_flow:{own_effective}"
+                )
+            own_rate = _number(own_flow.get("latest_flow_to_assets_pct"))
+            if (
+                own_rate is not None
+                and abs(own_rate) > MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT
+            ):
+                flow_quality_issues.append(
+                    f"{symbol}:own_etf_flow_rate_outside_gate:{own_rate:g}"
+                )
+        exposure = facts.get("etf_flow_to_constituent") or {}
+        if int(_number(exposure.get("eligible_etf_count")) or 0) > 0 and (
+            exposure.get("policy_id") != ETF_CONSTITUENT_FLOW_POLICY_ID
+        ):
+            flow_quality_issues.append(
+                f"{symbol}:constituent_flow_policy_not_current"
+            )
+        for row in exposure.get("top_contributing_etfs") or []:
+            effective = row.get("flow_effective_date")
+            age = flow_age_calendar_days(as_of_date, effective)
+            if (
+                age is None
+                or age < 0
+                or age > MAX_FLOW_OBSERVATION_AGE_CALENDAR_DAYS
+            ):
+                flow_quality_issues.append(
+                    f"{symbol}:{row.get('etf_ticker')}:stale_or_invalid_flow:"
+                    f"{effective}"
+                )
+            rate = _number(row.get("flow_to_estimated_net_assets_pct"))
+            if (
+                rate is not None
+                and abs(rate) > MAX_ABSOLUTE_FLOW_TO_NET_ASSETS_PCT
+            ):
+                flow_quality_issues.append(
+                    f"{symbol}:{row.get('etf_ticker')}:flow_rate_outside_gate:"
+                    f"{rate:g}"
+                )
+    flow_evidence_quality = 10.0 if not flow_quality_issues else 0.0
+
     briefs = [build_security_brief(item.get("judgement") or {}) for item in results]
     complete_briefs = [
         item
@@ -541,6 +729,7 @@ def audit_report_quality(
         bool(dashboard["accumulation_clusters"]),
         bool(dashboard["leading_etfs"]),
         bool(dashboard["affected_stocks"]),
+        bool(dashboard["candidate_lanes"]),
     )
     market_structure = round(
         sum(market_structure_checks) / len(market_structure_checks) * 10.0,
@@ -598,6 +787,7 @@ def audit_report_quality(
     scores = {
         "data_integrity": data_integrity,
         "numeric_faithfulness": numeric_faithfulness,
+        "flow_evidence_quality": flow_evidence_quality,
         "security_analysis": security_analysis,
         "market_structure": market_structure,
         "model_judgement_integration": model_judgement_integration,
@@ -613,6 +803,7 @@ def audit_report_quality(
         "scores": scores,
         "failed_categories": failed,
         "semantic_issues": semantic_issues,
+        "flow_quality_issues": sorted(set(flow_quality_issues)),
         "security_report_count": len(results),
         "complete_security_brief_count": len(complete_briefs),
         "model_consistent_judgement_count": model_consistent,

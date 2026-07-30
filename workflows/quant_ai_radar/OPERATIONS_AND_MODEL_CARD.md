@@ -579,26 +579,35 @@ Python은 다음을 전담한다.
 - Oracle rotation cluster·rotation 원본 값
 - 리포트에 표시되는 모든 숫자와 비교
 - 근거 ID 허용 목록, JSON 문법, 룩어헤드, 매매 지시, 해시 검증
+- 현재 종목 전달용 Flow의 최대 10 calendar-day age, 절대
+  flow-to-net-assets 100% plausibility, ETF 유동성 fail-closed gate
 
 시장 synthesis는 현재 evidence catalog에서 만든 vLLM guided JSON Schema를
 사용한다. 확인/반대 근거 ID는 enum 밖의 값을 생성할 수 없다. 모델이
 근거 설명문을 임의로 다시 쓰지 않도록 최종 리포트에는 선택된 evidence
 ID의 정확한 catalog 객체를 렌더링한다. 자유문장에 포함된 숫자는 제거해
 renderer 소유 수치와 이중화하지 않으며, 비교 방향 역전은 semantic gate가
-별도로 차단한다.
+별도로 차단한다. 요약은 가격 폭, ETF 자금, 섹터 회전, 괴리·위험 중 최소
+세 축을 실제 판단문으로 연결해야 하며, `한국어 제한`, `한국어로 해석`,
+`근거를 제시하지 않음` 같은 메타 문구는 publish 전에 거부된다.
 
-`quality_audit.json`의 다음 6개 점수는 각각 최소 8.0이어야 한다.
+`quality_audit.json`의 다음 7개 점수는 각각 최소 8.0이어야 한다.
 
 1. `data_integrity`
 2. `numeric_faithfulness`
-3. `security_analysis`
-4. `market_structure`
-5. `model_judgement_integration`
-6. `report_usability`
+3. `flow_evidence_quality`
+4. `security_analysis`
+5. `market_structure`
+6. `model_judgement_integration`
+7. `report_usability`
 
 하나라도 미달하면 reference publish는 fail closed다. 개별 종목 HTML은
 근거 기반 결론, 가격 구조, ETF Flow 전달, 가격-Flow 관계, 학습 모델 해석,
 확인/반대 증거, 다음 확인 조건을 모두 포함해야 한다.
+
+CLI와 Hermes는 `action=ask`로 동일 앱을 호출한다. 명시 ticker 질문은
+새 on-demand inference를 수행하고, 시장·후보·회전 질문은 Oracle 기준일과
+일치하며 위 품질 감사가 green인 최신 AI Radar 리포트만 답변 근거로 쓴다.
 
 ## 16. 향후 확장 원칙
 

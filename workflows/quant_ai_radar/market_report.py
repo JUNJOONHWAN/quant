@@ -235,6 +235,16 @@ def aggregate_judgements(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             stocks.append(base)
     etfs.sort(key=lambda row: (-float(row["ranking_magnitude"]), row["symbol"]))
     stocks.sort(key=lambda row: (-float(row["ranking_magnitude"]), row["symbol"]))
+
+    def by_regime(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            regime = str(row.get("regime") or "")
+            grouped.setdefault(regime, [])
+            if len(grouped[regime]) < 10:
+                grouped[regime].append(dict(row))
+        return dict(sorted(grouped.items()))
+
     return {
         "schema_version": "quant.ai_radar_aggregate.v1",
         "analyzed_security_count": len(results),
@@ -249,6 +259,10 @@ def aggregate_judgements(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         ),
         "etf_leaders": etfs[:25],
         "stock_leaders": stocks[:25],
+        "candidate_rankings": {
+            "etfs_by_regime": by_regime(etfs),
+            "stocks_by_regime": by_regime(stocks),
+        },
     }
 
 
@@ -593,7 +607,12 @@ def market_contract_repair_instruction(
         "contradictions는 최소 2개를 만들며, MANDATORY_EVIDENCE_IDS_JSON의 "
         "ID를 정확히 포함하라. 각 행에는 evidence_id만 쓰고 해석문이나 숫자를 "
         "넣지 마라. 숫자·퍼센트·날짜와 근거 설명은 renderer가 담당하므로 "
-        "summary·unknowns 자연어에는 숫자를 하나도 쓰지 마라. "
+        "summary·unknowns 자연어에는 숫자를 하나도 쓰지 마라. summary는 "
+        "가격 폭, ETF 자금 흐름, 섹터 회전, 괴리나 위험 중 최소 세 축을 "
+        "구체적으로 연결한 충분한 길이의 판단문이어야 한다. '한국어 제한', "
+        "'한국어로 해석', '근거를 제시하지 않음' 같은 메타 문구나 지시문 "
+        "반복은 금지한다. unknowns는 실제로 아직 확인되지 않은 시장 조건을 "
+        "구체적으로 적거나 없으면 빈 배열로 둔다. "
         "leading_etfs와 "
         "affected_stocks도 각 허용 목록 안에서만 고르라. 매매 지시와 입력 "
         "시점 이후 날짜를 포함하지 말고, summary·unknowns의 "
@@ -646,7 +665,11 @@ def synthesize_market(
         "two contradictions with unique catalog IDs. Every number and comparison "
         "is rendered from the cited catalog by the program. Return only evidence_id "
         "inside confirmation and contradiction rows. Do not write digits, percentages, "
-        "or dates in summary or unknowns. Never issue a trade "
+        "or dates in summary or unknowns. The Korean summary must concretely connect "
+        "at least three of market breadth, ETF capital flow, sector rotation, and "
+        "divergence or risk. Never echo instructions or write meta phrases such as "
+        "'한국어 제한', '한국어로 해석', or '근거를 제시하지 않음'. Unknowns must "
+        "name a real unresolved market condition or be an empty array. Never issue a trade "
         "instruction or invent a number. /no_think"
     )
     catalog_json = canonical_json(catalog)
