@@ -65,6 +65,35 @@ sector-only run. The governing formula is:
 Read the successful App Manager receipt and use the report paths in its stdout.
 If the receipt is not `PASS`, do not claim that the Oracle completed.
 
+## Quant AI Radar
+
+When the user says `AI Radar`, `Quant AI Radar`, or requests analysis from the
+trained quant model, use the managed `quant-ai-radar` application. Do not run
+its Python modules directly.
+
+- Full daily reference publish:
+  `hermes apps run quant-ai-radar --json`
+- Full non-publishing shadow:
+  `hermes apps run quant-ai-radar --input-json '{"action":"daily","shadow":true}' --json`
+- Explicit symbols:
+  `hermes apps run quant-ai-radar --input-json '{"action":"analyze","symbols":["AAPL","NVDA"]}' --json`
+- Runtime status:
+  `hermes apps run quant-ai-radar --input-json '{"action":"status"}' --json`
+
+The daily 64 ETF / 192 stock values are maximum inference capacities, not fixed
+universes. An explicitly requested symbol bypasses that daily selection but
+must still pass the same point-in-time packet, Oracle binding, model release,
+and response-contract gates. AI Radar is analysis-only and must never be
+described as a trading or order-execution application.
+
+Market Structure Oracle is the single writer for the shared current-market
+database. Both apps may request preparation, but the interprocess lock permits
+only one Massive/FMP incremental capture and the other caller reuses the sealed
+snapshot. ETF RADAR remains a separate workflow and is not an Oracle/AI Radar
+source, release-date gate, universe gate, or inference input. New securities
+enter through Massive grouped daily; new ETFs enter through Massive flow/FMP
+profile discovery and receive missing-constituent refresh priority.
+
 ## Domain Map
 
 - `data_sources/barchart/`: Barchart Premier/CDP page contracts, option pages,

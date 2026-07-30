@@ -289,10 +289,11 @@ class FmpEtfConstituentProvider:
 
 
 class FmpEtfConstituentStore:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, initialize_schema: bool = True):
         self.database = database
         self._trading_sessions_cache: Optional[Tuple[str, ...]] = None
-        self.initialize()
+        if initialize_schema:
+            self.initialize()
 
     def _trading_sessions(self) -> Tuple[str, ...]:
         if self._trading_sessions_cache is None:
@@ -552,11 +553,26 @@ class FmpEtfConstituentStore:
             "investment_country": row["investment_country"],
         }
 
+    @staticmethod
+    def _availability_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+        """Use the persisted business key; temp SQLite views have no rowid."""
+
+        return (
+            str(row["etf_ticker"]),
+            str(row["constituent_key"]),
+            str(row["effective_date"]),
+        )
+
     def packet_for_symbol(self, symbol: str, as_of_date: str) -> dict:
         ticker = normalize_symbol(symbol)
         as_of = validate_iso_date(as_of_date)
         sessions = self._trading_sessions()
-        with self.database.connect() as connection:
+        connector = getattr(
+            self.database,
+            "connect_constituents",
+            self.database.connect,
+        )
+        with connector() as connection:
             snapshot_candidates = connection.execute(
                 """
                 SELECT * FROM etf_constituent_snapshots
@@ -581,7 +597,7 @@ class FmpEtfConstituentStore:
             if etf_snapshot:
                 candidates = connection.execute(
                         """
-                        SELECT rowid, * FROM etf_constituent_observations
+                        SELECT * FROM etf_constituent_observations
                         WHERE provider='fmp' AND etf_ticker=? AND effective_date=?
                           AND available_date<=?
                         ORDER BY weight_percent DESC, constituent_key
@@ -594,10 +610,10 @@ class FmpEtfConstituentStore:
                     )
                     if derived is not None and derived <= as_of:
                         holdings.append(row)
-                        holding_availability[int(row["rowid"])] = derived
+                        holding_availability[self._availability_key(row)] = derived
             membership_candidates = connection.execute(
                 """
-                SELECT rowid, * FROM etf_constituent_observations
+                SELECT * FROM etf_constituent_observations
                 WHERE provider='fmp' AND constituent_ticker=?
                   AND effective_date<=? AND available_date<=?
                 ORDER BY etf_ticker, effective_date DESC, constituent_key
@@ -612,7 +628,7 @@ class FmpEtfConstituentStore:
                 )
                 if derived is not None and derived <= as_of:
                     eligible_memberships.append(row)
-                    membership_availability[int(row["rowid"])] = derived
+                    membership_availability[self._availability_key(row)] = derived
             latest_effective_by_etf = {}
             for row in eligible_memberships:
                 latest_effective_by_etf.setdefault(
@@ -654,7 +670,6 @@ class FmpEtfConstituentStore:
                                AS positive_ticker_weight_sum,
                            SUM(COALESCE(o.weight_percent, 0)) AS total_weight_sum
                     FROM etf_constituent_observations o
-                         INDEXED BY idx_etf_constituent_etf_date
                     JOIN requested r ON r.etf_ticker=o.etf_ticker
                                     AND r.effective_date=o.effective_date
                     WHERE o.provider='fmp'
@@ -710,7 +725,7 @@ class FmpEtfConstituentStore:
         membership_packets = []
         for row in memberships:
             payload = self._packet_row(
-                row, membership_availability[int(row["rowid"])]
+                row, membership_availability[self._availability_key(row)]
             )
             payload.update(
                 composition.get(
@@ -739,7 +754,10 @@ class FmpEtfConstituentStore:
             ),
             "availability_policy": etf_constituent_policy_manifest(),
             "constituents": [
-                self._packet_row(row, holding_availability[int(row["rowid"])])
+                self._packet_row(
+                    row,
+                    holding_availability[self._availability_key(row)],
+                )
                 for row in holdings
             ],
             "etf_memberships": membership_packets,
@@ -766,10 +784,14 @@ class FmpEtfConstituentLayer:
         database: Database,
         http: HttpCaptureClient,
         api_key: Optional[str],
+        *,
+        initialize_schema: bool = True,
     ):
         self.database = database
         self.provider = FmpEtfConstituentProvider(http, api_key)
-        self.store = FmpEtfConstituentStore(database)
+        self.store = FmpEtfConstituentStore(
+            database, initialize_schema=initialize_schema
+        )
 
     def backfill(
         self,

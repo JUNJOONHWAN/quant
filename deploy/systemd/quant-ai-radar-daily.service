@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily full-universe FMP Massive ETF RADAR trained-AI analysis
+Description=Daily Oracle-shared full scan and prioritized Quant AI Radar analysis
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/home/zooh/.config/quant/quant-ai-radar.env
@@ -11,7 +11,7 @@ WorkingDirectory=/home/zooh/Documents/GitHub/quant
 Environment=PYTHONPATH=/home/zooh/Documents/GitHub/quant
 EnvironmentFile=/home/zooh/.config/quant/quant-ai-radar.env
 ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs
-ExecStart=/home/zooh/Documents/GitHub/ETFRADAR/.venv/bin/python -m workflows.quant_ai_radar.run_daily_cycle
+ExecStart=/usr/bin/python3 -m workflows.quant_ai_radar.run_daily_cycle
 TimeoutStartSec=infinity
 Nice=5
 IOSchedulingClass=best-effort

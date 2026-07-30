@@ -13,6 +13,7 @@ import uuid
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -247,10 +248,11 @@ class MassiveEtfFlowProvider:
 class EtfFlowStore:
     """Append-only ETF flow versions, latest projections, and resume state."""
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, initialize_schema: bool = True):
         self.database = database
         self._trading_sessions_cache: Optional[Tuple[str, ...]] = None
-        self.initialize()
+        if initialize_schema:
+            self.initialize()
 
     def _trading_sessions(self) -> Tuple[str, ...]:
         """Load the observed U.S. equity calendar once per packet-export run."""
@@ -827,11 +829,106 @@ class EtfFlowStore:
         selected_by_ticker: Dict[str, List[Tuple[Mapping[str, Any], str]]] = {
             ticker: [] for ticker in normalized_tickers
         }
-        with self.database.connect() as connection:
-            for offset in range(0, len(normalized_tickers), chunk_size):
-                chunk = normalized_tickers[offset : offset + chunk_size]
-                placeholders = ",".join("?" for _ in chunk)
-                rows = connection.execute(
+        direct_source_paths = getattr(self.database, "flow_source_paths", None)
+        if callable(direct_source_paths):
+            source_rows: List[dict] = []
+            for source_rank, source_path in enumerate(direct_source_paths()):
+                connection = sqlite3.connect(
+                    "file:{}?mode=ro".format(Path(source_path)),
+                    uri=True,
+                    timeout=120,
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    for ticker in normalized_tickers:
+                        rows = connection.execute(
+                            """
+                            SELECT v.*,r.payload_sha256,r.raw_relative_path
+                            FROM etf_flow_versions v
+                            JOIN raw_artifacts r ON r.id=v.raw_artifact_id
+                            WHERE v.ticker=?
+                              AND v.effective_date<?
+                              AND v.processed_date<?
+                              AND v.id=(
+                                SELECT v2.id
+                                FROM etf_flow_versions v2
+                                WHERE v2.ticker=v.ticker
+                                  AND v2.effective_date=v.effective_date
+                                  AND v2.processed_date<?
+                                ORDER BY v2.processed_date DESC,
+                                         v2.captured_at_utc DESC,v2.id DESC
+                                LIMIT 1
+                            )
+                            ORDER BY v.effective_date DESC
+                            LIMIT ?
+                            """,
+                            (
+                                ticker,
+                                previous_visible_session,
+                                latest_visible_session,
+                                latest_visible_session,
+                                lookback_records,
+                            ),
+                        ).fetchall()
+                        for row in rows:
+                            value = dict(row)
+                            value["_source_rank"] = source_rank
+                            source_rows.append(value)
+                finally:
+                    connection.close()
+            latest_by_effective: Dict[Tuple[str, str], dict] = {}
+            for row in source_rows:
+                key = (str(row["ticker"]), str(row["effective_date"]))
+                rank = (
+                    str(row["processed_date"]),
+                    str(row["captured_at_utc"]),
+                    int(row["id"]),
+                    int(row["_source_rank"]),
+                )
+                current = latest_by_effective.get(key)
+                current_rank = (
+                    (
+                        str(current["processed_date"]),
+                        str(current["captured_at_utc"]),
+                        int(current["id"]),
+                        int(current["_source_rank"]),
+                    )
+                    if current
+                    else None
+                )
+                if current_rank is None or rank > current_rank:
+                    latest_by_effective[key] = row
+            rows_by_ticker: Dict[str, List[dict]] = {
+                ticker: [] for ticker in normalized_tickers
+            }
+            for row in latest_by_effective.values():
+                rows_by_ticker[str(row["ticker"])].append(row)
+            direct_rows = []
+            for ticker in normalized_tickers:
+                ordered = sorted(
+                    rows_by_ticker[ticker],
+                    key=lambda row: (
+                        str(row["effective_date"]),
+                        str(row["processed_date"]),
+                        str(row["captured_at_utc"]),
+                    ),
+                )
+                direct_rows.extend(ordered[-lookback_records:])
+            for row in direct_rows:
+                available = derive_etf_flow_available_session(
+                    row["effective_date"], row["processed_date"], sessions
+                )
+                if available is None or available > as_of:
+                    raise ValueError(
+                        "bulk ETF-flow visibility predicate admitted a future row"
+                    )
+                selected_by_ticker[str(row["ticker"])].append((row, available))
+        else:
+            with self.database.connect() as connection:
+                for offset in range(0, len(normalized_tickers), chunk_size):
+                    chunk = normalized_tickers[offset : offset + chunk_size]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = connection.execute(
                     """
                     WITH revision_ranked AS (
                         SELECT v.*, r.payload_sha256, r.raw_relative_path,
@@ -863,16 +960,16 @@ class EtfFlowStore:
                         latest_visible_session,
                         lookback_records,
                     ],
-                ).fetchall()
-                for row in rows:
-                    available = derive_etf_flow_available_session(
-                        row["effective_date"], row["processed_date"], sessions
-                    )
-                    if available is None or available > as_of:
-                        raise ValueError(
-                            "bulk ETF-flow visibility predicate admitted a future row"
+                    ).fetchall()
+                    for row in rows:
+                        available = derive_etf_flow_available_session(
+                            row["effective_date"], row["processed_date"], sessions
                         )
-                    selected_by_ticker[str(row["ticker"])].append((row, available))
+                        if available is None or available > as_of:
+                            raise ValueError(
+                                "bulk ETF-flow visibility predicate admitted a future row"
+                            )
+                        selected_by_ticker[str(row["ticker"])].append((row, available))
         for ticker, selected in selected_by_ticker.items():
             result[ticker] = self._packet_document(as_of, selected)
         return result
@@ -1018,8 +1115,12 @@ class EtfFlowLayer:
         database: Database,
         http: HttpCaptureClient,
         api_key: Optional[str],
+        *,
+        initialize_schema: bool = True,
     ):
-        self.store = EtfFlowStore(database)
+        self.store = EtfFlowStore(
+            database, initialize_schema=initialize_schema
+        )
         self.provider = MassiveEtfFlowProvider(http, api_key)
 
     @staticmethod

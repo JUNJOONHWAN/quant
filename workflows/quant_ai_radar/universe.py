@@ -6,10 +6,11 @@ import json
 import hashlib
 import sqlite3
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 ACCEPTED_QUALITY = ("pass", "warn", "single_source")
@@ -35,18 +36,35 @@ class Candidate:
         }
 
 
-def connect_readonly(database: Path) -> sqlite3.Connection:
+@contextmanager
+def connect_readonly(database: Any) -> Iterator[sqlite3.Connection]:
+    """Open either one SQLite file or a Database-compatible shared overlay."""
+
+    connector = getattr(database, "connect", None)
+    if callable(connector):
+        with connector() as connection:
+            yield connection
+        return
     path = Path(database).expanduser().resolve()
     if not path.is_file():
         raise UniverseError(f"normalized dataset database is missing: {path}")
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
-def resolve_as_of_date(database: Path, requested: str | None = None) -> str:
+def resolve_as_of_date(database: Any, requested: str | None = None) -> str:
     if requested:
         return date.fromisoformat(requested).isoformat()
+    latest_quality_date = getattr(database, "latest_quality_date", None)
+    if callable(latest_quality_date):
+        observed = latest_quality_date()
+        if not observed:
+            raise UniverseError("no quality-eligible positive-volume market date exists")
+        return str(observed)
     with connect_readonly(database) as connection:
         row = connection.execute(
             """
@@ -63,10 +81,13 @@ def resolve_as_of_date(database: Path, requested: str | None = None) -> str:
     return str(row["trade_date"])
 
 
-def dataset_source_fingerprint(database: Path, as_of_date: str) -> dict[str, Any]:
+def dataset_source_fingerprint(database: Any, as_of_date: str) -> dict[str, Any]:
     """Build a retry-stable fingerprint from persisted source rows, not timestamps."""
 
     as_of = date.fromisoformat(as_of_date).isoformat()
+    source_fingerprint = getattr(database, "source_fingerprint", None)
+    if callable(source_fingerprint):
+        return source_fingerprint(as_of)
     queries = {
         # MAX(rowid/id) is index-tail O(1). A new or revised persisted source
         # row changes the value, while a checkpoint-only retry leaves it stable.
@@ -108,7 +129,12 @@ def _symbol_set(
     }
 
 
-def scan_universe(database: Path, as_of_date: str) -> tuple[list[Candidate], dict[str, Any]]:
+def scan_universe(
+    database: Any,
+    as_of_date: str,
+    *,
+    relation_index_path: Path | None = None,
+) -> tuple[list[Candidate], dict[str, Any]]:
     """Scan every observed symbol, then select every ETF-related candidate.
 
     No fixed ticker list or top-N gate is used here.  Non-related securities are
@@ -117,46 +143,67 @@ def scan_universe(database: Path, as_of_date: str) -> tuple[list[Candidate], dic
     """
 
     as_of = date.fromisoformat(as_of_date).isoformat()
-    with connect_readonly(database) as connection:
-        price_rows = connection.execute(
-            """
-            SELECT q.symbol, q.status,
-                   MAX(CASE WHEN o.volume>0 AND o.close>0 THEN 1 ELSE 0 END) AS tradable
-            FROM quality_checks q
-            JOIN daily_observations o
-              ON o.symbol=q.symbol AND o.trade_date=q.trade_date
-            WHERE q.trade_date=?
-              AND q.status IN ('pass','warn','single_source')
-            GROUP BY q.symbol, q.status
-            ORDER BY q.symbol
-            """,
-            (as_of,),
-        ).fetchall()
-        flow_etfs = _symbol_set(
-            connection,
-            """
-            SELECT DISTINCT ticker FROM etf_flow_observations
-            WHERE effective_date<=? AND processed_date<=? AND fund_flow IS NOT NULL
-            """,
-            (as_of, as_of),
+    indexed_price_reader = getattr(database, "current_universe_price_rows", None)
+    if relation_index_path is not None and callable(indexed_price_reader):
+        price_rows = indexed_price_reader(as_of)
+    else:
+        with connect_readonly(database) as connection:
+            price_rows = connection.execute(
+                """
+                SELECT q.symbol, q.status,
+                       MAX(
+                         CASE WHEN o.volume>0 AND o.close>0 THEN 1 ELSE 0 END
+                       ) AS tradable
+                FROM quality_checks q
+                JOIN daily_observations o
+                  ON o.symbol=q.symbol AND o.trade_date=q.trade_date
+                WHERE q.trade_date=?
+                  AND q.status IN ('pass','warn','single_source')
+                GROUP BY q.symbol, q.status
+                ORDER BY q.symbol
+                """,
+                (as_of,),
+            ).fetchall()
+    if relation_index_path is None:
+        with connect_readonly(database) as connection:
+            flow_etfs = _symbol_set(
+                connection,
+                """
+                SELECT DISTINCT ticker FROM etf_flow_observations
+                WHERE effective_date<=? AND processed_date<=? AND fund_flow IS NOT NULL
+                """,
+                (as_of, as_of),
+            )
+            snapshot_etfs = _symbol_set(
+                connection,
+                """
+                SELECT DISTINCT etf_ticker FROM etf_constituent_snapshots
+                WHERE effective_date<=? AND available_date<=?
+                """,
+                (as_of, as_of),
+            )
+            membership_stocks = _symbol_set(
+                connection,
+                """
+                SELECT DISTINCT constituent_ticker FROM etf_constituent_observations
+                WHERE effective_date<=? AND available_date<=?
+                  AND constituent_ticker IS NOT NULL AND constituent_ticker<>''
+                """,
+                (as_of, as_of),
+            )
+        relation_source = "direct_historical_scan"
+    else:
+        # Imported lazily so legacy single-file dataset scans remain usable
+        # in tests and offline diagnostics.
+        from workflows.quant_ai_radar.relation_index import (
+            visible_relation_sets,
         )
-        snapshot_etfs = _symbol_set(
-            connection,
-            """
-            SELECT DISTINCT etf_ticker FROM etf_constituent_snapshots
-            WHERE effective_date<=? AND available_date<=?
-            """,
-            (as_of, as_of),
-        )
-        membership_stocks = _symbol_set(
-            connection,
-            """
-            SELECT DISTINCT constituent_ticker FROM etf_constituent_observations
-            WHERE effective_date<=? AND available_date<=?
-              AND constituent_ticker IS NOT NULL AND constituent_ticker<>''
-            """,
-            (as_of, as_of),
-        )
+
+        indexed = visible_relation_sets(relation_index_path, as_of)
+        flow_etfs = indexed["massive_etf_flow"]
+        snapshot_etfs = indexed["fmp_etf_constituents"]
+        membership_stocks = indexed["fmp_etf_membership"]
+        relation_source = "persistent_incremental_relation_index"
 
     # The source tables carry both effective and provider-available dates.  The
     # exact next-session visibility gate is applied again by analysis_packet_v3.
@@ -217,6 +264,10 @@ def scan_universe(database: Path, as_of_date: str) -> tuple[list[Candidate], dic
             "fmp_etf_snapshot_tickers": len(snapshot_etfs),
             "fmp_etf_member_symbols": len(membership_stocks),
         },
+        "relation_source": relation_source,
+        "historical_relation_tables_scanned_this_run": (
+            relation_index_path is None
+        ),
         "control_policy": (
             "symbols with no visible ETF flow, ETF constituent snapshot, or ETF membership "
             "remain counted but are outside this ETF-grounded inference product"

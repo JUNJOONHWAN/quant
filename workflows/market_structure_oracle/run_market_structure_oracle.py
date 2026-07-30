@@ -29,6 +29,11 @@ from quant_dataset.point_in_time import (  # noqa: E402
     ETF_FLOW_POLICY_ID,
     derive_etf_flow_available_session,
 )
+from workflows.market_structure_oracle.incremental_store import (  # noqa: E402
+    IncrementalStoreError,
+    ensure_oracle_snapshot,
+    expected_nyse_sessions,
+)
 
 
 DEFAULT_DATABASE = Path(
@@ -42,12 +47,13 @@ DEFAULT_UNIVERSE = Path(
 DEFAULT_OUTPUT_ROOT = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/oracle"
 )
+DEFAULT_INCREMENTAL_ROOT = DEFAULT_OUTPUT_ROOT / "incremental"
 SOURCE = "fmp"
 NORMALIZATION_SESSIONS = 504
 ANALOG_COUNT = 30
 ANALOG_EMBARGO_SESSIONS = 10
-STATE_CUBE_SCHEMA = "quant.market_structure_state_cube.v1"
-OUTPUT_SCHEMA = "quant.market_structure_oracle.v2"
+STATE_CUBE_SCHEMA = "quant.market_structure_state_cube.v2"
+OUTPUT_SCHEMA = "quant.market_structure_oracle.v3"
 SCOPE_REGISTRY = {
     "technology": {
         "label_ko": "기술",
@@ -348,8 +354,40 @@ def _connect_read_only(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
         f"file:{database_path}?mode=ro", uri=True, timeout=60
     )
-    connection.execute("PRAGMA query_only=ON")
+    # ``mode=ro`` makes the attached source immutable while still allowing
+    # TEMP views that combine the immutable history and Oracle delta.
     connection.execute("PRAGMA temp_store=MEMORY")
+    return connection
+
+
+def _connect_oracle_view(
+    database_path: Path, incremental_database_path: Path
+) -> sqlite3.Connection:
+    """Expose immutable FMP history plus Oracle-owned Massive delta as temp views."""
+    if not incremental_database_path.is_file():
+        raise OracleError(f"incremental database missing: {incremental_database_path}")
+    connection = _connect_read_only(database_path)
+    connection.execute(
+        "ATTACH DATABASE ? AS oracle_incremental",
+        (f"file:{incremental_database_path}?mode=ro",),
+    )
+    connection.executescript(
+        """
+        CREATE TEMP VIEW oracle_daily_observations AS
+          SELECT * FROM main.daily_observations WHERE source='fmp'
+          UNION ALL
+          SELECT * FROM oracle_incremental.daily_observations
+          WHERE source IN ('massive','fmp');
+        CREATE TEMP VIEW oracle_quality_checks AS
+          SELECT * FROM main.quality_checks
+          UNION ALL
+          SELECT * FROM oracle_incremental.quality_checks;
+        CREATE TEMP VIEW oracle_etf_flow_observations AS
+          SELECT * FROM main.etf_flow_observations
+          UNION ALL
+          SELECT * FROM oracle_incremental.etf_flow_observations;
+        """
+    )
     return connection
 
 
@@ -413,12 +451,12 @@ def _load_calendar(
     connection: sqlite3.Connection, as_of: str | None
 ) -> list[str]:
     upper_clause = " AND trade_date<=?" if as_of else ""
-    parameters: tuple[Any, ...] = (SOURCE, as_of) if as_of else (SOURCE,)
+    parameters: tuple[Any, ...] = (as_of,) if as_of else ()
     rows = connection.execute(
         f"""
         SELECT trade_date
-        FROM daily_observations
-        WHERE source=? AND symbol IN ('SPY','QQQ')
+        FROM oracle_daily_observations
+        WHERE symbol IN ('SPY','QQQ')
           AND volume>0 AND COALESCE(adjusted_close,close)>0
           {upper_clause}
         GROUP BY trade_date
@@ -448,14 +486,14 @@ def _load_daily_matrices(
         """
         SELECT d.symbol, d.trade_date,
                COALESCE(d.adjusted_close,d.close), d.volume
-        FROM daily_observations d
-        LEFT JOIN quality_checks q
+        FROM oracle_daily_observations d
+        LEFT JOIN oracle_quality_checks q
           ON q.symbol=d.symbol AND q.trade_date=d.trade_date
-        WHERE d.source=? AND d.trade_date<=?
+        WHERE d.trade_date<=?
           AND (q.status IS NULL OR q.status!='invalid')
         ORDER BY d.trade_date,d.symbol
         """,
-        (SOURCE, dates[-1]),
+        (dates[-1],),
     )
     scanned = 0
     while True:
@@ -504,7 +542,7 @@ def _flow_features(
                SUM(CASE WHEN fund_flow>0 THEN 1 ELSE 0 END),
                SUM(CASE WHEN fund_flow<0 THEN 1 ELSE 0 END),
                COUNT(fund_flow),COUNT(DISTINCT ticker),COUNT(*)
-        FROM etf_flow_observations
+        FROM oracle_etf_flow_observations
         WHERE effective_date<=?
           {ticker_clause}
         GROUP BY effective_date,processed_date
@@ -757,8 +795,43 @@ def _state_cube_directory(output_root: Path, as_of_date: str) -> Path:
     return output_root / "state_cubes" / as_of_date
 
 
+def _incremental_data_fingerprint(incremental_database_path: Path) -> dict[str, Any]:
+    """Hash data-bearing tables only; audit-run rows must not evict a valid cube."""
+    connection = sqlite3.connect(
+        f"file:{incremental_database_path}?mode=ro", uri=True
+    )
+    try:
+        daily = connection.execute(
+            """SELECT source,trade_date,COUNT(*),MIN(raw_artifact_id),MAX(raw_artifact_id)
+               FROM daily_observations GROUP BY source,trade_date ORDER BY source,trade_date"""
+        ).fetchall()
+        flows = connection.execute(
+            """SELECT MAX(effective_date),MAX(processed_date),COUNT(*),
+                      COUNT(DISTINCT ticker),MAX(record_hash)
+               FROM etf_flow_observations"""
+        ).fetchone()
+        seals = connection.execute(
+            """SELECT target_as_of_date,schema_version,source_contract,receipt_sha256
+               FROM oracle_snapshot_seals ORDER BY target_as_of_date"""
+        ).fetchall()
+    finally:
+        connection.close()
+    content = json.dumps(
+        {"daily": daily, "flows": flows, "snapshot_seals": seals},
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return {
+        "path": str(incremental_database_path),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "daily_session_count": len(daily),
+        "snapshot_seal_count": len(seals),
+    }
+
+
 def _state_cube_fingerprint(
     database_path: Path,
+    incremental_database_path: Path,
     universe_path: Path,
     as_of_date: str,
 ) -> dict[str, Any]:
@@ -767,10 +840,13 @@ def _state_cube_fingerprint(
         "database": str(database_path),
         "database_size": stat.st_size,
         "database_mtime_ns": stat.st_mtime_ns,
+        "incremental_data": _incremental_data_fingerprint(
+            incremental_database_path
+        ),
         "universe": str(universe_path),
         "universe_sha256": _sha256(universe_path),
         "as_of_date": as_of_date,
-        "price_source": SOURCE,
+        "price_source": "fmp_baseline_plus_massive_incremental",
         "flow_policy_id": ETF_FLOW_POLICY_ID,
     }
 
@@ -893,6 +969,7 @@ def _load_or_build_state_cube(
     connection: sqlite3.Connection,
     *,
     database_path: Path,
+    incremental_database_path: Path,
     universe_path: Path,
     output_root: Path,
     as_of: str | None,
@@ -910,7 +987,7 @@ def _load_or_build_state_cube(
     dates = _load_calendar(connection, as_of)
     cube_directory = _state_cube_directory(output_root, dates[-1])
     fingerprint = _state_cube_fingerprint(
-        database_path, universe_path, dates[-1]
+        database_path, incremental_database_path, universe_path, dates[-1]
     )
     cached = _load_state_cube(cube_directory, fingerprint)
     if cached is not None:
@@ -995,6 +1072,20 @@ def _resolve_scope(request: dict[str, Any] | None) -> dict[str, Any] | None:
     query = str(request.get("query") or "").strip()
     requested_scope = str(request.get("scope") or "").strip().lower()
     explicit_etfs = request.get("etfs")
+    full_market_aliases = (
+        "full_market",
+        "full market",
+        "market structure",
+        "전체 시장",
+        "전체시장",
+        "시장 구조",
+    )
+    if (
+        explicit_etfs is None
+        and not requested_scope
+        and (not query or any(alias in query.lower() for alias in full_market_aliases))
+    ):
+        return None
     if explicit_etfs is not None:
         if (
             not isinstance(explicit_etfs, list)
@@ -1805,6 +1896,31 @@ def _render_html(payload: dict[str, Any]) -> str:
     forecast = payload["forecast"]
     validation = payload["walk_forward_validation"]
     scope = payload.get("scope_analysis")
+    incremental = payload["incremental_market_data"]
+    source_rows = "".join(
+        (
+            "<tr><td>Massive grouped daily</td><td>Massive</td>"
+            f"<td>{html.escape(str(session))}</td><td>Oracle single writer</td>"
+            f"<td>{int(rows):,}</td></tr>"
+        )
+        for session, rows in (
+            incremental["market_row_gate"]["rows_by_session"].items()
+        )
+    )
+    source_rows += (
+        "<tr><td>ETF fund flow</td><td>Massive ETF Global</td>"
+        f"<td>{html.escape(str(incremental['etf_flow']['latest_effective_date']))}</td>"
+        "<td>D+2 PIT gate</td>"
+        f"<td>{int(incremental['etf_flow']['record_count']):,}</td></tr>"
+    )
+    incremental_section = f"""<section class=\"card\"><h2>현재 시장 증분 DB — 완결</h2>
+<p>기준 원본 FMP 장기 이력 종료 <b>{incremental['base_history_end']}</b> →
+현재 기준일 <b>{incremental['target_as_of_date']}</b>. 누락 거래일 없이
+{len(incremental['expected_sessions'])}개 NYSE 세션을 Massive 전시장 일봉으로 누적했습니다.</p>
+<p class=\"muted\">가격 전환: {html.escape(incremental['base_price_source'])} +
+{html.escape(incremental['incremental_price_source'])}. ETF Flow는 D+2 기준
+effective <b>{incremental['etf_flow']['latest_effective_date']}</b>까지 반영됩니다.</p>
+<table><thead><tr><th>보관 테이블</th><th>출처</th><th>기준일</th><th>수집시각 UTC</th><th>행 수</th></tr></thead><tbody>{source_rows}</tbody></table></section>"""
     forecast_rows = "".join(
         "<tr>"
         f"<td>{horizon} sessions</td>"
@@ -1891,14 +2007,15 @@ h1,h2{{margin:0 0 12px}}.muted{{color:#9aa8c2}}.metric{{font-size:32px;font-weig
 table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{padding:9px;border-bottom:1px solid #26314b;text-align:right}}
 th:first-child,td:first-child{{text-align:left}}code{{color:#93c5fd}}.warn{{color:#fbbf24}}
 </style></head><body><main>
-<p class="muted">Hermes Worker App · Frozen SOT · ETF Flow D+2 · no external overlay</p>
-<h1>Market Structure Oracle</h1><p class="muted">As of {payload['as_of_date']}</p>
+<p class="muted">Hermes Worker App · frozen PIT history + audited current ETF overlay</p>
+<h1>Market Structure Oracle</h1><p class="muted">장기 데이터 기준일 {payload['as_of_date']} · 실행 UTC {payload['created_at_utc']}</p>
 <section class="grid">
 <div class="card"><div class="muted">구조 레짐</div><div class="metric">{current['regime']}</div></div>
 <div class="card"><div class="muted">구조 점수</div><div class="metric">{current['structural_score']:+.2f}z</div></div>
 <div class="card"><div class="muted">관측 유니버스</div><div class="metric">{payload['coverage']['symbols_with_observations']:,}</div></div>
 <div class="card"><div class="muted">Flow D+2 최신 effective</div><div class="metric">{payload['coverage']['latest_effective_date_visible']}</div></div>
 </section>
+{incremental_section}
 {scope_section}
 <section class="card"><h2>조건부 경로와 평상시 기준</h2><table><thead><tr>
 <th>기간</th><th>P10</th><th>중앙값</th><th>P90</th><th>상승</th><th>평상시 중앙</th><th>평상시 상승</th>
@@ -1914,9 +2031,7 @@ th:first-child,td:first-child{{text-align:left}}code{{color:#93c5fd}}.warn{{colo
 <b>{validation['always_up_hit_rate']:.1%}</b> · Brier skill
 <b>{validation['brier_skill_vs_expanding_base']:+.1%}</b></p>
 <p class="warn">{validation['forecast_confidence']}</p></section>
-<section class="card"><h2>실행 계약</h2><p>Hermes Worker가 앱을 실행했다.
-원천 DB는 read-only이고 특징은 각 날짜까지의 정보만 사용한다.
-ETF Flow는 <code>{ETF_FLOW_POLICY_ID}</code>로 노출하며 미래 수익률은 결과 라벨에만 사용한다.</p></section>
+<section class="card"><h2>출처·기간·대상 계약</h2><p>장기 PIT 상태 큐브: FMP 기준 이력 + Oracle 증분 Massive 전시장 일봉 {payload['coverage']['calendar_start']} → {payload['coverage']['calendar_end']} · {payload['coverage']['sessions']:,} 세션 · {payload['coverage']['symbols_with_observations']:,} 심볼. ETF Flow는 {payload['coverage']['latest_effective_date_visible']} effective까지 D+2 정책으로 반영합니다.</p><p>Oracle이 Massive 일봉·ETF Flow와 FMP ETF 구성종목을 단일 writer로 갱신하고 봉인합니다. ETF RADAR는 별도 앱이며 이 리포트의 데이터·릴리스 게이트가 아닙니다.</p></section>
 </main></body></html>"""
 
 
@@ -1926,10 +2041,27 @@ def run_oracle(
     universe_path: Path,
     output_root: Path,
     as_of: str | None,
+    incremental_root: Path = DEFAULT_INCREMENTAL_ROOT,
     request_file: Path | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
+    try:
+        incremental = ensure_oracle_snapshot(
+            base_database=database_path,
+            incremental_root=incremental_root,
+            target_as_of_date=as_of,
+        )
+    except IncrementalStoreError as exc:
+        raise OracleError(f"incremental market-data gate failed: {exc}") from exc
+    target_as_of = str(incremental["target_as_of_date"])
+    if as_of is not None and as_of != target_as_of:
+        raise OracleError(
+            f"as-of must equal completed incremental target {target_as_of}, got {as_of}"
+        )
+    as_of = target_as_of
+    incremental_database_path = Path(str(incremental["database"]))
     before = database_path.stat()
+    incremental_before = incremental_database_path.stat()
     request = _load_request(request_file)
     scope_definition = _resolve_scope(request)
     symbols = sorted(
@@ -1939,7 +2071,7 @@ def run_oracle(
             if line.strip()
         }
     )
-    connection = _connect_read_only(database_path)
+    connection = _connect_oracle_view(database_path, incremental_database_path)
     try:
         (
             dates,
@@ -1953,6 +2085,7 @@ def run_oracle(
         ) = _load_or_build_state_cube(
             connection,
             database_path=database_path,
+            incremental_database_path=incremental_database_path,
             universe_path=universe_path,
             output_root=output_root,
             as_of=as_of,
@@ -1988,7 +2121,7 @@ def run_oracle(
                 "coverage": scope_coverage,
             }
         invalid_count = connection.execute(
-            "SELECT COUNT(*) FROM quality_checks WHERE status='invalid'"
+            "SELECT COUNT(*) FROM oracle_quality_checks WHERE status='invalid'"
         ).fetchone()[0]
     finally:
         connection.close()
@@ -2073,6 +2206,12 @@ def run_oracle(
     after = database_path.stat()
     if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
         raise OracleError("source database changed during read-only analysis")
+    incremental_after = incremental_database_path.stat()
+    if (
+        incremental_before.st_size != incremental_after.st_size
+        or incremental_before.st_mtime_ns != incremental_after.st_mtime_ns
+    ):
+        raise OracleError("incremental database changed during read-only analysis")
 
     payload: dict[str, Any] = {
         "schema": OUTPUT_SCHEMA,
@@ -2089,13 +2228,16 @@ def run_oracle(
         "request": request,
         "source_contract": {
             "database": str(database_path),
+            "incremental_database": str(incremental_database_path),
             "universe": str(universe_path),
-            "price_source": SOURCE,
+            "price_source": "FMP immutable baseline + Massive full-market incremental sessions",
             "flow_policy_id": ETF_FLOW_POLICY_ID,
-            "external_overlay": False,
+            "incremental_repair_required_before_report": True,
+            "source_owner": "market_structure_oracle_single_writer",
+            "etf_radar_runtime_dependency": False,
             "lookahead_in_features": False,
             "future_returns_role": "labels_only",
-            "database_open_mode": "read_only_query_only",
+            "database_open_mode": "sqlite_uri_mode_ro + temp_union_views",
         },
         "coverage": {
             "calendar_start": dates[0],
@@ -2115,6 +2257,7 @@ def run_oracle(
             "matrix_shape": cube_metadata["matrix_shape"],
             "source_fingerprint": cube_metadata["source_fingerprint"],
         },
+        "incremental_market_data": incremental,
         "current_structure": current,
         "analog_method": {
             "feature_count": len(STATE_FEATURES),
@@ -2136,6 +2279,11 @@ def run_oracle(
             "before_mtime_ns": before.st_mtime_ns,
             "after_mtime_ns": after.st_mtime_ns,
             "unchanged": True,
+            "incremental_before_size": incremental_before.st_size,
+            "incremental_after_size": incremental_after.st_size,
+            "incremental_before_mtime_ns": incremental_before.st_mtime_ns,
+            "incremental_after_mtime_ns": incremental_after.st_mtime_ns,
+            "incremental_unchanged_during_analysis": True,
         },
         "duration_seconds": round(time.monotonic() - started, 3),
     }
@@ -2203,6 +2351,7 @@ def run_oracle(
         ),
         "state_cube_cache_hit": cube_cache_hit,
         "source_database_unchanged": True,
+        "incremental_market_data_status": incremental["status"],
         "outputs": payload["outputs"],
     }
 
@@ -2214,6 +2363,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--incremental-root", type=Path, default=DEFAULT_INCREMENTAL_ROOT)
     parser.add_argument("--as-of")
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--preflight", action="store_true")
@@ -2234,6 +2384,7 @@ def main() -> int:
                 universe_path=args.universe,
                 output_root=args.output_root,
                 as_of=args.as_of,
+                incremental_root=args.incremental_root,
                 request_file=args.request_file,
             )
     except Exception as exc:

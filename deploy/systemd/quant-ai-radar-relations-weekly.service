@@ -8,7 +8,7 @@ Type=oneshot
 WorkingDirectory=/home/zooh/Documents/GitHub/quant
 Environment=PYTHONPATH=/home/zooh/Documents/GitHub/quant
 ExecStartPre=/usr/bin/mkdir -p /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/logs
-ExecStart=/home/zooh/Documents/GitHub/ETFRADAR/.venv/bin/python -m workflows.quant_ai_radar.refresh_weekly_relations
+ExecStart=/usr/bin/python3 -m workflows.quant_ai_radar.refresh_weekly_relations
 TimeoutStartSec=infinity
 Nice=5
 IOSchedulingClass=best-effort

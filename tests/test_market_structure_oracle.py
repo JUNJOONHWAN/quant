@@ -81,6 +81,12 @@ def test_preflight_stdout_contract_is_json_serializable(tmp_path, monkeypatch):
     assert json.loads(json.dumps(payload))["status"] == "PREFLIGHT_PASS"
 
 
+def test_oracle_incremental_calendar_excludes_standard_nyse_closures():
+    module = _load_module()
+    sessions = module.expected_nyse_sessions("2026-07-02", "2026-07-06")
+    assert sessions == ["2026-07-02", "2026-07-06"]
+
+
 def test_scope_resolution_keeps_global_context_and_supports_etf_baskets():
     module = _load_module()
     resolved = module._resolve_scope(
@@ -98,6 +104,7 @@ def test_scope_resolution_keeps_global_context_and_supports_etf_baskets():
     assert custom["scope_id"] == "my_gold"
     assert custom["etfs"] == ["GDX", "GDXJ"]
     assert module._resolve_scope({"scope": "full_market"}) is None
+    assert module._resolve_scope({"query": "현재 전체 시장 구조를 오라클로 분석"}) is None
 
 
 def test_pit_membership_activates_only_on_available_date():

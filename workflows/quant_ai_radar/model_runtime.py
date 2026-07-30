@@ -68,6 +68,10 @@ class InferenceError(RuntimeError):
     """Raised when the one authorized model endpoint cannot answer."""
 
 
+class ModelResponseParseError(InferenceError):
+    """Raised when the endpoint answered but its assistant content is not JSON."""
+
+
 class ResponseContractError(RuntimeError):
     """Raised when a model response mutates facts or violates analysis scope."""
 
@@ -86,6 +90,47 @@ def contract_repair_instruction(
         raise ResponseContractError(
             "expected response has no deterministic facts for contract repair"
         )
+    interpretation = expected_response.get("interpretation")
+    if not isinstance(interpretation, Mapping):
+        raise ResponseContractError(
+            "expected response has no interpretation contract for repair"
+        )
+    required_interpretation = {
+        "scope": interpretation.get("scope"),
+        "task_type": interpretation.get("task_type"),
+        "price_signal": interpretation.get("price_signal"),
+        "etf_flow_signal": interpretation.get("etf_flow_signal"),
+        "etf_flow_signal_source": interpretation.get(
+            "etf_flow_signal_source"
+        ),
+        "relationship": interpretation.get("relationship"),
+        "regime": expected_response.get("regime"),
+        "allowed_price_signal_values": sorted(SIGNALS),
+        "allowed_etf_flow_signal_values": sorted(SIGNALS),
+        "allowed_regime_values": sorted(REGIMES),
+    }
+    if (
+        required_interpretation["scope"]
+        != "data_interpretation_not_trade_execution"
+        or required_interpretation["task_type"] not in TASK_TYPES
+        or required_interpretation["price_signal"] not in SIGNALS
+        or required_interpretation["etf_flow_signal"] not in SIGNALS
+        or required_interpretation["etf_flow_signal_source"]
+        not in FLOW_SIGNAL_SOURCES
+        or required_interpretation["relationship"] not in REGIMES
+        or required_interpretation["regime"] not in REGIMES
+    ):
+        raise ResponseContractError(
+            "expected response has invalid deterministic interpretation fields"
+        )
+    interpretation_clause = (
+        "아래 REQUIRED_INTERPRETATION_CONTRACT_JSON의 scope, task_type, "
+        "price_signal, etf_flow_signal, etf_flow_signal_source, relationship, "
+        "regime은 정확히 그대로 사용하라. allowed 목록은 형식 검증용이며 "
+        "다른 허용값으로 바꾸면 안 된다.\n"
+        "REQUIRED_INTERPRETATION_CONTRACT_JSON="
+        f"{canonical_json(required_interpretation)}\n"
+    )
     if "fields do not match the contract" not in contract_error:
         return (
             "이전 응답은 계약 위반이다. 입력 시점 이후 날짜를 만들거나 결정론적 "
@@ -94,6 +139,7 @@ def contract_repair_instruction(
             "JSON 객체만 다시 출력하라. 해석은 입력 시점에 이용 가능한 증거만 "
             "사용하고 매매 지시를 포함하지 마라.\n"
             f"DETERMINISTIC_FACTS_JSON={canonical_json(dict(facts))}\n"
+            f"{interpretation_clause}"
             "/no_think"
         )
     return (
@@ -105,6 +151,7 @@ def contract_repair_instruction(
         "매매 지시를 포함하지 마라.\n"
         f"ALLOWED_TOP_LEVEL_KEYS_JSON={canonical_json(list(REQUIRED_RESPONSE_KEYS))}\n"
         f"DETERMINISTIC_FACTS_JSON={canonical_json(dict(facts))}\n"
+        f"{interpretation_clause}"
         "/no_think"
     )
 
@@ -324,7 +371,9 @@ def parse_json_object(raw: str) -> dict[str, Any]:
             continue
         if isinstance(value, dict):
             return value
-    raise InferenceError("trained model response did not contain one valid JSON object")
+    raise ModelResponseParseError(
+        "trained model response did not contain one valid JSON object"
+    )
 
 
 Transport = Callable[[dict[str, Any], Mapping[str, str], int], dict[str, Any]]
@@ -364,7 +413,16 @@ class TrainedQuantClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 status = response.status
-        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            suffix = f": {detail[:2000]}" if detail else ""
+            raise InferenceError(
+                f"trained-model endpoint request failed: HTTP {exc.code}{suffix}"
+            ) from exc
+        except urllib.error.URLError as exc:
             raise InferenceError(f"trained-model endpoint request failed: {exc}") from exc
         if status != 200:
             raise InferenceError(f"trained-model endpoint returned HTTP {status}")
@@ -381,6 +439,7 @@ class TrainedQuantClient:
         *,
         messages: Sequence[Mapping[str, str]],
         max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         payload = {
             "model": self.release.endpoint_model,
@@ -388,7 +447,17 @@ class TrainedQuantClient:
             "temperature": 0,
             "seed": 1111,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
+            "response_format": (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "quant_ai_radar_response",
+                        "schema": dict(response_schema),
+                    },
+                }
+                if response_schema is not None
+                else {"type": "json_object"}
+            ),
             "chat_template_kwargs": {"enable_thinking": False},
         }
         headers = {
@@ -424,11 +493,19 @@ class TrainedQuantClient:
         *,
         messages: Sequence[Mapping[str, str]],
         max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         content, trace = self._complete_messages_raw(
-            messages=messages, max_tokens=max_tokens
+            messages=messages,
+            max_tokens=max_tokens,
+            response_schema=response_schema,
         )
-        return parse_json_object(content), trace
+        try:
+            return parse_json_object(content), trace
+        except ModelResponseParseError as exc:
+            exc.trace = trace
+            exc.raw_content = content
+            raise
 
     def complete(
         self,
@@ -436,6 +513,7 @@ class TrainedQuantClient:
         system: str,
         user: str,
         max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         return self.complete_messages(
             messages=[
@@ -443,6 +521,7 @@ class TrainedQuantClient:
                 {"role": "user", "content": user},
             ],
             max_tokens=max_tokens,
+            response_schema=response_schema,
         )
 
     def complete_validated(
@@ -543,6 +622,24 @@ def validate_symbol_judgement(
         raise ResponseContractError("symbol judgement escaped the analysis-only scope")
     if interpretation.get("task_type") != expected_interpretation.get("task_type"):
         raise ResponseContractError("symbol judgement changed the deterministic task type")
+    if interpretation.get("price_signal") != expected_interpretation.get(
+        "price_signal"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic price signal"
+        )
+    if interpretation.get("etf_flow_signal") != expected_interpretation.get(
+        "etf_flow_signal"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic ETF-flow signal"
+        )
+    if interpretation.get("etf_flow_signal_source") != expected_interpretation.get(
+        "etf_flow_signal_source"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic ETF-flow source"
+        )
     if interpretation.get("price_signal") not in SIGNALS:
         raise ResponseContractError("symbol judgement has an invalid price signal")
     if interpretation.get("etf_flow_signal") not in SIGNALS:
@@ -553,6 +650,14 @@ def validate_symbol_judgement(
         raise ResponseContractError("symbol judgement has an invalid task type")
     if value.get("regime") not in REGIMES:
         raise ResponseContractError("symbol judgement has an invalid regime")
+    if value.get("regime") != expected_response.get("regime"):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic regime"
+        )
+    if interpretation.get("relationship") != value.get("regime"):
+        raise ResponseContractError(
+            "symbol interpretation relationship does not match regime"
+        )
     confidence = value.get("confidence")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
         raise ResponseContractError("symbol judgement confidence must be numeric")

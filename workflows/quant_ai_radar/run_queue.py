@@ -48,6 +48,7 @@ class RadarQueue:
                     eligibility_json TEXT,
                     prompt_sha256 TEXT,
                     response_sha256 TEXT,
+                    trace_json TEXT,
                     result_json TEXT,
                     exclusion_reason TEXT,
                     error TEXT,
@@ -57,6 +58,12 @@ class RadarQueue:
                     ON items(status, symbol);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(items)")
+            }
+            if "trace_json" not in columns:
+                connection.execute("ALTER TABLE items ADD COLUMN trace_json TEXT")
             connection.execute(
                 "UPDATE items SET status='pending', error='interrupted_while_running' "
                 "WHERE status='running'"
@@ -145,13 +152,15 @@ class RadarQueue:
         eligibility: Mapping[str, Any],
         prompt_sha256: str,
         response_sha256: str,
+        trace: Mapping[str, Any],
         result: Mapping[str, Any],
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
                 UPDATE items SET status='done',actual_task_type=?,packet_id=?,
-                    eligibility_json=?,prompt_sha256=?,response_sha256=?,result_json=?,
+                    eligibility_json=?,prompt_sha256=?,response_sha256=?,
+                    trace_json=?,result_json=?,
                     exclusion_reason=NULL,error=NULL,updated_at_utc=? WHERE symbol=?
                 """,
                 (
@@ -160,6 +169,7 @@ class RadarQueue:
                     json.dumps(eligibility, sort_keys=True, ensure_ascii=False),
                     prompt_sha256,
                     response_sha256,
+                    json.dumps(trace, sort_keys=True, ensure_ascii=False),
                     json.dumps(result, sort_keys=True, ensure_ascii=False),
                     utc_now(),
                     symbol,
@@ -185,7 +195,7 @@ class RadarQueue:
     def done_results(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT symbol,actual_task_type,result_json FROM items "
+                "SELECT symbol,actual_task_type,result_json,trace_json FROM items "
                 "WHERE status='done' ORDER BY symbol"
             ).fetchall()
         return [
@@ -193,6 +203,11 @@ class RadarQueue:
                 "symbol": str(row["symbol"]),
                 "task_type": str(row["actual_task_type"]),
                 "judgement": json.loads(str(row["result_json"])),
+                "trace": (
+                    json.loads(str(row["trace_json"]))
+                    if row["trace_json"]
+                    else None
+                ),
             }
             for row in rows
         ]

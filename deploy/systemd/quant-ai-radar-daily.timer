@@ -1,9 +1,11 @@
 [Unit]
-Description=KST 09:15 Tue-Sat Quant AI Radar daily cycle (stored UTC)
+Description=KST 14:30 Tue-Sat Quant AI Radar daily cycle (stored UTC)
 
 [Timer]
-# KST intent: Tue-Sat 09:15 Asia/Seoul. Stored/executed: Tue-Sat 00:15 UTC.
-OnCalendar=Tue..Sat *-*-* 00:15:00 UTC
+# KST intent: Tue-Sat 14:30 Asia/Seoul. Stored/executed: Tue-Sat 05:30 UTC.
+# This is after the prior US calendar day has ended, which is required by the
+# configured Massive grouped-daily entitlement.
+OnCalendar=Tue..Sat *-*-* 05:30:00 UTC
 Persistent=true
 RandomizedDelaySec=0
 Unit=quant-ai-radar-daily.service

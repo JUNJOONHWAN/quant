@@ -1,123 +1,92 @@
 #!/usr/bin/env python3
-"""Refresh the live FMP universe and PIT ETF constituent relationship layer."""
+"""Run a larger weekly Oracle constituent refresh and rebuild relations."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
-import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from workflows.quant_ai_radar.refresh_daily_data import (
-    DailyRefreshError,
-    latest_completed_us_weekday,
+from quant_dataset.shared_market import (
+    DEFAULT_BASE_DATABASE,
+    DEFAULT_INCREMENTAL_DATABASE,
+    DEFAULT_ORACLE_STATUS,
+    load_shared_market_binding,
+)
+from workflows.market_structure_oracle.incremental_store import (
+    ensure_oracle_snapshot,
+)
+from workflows.quant_ai_radar.relation_index import (
+    DEFAULT_RELATION_INDEX,
+    refresh_relation_index,
 )
 from workflows.quant_ai_radar.universe import write_json
 
 
 KST = ZoneInfo("Asia/Seoul")
-QUANT_ROOT = Path("/home/zooh/Documents/GitHub/quant")
-DEFAULT_DATA_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET")
+DEFAULT_INCREMENTAL_ROOT = DEFAULT_INCREMENTAL_DATABASE.parent.parent
 DEFAULT_STATE = Path(
-    "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/status/weekly_relations.json"
+    "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/status/"
+    "weekly_relations.json"
 )
-
-
-def _run_json(command: list[str]) -> dict:
-    completed = subprocess.run(
-        command,
-        cwd=QUANT_ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise DailyRefreshError(
-            f"weekly relation command failed ({completed.returncode}): {detail[-4000:]}"
-        )
-    value = json.loads(completed.stdout)
-    if not isinstance(value, dict) or value.get("ok") is False:
-        raise DailyRefreshError(f"weekly relation command reported failure: {value}")
-    return value
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--market-date")
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--base-database", type=Path, default=DEFAULT_BASE_DATABASE)
     parser.add_argument(
-        "--secrets-file",
-        type=Path,
-        default=Path("/home/zooh/Documents/GitHub/STOCK/secrets.env"),
+        "--incremental-root", type=Path, default=DEFAULT_INCREMENTAL_ROOT
     )
-    parser.add_argument("--lookback-days", type=int, default=120)
+    parser.add_argument(
+        "--incremental-database",
+        type=Path,
+        default=DEFAULT_INCREMENTAL_DATABASE,
+    )
+    parser.add_argument("--oracle-status", type=Path, default=DEFAULT_ORACLE_STATUS)
+    parser.add_argument(
+        "--relation-index", type=Path, default=DEFAULT_RELATION_INDEX
+    )
+    parser.add_argument("--constituent-refresh-max-etfs", type=int, default=300)
+    parser.add_argument("--constituent-stale-days", type=int, default=45)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     args = parser.parse_args()
-    target = date.fromisoformat(
-        args.market_date or latest_completed_us_weekday()
-    )
-    start = target - timedelta(days=args.lookback_days)
-    root = args.data_root.expanduser().resolve()
-    common = [
-        sys.executable,
-        "-m",
-        "quant_dataset",
-        "--data-root",
-        str(root),
-        "--secrets-file",
-        str(args.secrets_file),
-    ]
     state = {
-        "schema_version": "quant.ai_radar_weekly_relations.v1",
+        "schema_version": "quant.ai_radar_weekly_relations.v2",
         "status": "running",
-        "target_date": target.isoformat(),
         "started_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
+        "source_owner": "market_structure_oracle_single_writer",
     }
     write_json(args.state_file, state)
     try:
-        universe = _run_json(
-            common + ["capture-fmp-universe", "--date", target.isoformat()]
+        status = ensure_oracle_snapshot(
+            base_database=args.base_database.expanduser().resolve(),
+            incremental_root=args.incremental_root.expanduser().resolve(),
+            target_as_of_date=args.market_date,
+            force_repair=True,
+            constituent_stale_days=args.constituent_stale_days,
+            constituent_refresh_max_etfs=args.constituent_refresh_max_etfs,
         )
-        universe_jsonl = Path(str(universe["jsonl_path"]))
-        filtered_symbols = root / "state" / "universe" / (
-            f"fmp_us_equity_etf_{target.strftime('%Y%m%d')}.symbols.txt"
+        binding = load_shared_market_binding(
+            base_database=args.base_database,
+            incremental_database=args.incremental_database,
+            oracle_status_path=args.oracle_status,
         )
-        symbol_result = _run_json(
-            [
-                sys.executable,
-                str(QUANT_ROOT / "scripts" / "build_fmp_us_equity_etf_symbols.py"),
-                "--input-jsonl",
-                str(universe_jsonl),
-                "--output-symbols",
-                str(filtered_symbols),
-            ]
-        )
-        constituents = _run_json(
-            common
-            + [
-                "backfill-fmp-etf-constituents",
-                "--from",
-                start.isoformat(),
-                "--to",
-                target.isoformat(),
-                "--universe-jsonl",
-                str(universe_jsonl),
-            ]
-        )
+        relation = refresh_relation_index(binding, args.relation_index)
         state.update(
             {
                 "status": "complete",
-                "completed_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
-                "universe": universe,
-                "filtered_symbols": symbol_result,
-                "constituents": constituents,
-                "historical_rows_preserved": True,
-                "present_day_active_list_used_for_historical_filter": False,
+                "completed_at_kst": datetime.now(KST).isoformat(
+                    timespec="seconds"
+                ),
+                "target_date": status["target_as_of_date"],
+                "oracle_ensure_mode": status["ensure_mode"],
+                "constituent_refresh": status["etf_constituents"],
+                "relation_index": relation,
+                "duplicate_collection": False,
+                "etf_radar_runtime_dependency": False,
             }
         )
     except Exception as exc:
@@ -126,7 +95,9 @@ def main() -> int:
                 "status": "error",
                 "error_type": type(exc).__name__,
                 "error": str(exc),
-                "failed_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
+                "failed_at_kst": datetime.now(KST).isoformat(
+                    timespec="seconds"
+                ),
             }
         )
         write_json(args.state_file, state)

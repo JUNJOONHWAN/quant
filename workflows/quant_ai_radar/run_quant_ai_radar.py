@@ -18,20 +18,26 @@ QUANT_ROOT = Path("/home/zooh/Documents/GitHub/quant")
 if str(QUANT_ROOT) not in sys.path:
     sys.path.insert(0, str(QUANT_ROOT))
 
-from quant_dataset.config import DEFAULT_SECRETS_PATH, load_credentials  # noqa: E402
+from quant_dataset.config import load_credentials  # noqa: E402
 from quant_dataset.pipeline import DatasetPipeline  # noqa: E402
+from quant_dataset.shared_market import (  # noqa: E402
+    DEFAULT_INCREMENTAL_DATABASE,
+    DEFAULT_ORACLE_STATUS,
+    SharedMarketStoreError,
+    SharedReadOnlyDatabase,
+    load_shared_market_binding,
+)
 from training.quant_llm.build_sft_dataset import (  # noqa: E402
     build_example,
     packet_eligibility,
 )
-from workflows.quant_ai_radar.etfradar_release import (  # noqa: E402
-    EtfRadarReleaseError,
-    load_release_evidence,
-)
 from workflows.quant_ai_radar.market_report import (  # noqa: E402
     aggregate_judgements,
-    etfradar_summary,
+    oracle_market_summary,
     synthesize_market,
+)
+from workflows.quant_ai_radar.oracle_features import (  # noqa: E402
+    build_oracle_market_features,
 )
 from workflows.quant_ai_radar.model_runtime import (  # noqa: E402
     InferenceError,
@@ -41,6 +47,11 @@ from workflows.quant_ai_radar.model_runtime import (  # noqa: E402
     load_model_release,
 )
 from workflows.quant_ai_radar.run_queue import RadarQueue  # noqa: E402
+from workflows.quant_ai_radar.relation_index import (  # noqa: E402
+    DEFAULT_RELATION_INDEX,
+    RelationIndexError,
+    load_verified_relation_index,
+)
 from workflows.quant_ai_radar.universe import (  # noqa: E402
     UniverseError,
     dataset_source_fingerprint,
@@ -49,15 +60,31 @@ from workflows.quant_ai_radar.universe import (  # noqa: E402
     write_candidates,
     write_json,
 )
+from workflows.quant_ai_radar.selection import (  # noqa: E402
+    select_daily_inference,
+)
+from workflows.quant_ai_radar.report_renderer import render_reports  # noqa: E402
+from workflows.quant_ai_radar.decision_support import (  # noqa: E402
+    audit_report_quality,
+    build_market_dashboard,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
 DEFAULT_DATA_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET")
-DEFAULT_ETFRADAR_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/ETFRADAR")
 DEFAULT_OUTPUT_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR")
 DEFAULT_RELEASE_MANIFEST = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/"
     "qwen3_8b_quant_lora_v1/release_manifest.json"
+)
+DEFAULT_SECRETS_PATH = Path("/home/zooh/.dgx-secrets/secrets.env")
+SUCCESSFUL_RUN_STATUSES = frozenset(
+    {
+        "complete",
+        "prepared_waiting_for_accepted_model",
+        "shadow_complete_not_published",
+        "smoke_complete_not_publishable",
+    }
 )
 
 
@@ -133,6 +160,7 @@ def _handle_future(
             eligibility=context["eligibility"],
             prompt_sha256=trace["request_sha256"],
             response_sha256=trace["response_sha256"],
+            trace=trace,
             result=judgement,
         )
     except Exception as exc:
@@ -142,47 +170,95 @@ def _handle_future(
 def run(args: argparse.Namespace) -> dict[str, Any]:
     data_root = args.data_root.expanduser().resolve()
     database = data_root / "normalized" / "daily_observations.sqlite3"
-    as_of = resolve_as_of_date(database, args.as_of_date)
+    shared_binding = load_shared_market_binding(
+        base_database=database,
+        incremental_database=args.oracle_incremental_database,
+        oracle_status_path=args.oracle_status,
+        max_constituent_available_lag_days=(
+            args.max_constituent_available_lag_days
+        ),
+    )
+    shared_database = SharedReadOnlyDatabase(shared_binding)
+    requested_as_of = args.as_of_date or shared_binding.target_as_of_date
+    if requested_as_of != shared_binding.target_as_of_date:
+        raise RadarRunError(
+            "as-of must match the sealed Oracle snapshot: "
+            f"requested={requested_as_of} "
+            f"oracle={shared_binding.target_as_of_date}"
+        )
+    as_of = resolve_as_of_date(shared_database, None)
+    if as_of != shared_binding.target_as_of_date:
+        raise RadarRunError(
+            "latest quality-eligible market date does not match Oracle snapshot: "
+            f"quality={as_of} oracle={shared_binding.target_as_of_date}"
+        )
     run_dir = args.output_root.expanduser().resolve() / "runs" / as_of
     run_dir.mkdir(parents=True, exist_ok=True)
     state_path = run_dir / "run_state.json"
 
-    etfradar = load_release_evidence(args.etfradar_data_root, as_of)
-    candidates, universe_manifest = scan_universe(database, as_of)
-    etfradar_tickers = {
-        str(row.get("ticker") or "").upper()
-        for row in etfradar["tables"]["02_ETF_MASTER"]
-        if row.get("ticker")
-    }
-    quant_candidate_symbols = {item.symbol for item in candidates}
-    universe_manifest["etfradar_release_id"] = etfradar["binding"]["release_id"]
-    universe_manifest["etfradar_master_ticker_count"] = len(etfradar_tickers)
-    universe_manifest["etfradar_tickers_without_quant_candidate_count"] = len(
-        etfradar_tickers - quant_candidate_symbols
+    relation_index = load_verified_relation_index(
+        shared_binding, args.relation_index
     )
-    universe_manifest["etfradar_tickers_without_quant_candidate_sample"] = sorted(
-        etfradar_tickers - quant_candidate_symbols
-    )[:100]
+    candidates, universe_manifest = scan_universe(
+        shared_database,
+        as_of,
+        relation_index_path=args.relation_index,
+    )
+    universe_manifest["shared_market_store"] = shared_binding.public_metadata()
+    universe_manifest["relation_index"] = relation_index
+    oracle_features = build_oracle_market_features(
+        shared_database, candidates, as_of
+    )
+    universe_manifest["oracle_feature_snapshot_sha256"] = oracle_features[
+        "snapshot_sha256"
+    ]
+    universe_manifest["oracle_feature_etf_count"] = len(
+        oracle_features["etfs"]
+    )
+    universe_manifest["oracle_feature_stock_count"] = len(
+        oracle_features["stocks"]
+    )
     write_json(run_dir / "universe_manifest.json", universe_manifest)
     write_candidates(run_dir / "candidates.jsonl", candidates)
-    write_json(run_dir / "etfradar_release_binding.json", etfradar["binding"])
+    write_json(run_dir / "oracle_market_features.json", oracle_features)
+    selection = select_daily_inference(
+        candidates,
+        oracle_features,
+        max_etfs=args.max_ai_etfs,
+        max_stocks=args.max_ai_stocks,
+    )
+    if not selection.selected:
+        raise RadarRunError("dynamic daily evidence selection produced zero candidates")
+    write_json(run_dir / "selection_manifest.json", selection.manifest)
+    write_candidates(run_dir / "selected_candidates.jsonl", selection.selected)
+    _write_jsonl(
+        run_dir / "coverage_ledger.jsonl",
+        list(selection.coverage_ledger),
+    )
 
     dataset_manifest = data_root / "state" / "dataset_manifest.json"
     if not dataset_manifest.is_file():
         raise RadarRunError(f"quant dataset manifest is missing: {dataset_manifest}")
-    queue = RadarQueue(run_dir / "run_queue.sqlite3")
-    source_fingerprint = dataset_source_fingerprint(database, as_of)
+    queue = RadarQueue(run_dir / "selected_run_queue.sqlite3")
+    source_fingerprint = dataset_source_fingerprint(shared_database, as_of)
     queue.bind_metadata(
         {
             "as_of_date": as_of,
             "dataset_source_fingerprint_sha256": source_fingerprint["sha256"],
-            "etfradar_release_manifest_sha256": etfradar["binding"][
-                "release_manifest_sha256"
+            "oracle_status_sha256": shared_binding.source_fingerprint[
+                "oracle_status_sha256"
             ],
-            "candidate_count": len(candidates),
+            "oracle_feature_snapshot_sha256": oracle_features[
+                "snapshot_sha256"
+            ],
+            "full_candidate_count": len(candidates),
+            "selected_candidate_count": len(selection.selected),
+            "selection_schema_version": selection.manifest["schema_version"],
+            "selection_max_ai_etfs": args.max_ai_etfs,
+            "selection_max_ai_stocks": args.max_ai_stocks,
         }
     )
-    queue.seed(candidates)
+    queue.seed(selection.selected)
 
     if args.prepare_only:
         state = _status_document(
@@ -194,7 +270,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             training_started=False,
             model_release_required=str(args.release_manifest),
             universe_manifest=str(run_dir / "universe_manifest.json"),
-            etfradar_release_binding=str(run_dir / "etfradar_release_binding.json"),
+            oracle_market_features=str(run_dir / "oracle_market_features.json"),
+            selection_manifest=str(run_dir / "selection_manifest.json"),
+            coverage_ledger=str(run_dir / "coverage_ledger.jsonl"),
+            shared_market_store=shared_binding.public_metadata(),
         )
         write_json(state_path, state)
         return state
@@ -220,6 +299,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         credentials=credentials,
         timeout_seconds=args.timeout,
         retries=1,
+        database=shared_database,
+        read_only=True,
     )
 
     pending = queue.pending()
@@ -300,7 +381,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     results = queue.done_results()
     _write_jsonl(run_dir / "security_judgements.jsonl", results)
     aggregate = aggregate_judgements(results)
-    radar = etfradar_summary(etfradar)
+    radar = oracle_market_summary(oracle_features)
     synthesis, synthesis_trace, catalog = synthesize_market(
         client=client,
         as_of_date=as_of,
@@ -312,7 +393,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "as_of_date": as_of,
         "generated_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
         "scope": "market_and_security_analysis_not_trade_execution",
-        "full_universe_complete": True,
+        "deployment_mode": "shadow" if args.shadow else "reference_publish",
+        "full_universe_quantitative_scan_complete": True,
+        "full_universe_model_inference_requested": False,
+        "selected_model_scope_complete": True,
         "model_release": release.public_metadata(),
         "source_status": {
             "quant_dataset": {
@@ -320,33 +404,78 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "manifest_sha256": _sha256(dataset_manifest),
                 "source_fingerprint": source_fingerprint,
             },
-            "etfradar_release": {
+            "shared_oracle_store": shared_binding.public_metadata(),
+            "oracle_market_features": {
                 "status": "confirmed",
-                **etfradar["binding"],
+                **oracle_features["binding"],
+                "snapshot_sha256": oracle_features["snapshot_sha256"],
             },
         },
         "universe": universe_manifest,
+        "selection": selection.manifest,
+        "coverage_ledger_path": str(run_dir / "coverage_ledger.jsonl"),
         "queue_counts": counts,
         "exclusion_counts": queue.exclusions(),
         "aggregate": aggregate,
-        "etfradar": radar,
+        "oracle_market": radar,
         "market_judgement": synthesis,
         "market_judgement_trace": synthesis_trace,
         "market_evidence_catalog": catalog,
         "security_judgements_path": str(run_dir / "security_judgements.jsonl"),
     }
+    report["market_dashboard"] = build_market_dashboard(aggregate, radar)
+    report["quality_audit"] = audit_report_quality(
+        report=report,
+        results=results,
+    )
     report_path = run_dir / "market_report.json"
     write_json(report_path, report)
+    rendered = render_reports(
+        run_dir=run_dir,
+        report=report,
+        results=results,
+        coverage_ledger=selection.coverage_ledger,
+    )
+    report["rendered_reports"] = rendered
+    report["quality_audit"] = audit_report_quality(
+        report=report,
+        results=results,
+    )
+    write_json(run_dir / "quality_audit.json", report["quality_audit"])
+    rendered = render_reports(
+        run_dir=run_dir,
+        report=report,
+        results=results,
+        coverage_ledger=selection.coverage_ledger,
+    )
+    report["rendered_reports"] = rendered
+    write_json(report_path, report)
     latest_path = args.output_root.expanduser().resolve() / "status" / "latest.json"
-    write_json(latest_path, report)
+    quality_green = report["quality_audit"]["status"] == "green"
+    if not args.shadow and quality_green:
+        write_json(latest_path, report)
     state = _status_document(
-        status="complete",
+        status=(
+            "shadow_complete_not_published"
+            if args.shadow and quality_green
+            else "shadow_quality_failed_not_published"
+            if args.shadow
+            else "complete"
+            if quality_green
+            else "quality_failed_not_published"
+        ),
         as_of_date=as_of,
         run_dir=run_dir,
         queue=queue,
         inference_started=True,
-        production_scope_complete=True,
+        production_scope_complete=quality_green,
+        production_latest_published=not args.shadow and quality_green,
         report=str(report_path),
+        quality_audit=str(run_dir / "quality_audit.json"),
+        quality_scores=report["quality_audit"]["scores"],
+        quality_failed_categories=report["quality_audit"][
+            "failed_categories"
+        ],
     )
     write_json(state_path, state)
     return state
@@ -355,15 +484,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--etfradar-data-root", type=Path, default=DEFAULT_ETFRADAR_ROOT)
+    parser.add_argument(
+        "--oracle-incremental-database",
+        type=Path,
+        default=DEFAULT_INCREMENTAL_DATABASE,
+    )
+    parser.add_argument(
+        "--oracle-status",
+        type=Path,
+        default=DEFAULT_ORACLE_STATUS,
+    )
+    parser.add_argument(
+        "--relation-index", type=Path, default=DEFAULT_RELATION_INDEX
+    )
+    parser.add_argument(
+        "--max-constituent-available-lag-days",
+        type=int,
+        default=45,
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--as-of-date")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help="complete and render the selected queue without updating status/latest.json",
+    )
     parser.add_argument("--release-manifest", type=Path, default=DEFAULT_RELEASE_MANIFEST)
     parser.add_argument("--model-endpoint")
     parser.add_argument("--model-token-file", type=Path)
     parser.add_argument("--secrets-file", type=Path, default=DEFAULT_SECRETS_PATH)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--max-ai-etfs", type=int, default=64)
+    parser.add_argument("--max-ai-stocks", type=int, default=192)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument(
         "--smoke-max-items",
@@ -379,14 +532,19 @@ def main() -> int:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if args.max_constituent_available_lag_days < 0:
+        parser.error("--max-constituent-available-lag-days must be >= 0")
+    if args.max_ai_etfs < 1 or args.max_ai_stocks < 1:
+        parser.error("--max-ai-etfs and --max-ai-stocks must be >= 1")
     try:
         result = run(args)
     except (
-        EtfRadarReleaseError,
         InferenceError,
         ModelGateError,
         RadarRunError,
         ResponseContractError,
+        RelationIndexError,
+        SharedMarketStoreError,
         UniverseError,
         OSError,
         ValueError,
@@ -399,11 +557,7 @@ def main() -> int:
         )
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0 if result["status"] in {
-        "complete",
-        "prepared_waiting_for_accepted_model",
-        "smoke_complete_not_publishable",
-    } else 1
+    return 0 if result["status"] in SUCCESSFUL_RUN_STATUSES else 1
 
 
 if __name__ == "__main__":

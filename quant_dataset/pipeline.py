@@ -361,11 +361,16 @@ class DatasetPipeline:
         sleep=None,
         tolerances: Optional[QualityTolerances] = None,
         rate_limiters: Optional[Mapping[str, Any]] = None,
+        database: Optional[Database] = None,
+        read_only: bool = False,
     ):
         self.data_root = Path(data_root).expanduser()
-        self.data_root.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            self.data_root.mkdir(parents=True, exist_ok=True)
         self.credentials = credentials
-        self.database = Database(self.data_root)
+        if read_only and database is None:
+            raise ValueError("read_only DatasetPipeline requires an explicit database")
+        self.database = database or Database(self.data_root)
         self.raw_store = RawStore(self.data_root, self.database)
         http_kwargs = {
             "raw_store": self.raw_store,
@@ -385,13 +390,23 @@ class DatasetPipeline:
         )
         self.massive = MassiveProvider(self.http, credentials.massive_api_key)
         self.etf_flows = EtfFlowLayer(
-            self.database, self.http, credentials.massive_api_key
+            self.database,
+            self.http,
+            credentials.massive_api_key,
+            initialize_schema=not read_only,
         )
         self.etf_constituents = FmpEtfConstituentLayer(
-            self.database, self.http, credentials.fmp_api_key
+            self.database,
+            self.http,
+            credentials.fmp_api_key,
+            initialize_schema=not read_only,
         )
-        self.fmp_training = FmpTrainingBackfill(
-            self.database, self.http, credentials.fmp_api_key
+        self.fmp_training = (
+            None
+            if read_only
+            else FmpTrainingBackfill(
+                self.database, self.http, credentials.fmp_api_key
+            )
         )
         self.tolerances = tolerances or QualityTolerances()
         self.quality = QualityEngine(self.database, self.tolerances)
@@ -922,28 +937,32 @@ class DatasetPipeline:
     ) -> Tuple[List[dict], dict]:
         """Fetch an entire lookback window in one indexed query."""
 
-        with self.database.connect() as connection:
-            rows = connection.execute(
-                """
-                WITH selected_dates AS (
-                    SELECT trade_date FROM (
-                        SELECT DISTINCT trade_date
-                        FROM daily_observations
-                        WHERE symbol=? AND trade_date<=?
-                        ORDER BY trade_date DESC LIMIT ?
-                    ) ORDER BY trade_date
-                )
-                SELECT o.*, r.payload_sha256, r.raw_relative_path,
-                       ce.captured_at_utc
-                FROM daily_observations o
-                JOIN selected_dates d ON d.trade_date=o.trade_date
-                JOIN raw_artifacts r ON r.id=o.raw_artifact_id
-                JOIN capture_events ce ON ce.id=o.capture_event_id
-                WHERE o.symbol=?
-                ORDER BY o.trade_date, o.source
-                """,
-                (symbol, as_of_date, lookback_days, symbol),
-            ).fetchall()
+        indexed_reader = getattr(self.database, "history_payload_rows", None)
+        if callable(indexed_reader):
+            rows = indexed_reader(symbol, as_of_date, lookback_days)
+        else:
+            with self.database.connect() as connection:
+                rows = connection.execute(
+                    """
+                    WITH selected_dates AS (
+                        SELECT trade_date FROM (
+                            SELECT DISTINCT trade_date
+                            FROM daily_observations
+                            WHERE symbol=? AND trade_date<=?
+                            ORDER BY trade_date DESC LIMIT ?
+                        ) ORDER BY trade_date
+                    )
+                    SELECT o.*, r.payload_sha256, r.raw_relative_path,
+                           ce.captured_at_utc
+                    FROM daily_observations o
+                    JOIN selected_dates d ON d.trade_date=o.trade_date
+                    JOIN raw_artifacts r ON r.id=o.raw_artifact_id
+                    JOIN capture_events ce ON ce.id=o.capture_event_id
+                    WHERE o.symbol=?
+                    ORDER BY o.trade_date, o.source
+                    """,
+                    (symbol, as_of_date, lookback_days, symbol),
+                ).fetchall()
         history_by_date: Dict[str, List[dict]] = {}
         provenance = {}
         for row in rows:
