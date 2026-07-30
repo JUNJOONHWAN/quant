@@ -9,6 +9,17 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .decision_support import build_market_dashboard, build_security_brief
+from .presentation import (
+    bar_width,
+    confidence_pct,
+    label_market_state,
+    label_regime,
+    label_rotation_state,
+    label_signal,
+    label_task,
+    whole,
+)
+from .report_narratives import validate_report_narratives
 
 
 def _canonical(value: Any) -> str:
@@ -74,6 +85,9 @@ var(--line);border-radius:10px;margin:10px 0 16px}} pre{{white-space:pre-wrap;
 word-break:break-word;background:#09101e;border:1px solid var(--line);padding:12px;
 border-radius:10px;max-height:520px;overflow:auto}}
 .positive{{color:var(--accent)}} .negative{{color:var(--bad)}}
+.bar{{height:9px;background:#09101e;border-radius:999px;overflow:hidden;margin:6px 0}}
+.bar>span{{display:block;height:100%;background:linear-gradient(90deg,#72e0bd,#7aa7ff);
+border-radius:999px}} .callout{{border-left:3px solid var(--accent);padding-left:12px}}
 @media(max-width:420px){{main{{padding:10px}}th:nth-child(n+4),td:nth-child(n+4){{display:none}}}}
 </style>
 </head><body><main>{body}</main></body></html>
@@ -85,12 +99,13 @@ def _security_html(
     coverage: Mapping[str, Any],
     as_of_date: str,
     navigation_html: str | None = None,
+    narrative: Mapping[str, Any] | None = None,
 ) -> str:
     judgement = result["judgement"]
     interpretation = judgement.get("interpretation") or {}
     facts = judgement.get("facts") or {}
     brief = build_security_brief(judgement)
-    learned = interpretation.get("decision_support") or {}
+    narrative = narrative or {}
     confirmation_rows = "".join(
         "<li><strong>{}</strong> · {} <span class=\"muted\">({})</span></li>".format(
             _e(row.get("label")),
@@ -124,22 +139,23 @@ def _security_html(
     body = f"""
 {navigation_html}
 <h1>{_e(result["symbol"])}</h1>
-<p class="meta">기준일 {_e(as_of_date)} · {_e(result["task_type"])} ·
+<p class="meta">기준일 {_e(as_of_date)} · {_e(label_task(result["task_type"]))} ·
 분석 전용, 주문 연결 없음</p>
 <div class="grid">
- <section class="card"><div class="muted">Regime</div>
-  <div class="metric">{_e(judgement.get("regime"))}</div></section>
- <section class="card"><div class="muted">Confidence</div>
-  <div class="metric">{_e(judgement.get("confidence"))}</div></section>
- <section class="card"><div class="muted">Price / ETF Flow</div>
-  <div class="metric">{_e(interpretation.get("price_signal"))} /
-  {_e(interpretation.get("etf_flow_signal"))}</div></section>
- <section class="card"><div class="muted">Priority</div>
-  <div class="metric">{_e(coverage.get("priority_score"))}</div>
+ <section class="card"><div class="muted">가격·ETF 자금 국면</div>
+  <div class="metric">{_e(label_regime(judgement.get("regime")))}</div></section>
+ <section class="card"><div class="muted">AI 판단 신뢰도</div>
+  <div class="metric">{_e(confidence_pct(judgement.get("confidence")))}</div>
+  <div class="bar"><span style="width:{bar_width((judgement.get('confidence') or 0) * 100)}%"></span></div></section>
+ <section class="card"><div class="muted">가격 / ETF 자금</div>
+  <div class="metric">{_e(label_signal(interpretation.get("price_signal")))} /
+  {_e(label_signal(interpretation.get("etf_flow_signal")))}</div></section>
+ <section class="card"><div class="muted">분석 우선순위</div>
+  <div class="metric">{_e(whole(coverage.get("priority_score")))}</div>
   <div>{''.join(f'<span class="pill">{_e(x)}</span>' for x in coverage.get('selection_reasons') or [])}</div>
  </section>
- <section class="card"><div class="muted">Evidence strength</div>
-  <div class="metric">{_e(brief["data_quality"]["evidence_strength_score"])}</div>
+ <section class="card"><div class="muted">근거 강도</div>
+  <div class="metric">{_e(whole(brief["data_quality"]["evidence_strength_score"], suffix="/100"))}</div>
   <div>{_e(brief["data_quality"]["status"])}</div></section>
 </div>
 <section class="card"><h2>근거 기반 결론</h2><p>{_e(brief["conclusion"])}</p></section>
@@ -149,9 +165,15 @@ def _security_html(
  <section class="card"><h2>가격–Flow 관계</h2><p>{_e(brief["relationship"]["summary"])}</p></section>
 </div>
 <section class="card"><h2>학습 모델 해석</h2>
- <p>{_e(learned.get("headline") or judgement.get("conclusion"))}</p>
- <p>{_e(learned.get("relationship_context") or "현재 release는 구조화 regime만 제공하며 상세 학습 해설은 미검증입니다.")}</p>
+ <p>{_e(judgement.get("conclusion"))}</p>
 </section>
+{f'''<section class="card callout"><h2>전체 시장 속 이 종목</h2>
+ <h3>{_e(narrative.get("headline"))}</h3>
+ <p><strong>소속 흐름:</strong> {_e(narrative.get("group_context"))}</p>
+ <p><strong>ETF 전달 경로:</strong> {_e(narrative.get("etf_transmission"))}</p>
+ <p><strong>반대 근거:</strong> {_e(narrative.get("counterpoint"))}</p>
+ <p><strong>다음 확인:</strong> {_e(narrative.get("watch_condition"))}</p>
+</section>''' if narrative else ""}
 <div class="grid">
  <section class="card"><h2>확인 증거</h2><ul>{confirmation_rows or '<li>없음</li>'}</ul></section>
  <section class="card"><h2>반대 증거</h2><ul>{contradiction_rows or '<li>없음</li>'}</ul></section>
@@ -203,8 +225,14 @@ def render_reports(
 ) -> dict[str, Any]:
     """Write market and per-security reports, then hash every artifact."""
 
+    validate_report_narratives(report)
     root = Path(run_dir).expanduser().resolve()
     coverage = {str(row["symbol"]): row for row in coverage_ledger}
+    narratives = report.get("multistage_narratives") or {}
+    security_narratives = {
+        str(row.get("symbol") or ""): row
+        for row in narratives.get("security_explanations") or []
+    }
     security_dir = root / "security_reports"
     rows = []
     artifact_paths = []
@@ -226,6 +254,7 @@ def render_reports(
                 result,
                 coverage.get(symbol, {}),
                 str(report["as_of_date"]),
+                narrative=security_narratives.get(symbol),
             ),
         )
         artifact_paths.extend((json_path, html_path))
@@ -234,10 +263,10 @@ def render_reports(
         rows.append(
             {
                 "symbol": symbol,
-                "task_type": result["task_type"],
-                "regime": judgement.get("regime"),
-                "confidence": judgement.get("confidence"),
-                "relationship": interpretation.get("relationship"),
+                "task_type": label_task(result["task_type"]),
+                "regime": label_regime(judgement.get("regime")),
+                "confidence": confidence_pct(judgement.get("confidence")),
+                "relationship": label_regime(interpretation.get("relationship")),
                 "priority_score": coverage.get(symbol, {}).get("priority_score"),
                 "path": f"security_reports/{symbol}.html",
             }
@@ -279,6 +308,39 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
         report.get("oracle_market") or {},
     )
     quality = report.get("quality_audit") or {}
+    editorial = narratives.get("editorial") or {}
+    strict_narratives = report.get("schema_version") == "quant.ai_radar_report.v2"
+    editorial_headline = (
+        editorial.get("headline")
+        if strict_narratives
+        else editorial.get("headline") or "오늘의 시장 구조"
+    )
+    editorial_summary = (
+        editorial.get("executive_summary")
+        if strict_narratives
+        else editorial.get("executive_summary") or market.get("summary")
+    )
+    editorial_rotation = (
+        editorial.get("rotation_summary")
+        if strict_narratives
+        else editorial.get("rotation_summary") or market.get("summary")
+    )
+    editorial_selection = (
+        editorial.get("selection_summary")
+        if strict_narratives
+        else editorial.get("selection_summary")
+        or "가격과 ETF 자금이 함께 확인된 후보를 분리해 봅니다."
+    )
+    editorial_risk = (
+        editorial.get("risk_summary")
+        if strict_narratives
+        else editorial.get("risk_summary")
+        or "괴리와 반대 근거를 함께 확인해야 합니다."
+    )
+    sector_narratives = {
+        str(row.get("cluster") or ""): row
+        for row in narratives.get("sector_explanations") or []
+    }
     evidence_catalog = report.get("market_evidence_catalog") or {}
     confirmations = "".join(
         _market_evidence_item(row, evidence_catalog)
@@ -291,18 +353,18 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
     rotation_rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             _e(row.get("cluster")),
-            _e(row.get("state")),
-            _e(row.get("score")),
-            _e(row.get("breadth_score")),
-            _e(row.get("median_return_5d_pct")),
+            _e(label_rotation_state(row.get("state"))),
+            _e(whole(row.get("score"))),
+            _e(whole(row.get("breadth_score"), suffix="%")),
+            _e(whole(row.get("median_return_5d_pct"), signed=True, suffix="%")),
         )
         for row in dashboard.get("rotation_clusters") or []
     )
     etf_rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             _e(row.get("symbol")),
-            _e(row.get("regime")),
-            _e(row.get("latest_robust_zscore")),
+            _e(label_regime(row.get("regime"))),
+            _e(whole(row.get("latest_robust_zscore"), signed=True)),
             _e(row.get("latest_effective_date")),
         )
         for row in dashboard.get("leading_etfs") or []
@@ -310,9 +372,9 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
     stock_rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             _e(row.get("symbol")),
-            _e(row.get("regime")),
-            _e(row.get("net_weighted_flow_rate_contribution_pct")),
-            _e(row.get("eligible_etf_count")),
+            _e(label_regime(row.get("regime"))),
+            _e(whole(row.get("net_weighted_flow_rate_contribution_pct"), signed=True, suffix="%")),
+            _e(whole(row.get("eligible_etf_count"))),
         )
         for row in dashboard.get("affected_stocks") or []
     )
@@ -324,12 +386,16 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
             "<td>{}</td><td>{}</td><td>{}</td></tr>".format(
                 _e(row.get("symbol")),
                 _e(row.get("symbol")),
-                _e(row.get("regime")),
-                _e(row.get("confidence")),
+                _e(label_regime(row.get("regime"))),
+                _e(confidence_pct(row.get("confidence"))),
                 _e(
-                    row.get("latest_robust_zscore")
+                    whole(row.get("latest_robust_zscore"), signed=True)
                     if row.get("latest_robust_zscore") is not None
-                    else row.get("net_weighted_flow_rate_contribution_pct")
+                    else whole(
+                        row.get("net_weighted_flow_rate_contribution_pct"),
+                        signed=True,
+                        suffix="%",
+                    )
                 ),
             )
             for row in candidate_lanes.get(key) or []
@@ -353,29 +419,45 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
         "security_report_count",
         selection.get("selected_count"),
     )
+    sector_explanation_cards = "".join(
+        f"""<section class="card"><h3>{_e(row.get("cluster"))} ·
+{_e(label_rotation_state(next((item.get("state") for item in dashboard.get("rotation_clusters") or [] if item.get("cluster") == row.get("cluster")), "")))}</h3>
+<p><strong>{_e(row.get("headline"))}</strong></p>
+<p>{_e(row.get("explanation"))}</p>
+<p class="muted">관련 종목: {_e(row.get("stock_context"))}</p>
+<p class="muted">반대 근거: {_e(row.get("counterpoint"))}</p></section>"""
+        for row in narratives.get("sector_explanations") or []
+    )
     market_body = f"""
 <h1>Quant AI Radar</h1>
 <p class="meta">기준일 {_e(report["as_of_date"])} · 생성 {_e(report["generated_at_kst"])}
 · 참고용 분석 · 실주문 미연결</p>
 <div class="grid">
- <section class="card"><div class="muted">Market state</div>
-  <div class="metric">{_e(market.get("market_state"))}</div></section>
- <section class="card"><div class="muted">Confidence</div>
-  <div class="metric">{_e(market.get("confidence"))}</div></section>
+ <section class="card"><div class="muted">시장 국면</div>
+  <div class="metric">{_e(label_market_state(market.get("market_state")))}</div></section>
+ <section class="card"><div class="muted">AI 판단 신뢰도</div>
+  <div class="metric">{_e(confidence_pct(market.get("confidence")))}</div>
+  <div class="bar"><span style="width:{bar_width((market.get('confidence') or 0) * 100)}%"></span></div></section>
  <section class="card"><div class="muted">전체 ETF 관련 후보</div>
   <div class="metric">{_e(selection.get("full_candidate_count"))}</div></section>
  <section class="card"><div class="muted">AI 상세 분석</div>
   <div class="metric">{_e(completed_ai_count)}</div></section>
 </div>
-<section class="card"><h2>시장 해석</h2><p>{_e(market.get("summary"))}</p>
+<section class="card callout"><h2>{_e(editorial_headline)}</h2>
+<p>{_e(editorial_summary)}</p>
+<p><strong>회전:</strong> {_e(editorial_rotation)}</p>
+<p><strong>후보군:</strong> {_e(editorial_selection)}</p>
+<p><strong>위험:</strong> {_e(editorial_risk)}</p>
 <p><a href="security_index.html">ETF·종목 상세 분석 보기 →</a></p></section>
 <section class="card"><h2>정확 집계 기반 시장 구조</h2>
  <p>{_e(dashboard.get("interpretation"))}</p>
  <div class="grid">
-  <div><div class="muted">가격 양수 비중</div><div class="metric">{_e(breadth.get("price_positive_pct"))}%</div></div>
-  <div><div class="muted">ETF Flow 양수 비중</div><div class="metric">{_e(breadth.get("etf_flow_positive_pct"))}%</div></div>
-  <div><div class="muted">확인 국면</div><div class="metric">{_e(breadth.get("confirmation_count"))}</div></div>
-  <div><div class="muted">괴리 국면</div><div class="metric">{_e(breadth.get("divergence_count"))}</div></div>
+  <div><div class="muted">가격 강세 비중</div><div class="metric">{_e(whole(breadth.get("price_positive_pct"), suffix="%"))}</div>
+  <div class="bar"><span style="width:{bar_width(breadth.get('price_positive_pct'))}%"></span></div></div>
+  <div><div class="muted">ETF 자금 강세 비중</div><div class="metric">{_e(whole(breadth.get("etf_flow_positive_pct"), suffix="%"))}</div>
+  <div class="bar"><span style="width:{bar_width(breadth.get('etf_flow_positive_pct'))}%"></span></div></div>
+  <div><div class="muted">동시 확인 국면</div><div class="metric">{_e(whole(breadth.get("confirmation_count")))}</div></div>
+  <div><div class="muted">가격·자금 괴리</div><div class="metric">{_e(whole(breadth.get("divergence_count")))}</div></div>
  </div>
 </section>
 <section class="card"><h2>AI Radar 판단 후보군</h2>
@@ -383,11 +465,11 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
  분리합니다. 매수·매도 주문 신호가 아니며, 괴리 후보는 방향 확정 전에 추가
  확인이 필요합니다.</p>
  <div class="grid">
-  <div><h3>강세 확인 관찰</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+  <div><h3>강세 확인 관찰</h3><table><thead><tr><th>종목</th><th>판정</th><th>신뢰도</th><th>자금</th></tr></thead>
    <tbody>{positive_candidates or '<tr><td colspan="4">동시 확인 후보 없음</td></tr>'}</tbody></table></div>
-  <div><h3>약세 확인 위험</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+  <div><h3>약세 확인 위험</h3><table><thead><tr><th>종목</th><th>판정</th><th>신뢰도</th><th>자금</th></tr></thead>
    <tbody>{negative_candidates or '<tr><td colspan="4">동시 약세 후보 없음</td></tr>'}</tbody></table></div>
-  <div><h3>가격–Flow 괴리</h3><table><thead><tr><th>종목</th><th>Regime</th><th>신뢰도</th><th>Flow</th></tr></thead>
+  <div><h3>가격–ETF 자금 괴리</h3><table><thead><tr><th>종목</th><th>판정</th><th>신뢰도</th><th>자금</th></tr></thead>
    <tbody>{divergence_candidates or '<tr><td colspan="4">괴리 후보 없음</td></tr>'}</tbody></table></div>
  </div>
 </section>
@@ -396,13 +478,15 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
  <section class="card"><h2>반대 증거</h2><ul>{contradictions or '<li>없음</li>'}</ul></section>
  <section class="card"><h2>미확인 사항</h2><ul>{_list_items(market.get("unknowns") or [])}</ul></section>
 </div>
-<section class="card"><h2>섹터·테마 회전</h2>
- <table><thead><tr><th>Cluster</th><th>State</th><th>Score</th><th>Breadth</th><th>5D</th></tr></thead>
+<section class="card"><h2>섹터·테마 회전 수치</h2>
+ <table><thead><tr><th>분류</th><th>상태</th><th>강도</th><th>확산</th><th>최근</th></tr></thead>
  <tbody>{rotation_rows or '<tr><td colspan="5">확인 가능한 회전 cluster 없음</td></tr>'}</tbody></table>
 </section>
+<h2>섹터별 AI 해설</h2>
+<div class="grid">{sector_explanation_cards}</div>
 <div class="grid">
- <section class="card"><h2>주요 ETF</h2><table><thead><tr><th>ETF</th><th>Regime</th><th>Flow z</th><th>유효일</th></tr></thead><tbody>{etf_rows}</tbody></table></section>
- <section class="card"><h2>영향 종목</h2><table><thead><tr><th>종목</th><th>Regime</th><th>가중 Flow %</th><th>ETF 수</th></tr></thead><tbody>{stock_rows}</tbody></table></section>
+ <section class="card"><h2>주요 ETF</h2><table><thead><tr><th>ETF</th><th>판정</th><th>자금 이상도</th><th>유효일</th></tr></thead><tbody>{etf_rows}</tbody></table></section>
+ <section class="card"><h2>영향 종목</h2><table><thead><tr><th>종목</th><th>판정</th><th>가중 자금</th><th>ETF 수</th></tr></thead><tbody>{stock_rows}</tbody></table></section>
 </div>
 <section class="card"><h2>품질 게이트</h2><p>{score_pills or '실행 전'}</p>
  <p class="muted">모든 항목 8.0/10 이상일 때만 reference publish 가능</p></section>

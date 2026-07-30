@@ -107,6 +107,32 @@ class RadarQueue:
                 )
         return len(rows)
 
+    def requeue_verified_corporate_action_exclusions(
+        self, symbols: Iterable[str]
+    ) -> int:
+        """Retry only discontinuities now explained by a verified action."""
+
+        normalized = sorted(
+            {str(symbol).upper() for symbol in symbols if symbol}
+        )
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE items
+                   SET status='pending', eligibility_json=NULL,
+                       exclusion_reason=NULL, error=NULL, updated_at_utc=?
+                 WHERE symbol IN ({placeholders})
+                   AND status='excluded'
+                   AND exclusion_reason=
+                       'raw_price_discontinuity_ge_45pct_without_pit_corporate_action'
+                """,
+                (utc_now(), *normalized),
+            )
+            return int(cursor.rowcount)
+
     def pending(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             return [

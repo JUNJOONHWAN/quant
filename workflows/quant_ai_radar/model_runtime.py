@@ -242,9 +242,10 @@ class ModelRelease:
     dataset_manifest_sha256: str
     evaluation_sha256: str
     raw: dict[str, Any]
+    merged_model_manifest_sha256: str | None = None
 
     def public_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "schema_version": RELEASE_SCHEMA,
             "status": "accepted",
             "model_id": self.model_id,
@@ -255,6 +256,16 @@ class ModelRelease:
             "evaluation_sha256": self.evaluation_sha256,
             "release_manifest_sha256": self.manifest_sha256,
         }
+        if self.merged_model_manifest_sha256:
+            merged = self.raw.get("merged_model") or {}
+            metadata["merged_model"] = {
+                "manifest_sha256": self.merged_model_manifest_sha256,
+                "content_sha256": merged.get("content_sha256"),
+                "precision": merged.get("precision"),
+                "file_count": merged.get("file_count"),
+                "total_bytes": merged.get("total_bytes"),
+            }
+        return metadata
 
 
 def load_model_release(path: Path) -> ModelRelease:
@@ -342,6 +353,110 @@ def load_model_release(path: Path) -> ModelRelease:
         raise ModelGateError(
             "adapter_set_sha256 does not match the verified released artifacts"
         )
+    merged_model_manifest_sha = None
+    merged_model = value.get("merged_model")
+    if merged_model is not None:
+        if not isinstance(merged_model, dict):
+            raise ModelGateError("merged_model release binding must be an object")
+        merged_manifest_binding = merged_model.get("manifest")
+        if not isinstance(merged_manifest_binding, dict):
+            raise ModelGateError("merged_model has no bound manifest")
+        merged_manifest_path, merged_model_manifest_sha = _verify_bound_file(
+            release_path,
+            merged_manifest_binding,
+            "merged-model manifest",
+        )
+        merged_manifest = _read_object(
+            merged_manifest_path, "merged-model manifest"
+        )
+        if (
+            merged_manifest.get("schema_version")
+            != "quant.merged_hf_model.v1"
+            or merged_manifest.get("status") != "complete"
+            or merged_manifest.get("model_name") != endpoint_model
+            or merged_manifest.get("precision") != "bfloat16"
+        ):
+            raise ModelGateError(
+                "merged-model manifest does not match the release contract"
+            )
+        merged_root = _resolve_release_path(
+            release_path, merged_model.get("root"), "merged_model.root"
+        )
+        if not merged_root.is_dir():
+            raise ModelGateError(
+                f"released merged-model directory is missing: {merged_root}"
+            )
+        if Path(base_model).expanduser().resolve() != merged_root:
+            raise ModelGateError(
+                "release base_model does not match merged_model.root"
+            )
+        source_adapter_hashes = sorted(
+            digest for _, digest in verified_artifacts
+        )
+        merged_adapter_rows = merged_manifest.get("adapter_artifacts")
+        if not isinstance(merged_adapter_rows, list):
+            raise ModelGateError(
+                "merged-model manifest has no adapter artifacts"
+            )
+        merged_adapter_hashes = sorted(
+            str(row.get("sha256") or "")
+            for row in merged_adapter_rows
+            if isinstance(row, dict)
+        )
+        if merged_adapter_hashes != source_adapter_hashes:
+            raise ModelGateError(
+                "merged-model adapter artifacts differ from the release"
+            )
+        declared_files = merged_manifest.get("files")
+        if not isinstance(declared_files, list) or not declared_files:
+            raise ModelGateError("merged-model manifest has no model files")
+        total_bytes = 0
+        for index, row in enumerate(declared_files):
+            if not isinstance(row, dict):
+                raise ModelGateError(
+                    f"merged-model file {index} is not an object"
+                )
+            relative = Path(str(row.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ModelGateError(
+                    f"merged-model file escapes root: {relative}"
+                )
+            model_file = (merged_root / relative).resolve()
+            try:
+                model_file.relative_to(merged_root)
+            except ValueError as exc:
+                raise ModelGateError(
+                    f"merged-model file escapes root: {model_file}"
+                ) from exc
+            if not model_file.is_file():
+                raise ModelGateError(
+                    f"merged-model file is missing: {model_file}"
+                )
+            size = model_file.stat().st_size
+            if size != int(row.get("bytes") or -1):
+                raise ModelGateError(
+                    f"merged-model file size mismatch: {model_file}"
+                )
+            if sha256_file(model_file) != str(row.get("sha256") or ""):
+                raise ModelGateError(
+                    f"merged-model file SHA256 mismatch: {model_file}"
+                )
+            total_bytes += size
+        if int(merged_model.get("file_count") or -1) != len(declared_files):
+            raise ModelGateError("merged_model file_count is invalid")
+        if int(merged_model.get("total_bytes") or -1) != total_bytes:
+            raise ModelGateError("merged_model total_bytes is invalid")
+        content_core = dict(merged_manifest)
+        declared_content_sha = str(content_core.pop("content_sha256", ""))
+        observed_content_sha = sha256_bytes(
+            canonical_json(content_core).encode("utf-8")
+        )
+        if (
+            declared_content_sha != observed_content_sha
+            or str(merged_model.get("content_sha256") or "")
+            != observed_content_sha
+        ):
+            raise ModelGateError("merged-model content SHA256 is invalid")
     return ModelRelease(
         manifest_path=release_path,
         manifest_sha256=sha256_file(release_path),
@@ -353,6 +468,7 @@ def load_model_release(path: Path) -> ModelRelease:
         dataset_manifest_sha256=dataset_sha,
         evaluation_sha256=evaluation_sha,
         raw=value,
+        merged_model_manifest_sha256=merged_model_manifest_sha,
     )
 
 

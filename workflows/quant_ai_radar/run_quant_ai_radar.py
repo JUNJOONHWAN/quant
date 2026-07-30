@@ -39,6 +39,10 @@ from workflows.quant_ai_radar.market_report import (  # noqa: E402
 from workflows.quant_ai_radar.oracle_features import (  # noqa: E402
     build_oracle_market_features,
 )
+from workflows.quant_ai_radar.corporate_actions import (  # noqa: E402
+    adjust_packet_for_verified_corporate_actions,
+    load_oracle_corporate_actions,
+)
 from workflows.quant_ai_radar.model_runtime import (  # noqa: E402
     InferenceError,
     ModelGateError,
@@ -64,6 +68,9 @@ from workflows.quant_ai_radar.selection import (  # noqa: E402
     select_daily_inference,
 )
 from workflows.quant_ai_radar.report_renderer import render_reports  # noqa: E402
+from workflows.quant_ai_radar.report_narratives import (  # noqa: E402
+    build_multistage_narratives,
+)
 from workflows.quant_ai_radar.decision_support import (  # noqa: E402
     audit_report_quality,
     build_market_dashboard,
@@ -241,6 +248,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RadarRunError(f"quant dataset manifest is missing: {dataset_manifest}")
     queue = RadarQueue(run_dir / "selected_run_queue.sqlite3")
     source_fingerprint = dataset_source_fingerprint(shared_database, as_of)
+    corporate_actions = load_oracle_corporate_actions(
+        shared_database,
+        as_of_date=as_of,
+    )
     queue.bind_metadata(
         {
             "as_of_date": as_of,
@@ -256,9 +267,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "selection_schema_version": selection.manifest["schema_version"],
             "selection_max_ai_etfs": args.max_ai_etfs,
             "selection_max_ai_stocks": args.max_ai_stocks,
+            "oracle_corporate_actions_sha256": corporate_actions["sha256"],
         }
     )
     queue.seed(selection.selected)
+    requeued_corporate_actions = (
+        queue.requeue_verified_corporate_action_exclusions(
+            corporate_actions["events_by_symbol"]
+        )
+    )
 
     if args.prepare_only:
         state = _status_document(
@@ -315,6 +332,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 packet = pipeline.analysis_packet_for_pair(
                     symbol, as_of, lookback_days=21, recompute_quality=False
+                )
+                packet = adjust_packet_for_verified_corporate_actions(
+                    packet,
+                    corporate_actions,
                 )
                 eligibility = packet_eligibility(packet)
                 if not eligibility["eligible"]:
@@ -389,7 +410,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         radar=radar,
     )
     report = {
-        "schema_version": "quant.ai_radar_report.v1",
+        "schema_version": "quant.ai_radar_report.v2",
         "as_of_date": as_of,
         "generated_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
         "scope": "market_and_security_analysis_not_trade_execution",
@@ -410,6 +431,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 **oracle_features["binding"],
                 "snapshot_sha256": oracle_features["snapshot_sha256"],
             },
+            "oracle_corporate_actions": {
+                "status": (
+                    "confirmed"
+                    if corporate_actions["events"]
+                    else "no_verified_visible_events"
+                ),
+                "schema_version": corporate_actions["schema_version"],
+                "ledger_sha256": corporate_actions["sha256"],
+                "source_row_count": corporate_actions["source_row_count"],
+                "event_count": len(corporate_actions["events"]),
+                "requeued_exclusion_count": requeued_corporate_actions,
+                "events": corporate_actions["events"],
+            },
         },
         "universe": universe_manifest,
         "selection": selection.manifest,
@@ -424,6 +458,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "security_judgements_path": str(run_dir / "security_judgements.jsonl"),
     }
     report["market_dashboard"] = build_market_dashboard(aggregate, radar)
+    narratives, narrative_trace = build_multistage_narratives(
+        client=client,
+        aggregate=aggregate,
+        radar=radar,
+        market_judgement=synthesis,
+        results=results,
+        checkpoint_dir=run_dir / "narrative_stages",
+    )
+    report["multistage_narratives"] = narratives
+    report["multistage_narrative_trace"] = narrative_trace
     report["quality_audit"] = audit_report_quality(
         report=report,
         results=results,

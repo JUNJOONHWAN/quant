@@ -179,6 +179,50 @@ An evaluation-red result exits with status 2 and is not automatically retried;
 transient training, endpoint, or collector failures remain restartable. The
 lane does not resume FMP backfill and does not enable Quant AI Radar timers.
 
+## Merge the accepted LoRA into Qwen3-8B-FLOW BF16
+
+The standalone serving artifact is a safe BF16 merge of the accepted base and
+LoRA. It is not an NVFP4 conversion. The original LoRA release manifest and
+frozen evaluation remain the acceptance evidence; a separate deployment
+release binds that evidence to every hashed BF16 model shard.
+
+```bash
+python3 -m training.quant_llm.merge_lora_release \
+  --model-name Qwen3-8B-FLOW \
+  --base-model /home/zooh/models/Qwen3-8B-bf16 \
+  --adapter /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1/epoch_1_step_14027/model \
+  --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/models/Qwen3-8B-FLOW-BF16
+```
+
+The command refuses to overwrite either a completed output or an incomplete
+merge directory. It loads local artifacts only, performs `safe_merge=True`,
+keeps BF16 weights, writes the tokenizer, hashes every output file, and writes
+`merge_manifest.json`. A serving runtime must expose model id
+`Qwen3-8B-FLOW`; the current report validation profile uses a 16,384-token
+context window.
+
+Create the deployment release only after the merged model is complete:
+
+```bash
+python3 -m training.quant_llm.create_model_release \
+  --model-id Qwen3-8B-FLOW \
+  --endpoint-model Qwen3-8B-FLOW \
+  --base-model /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/models/Qwen3-8B-FLOW-BF16 \
+  --adapter-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1 \
+  --artifact /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1/epoch_1_step_14027/model/adapter_model.safetensors \
+  --artifact /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1/epoch_1_step_14027/model/adapter_config.json \
+  --dataset-manifest /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_sft_v2/manifest.json \
+  --evaluation-report /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/evaluations/qwen3_8b_quant_lora_v1/frozen_test_evaluation.json \
+  --merged-manifest /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/models/Qwen3-8B-FLOW-BF16/merge_manifest.json \
+  --merged-model-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/models/Qwen3-8B-FLOW-BF16 \
+  --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/Qwen3-8B-FLOW/release_manifest.json
+```
+
+The creator rejects an endpoint-name mismatch, non-BF16 precision, changed
+adapter hashes, path traversal, missing shards, size/hash drift, or an invalid
+merge content digest. Quant AI Radar revalidates those files when it loads the
+release; it does not trust the deployment manifest by name alone.
+
 ## Training direction after baseline
 
 The baseline target is deterministic and auditable, not an expert human label.

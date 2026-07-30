@@ -15,6 +15,30 @@ Hermes Worker가 Spark의 동결된 전수 일봉과 ETF Flow D+2 관측 뷰만�
 - 실행 주체: Hermes Operations Role Shell의 `hermes-worker-general`
 - 조건부 공식: `scope future | full market state + scope internal structure + relative position + ETF Flow D+2`
 
+위 read-only 계약은 상태 큐브 분석 단계의 계약이다. 공통 증분 저장소는
+별도의 Oracle single-writer 단계가 갱신하며 AI Radar와 Oracle 분석기가
+동일한 seal을 읽는다.
+
+### 공통 증분 저장소의 corporate-action 원장
+
+- 테이블: `corporate_action_versions`(source-preserving raw version),
+  `corporate_actions`(earliest-availability projection)
+- 발견: Massive `/stocks/v1/splits`를 기간 전체로 조회
+- 교차확인: 발견된 symbol을 FMP `/stable/splits`로 확인
+- 공식 seed: 검증된 발행사·거래소 공지를 raw artifact로 함께 보존
+- provider 가용일: 최초 capture 날짜이며 이후 재수집해도 앞당기지 않음
+- 공식 가용일: 문서에 적힌 announcement date
+- PIT 공개 조건: `effective_date<=as_of AND available_date<=as_of`
+- seal: visible record count와 canonical projection SHA-256을 v3 Oracle
+  receipt와 shared-source fingerprint에 결속
+- 소비자 정책: 공식 이벤트 또는 Massive/FMP 동일 비율 교차확인만 사용;
+  단일 provider 이벤트는 원장에는 남지만 분석 입력에서는 fail closed
+
+분할·역분할 보정은 renderer가 아니라 분석 packet 생성 전에 수행한다.
+효력일 이전 가격에는 `old_shares/new_shares`, 거래량에는
+`new_shares/old_shares`를 적용한다. 원본 값, raw artifact SHA, provider,
+endpoint, capture event는 보존한다.
+
 ## Output
 
 실행별 결과:

@@ -31,6 +31,20 @@ def _report() -> dict:
 
 
 class QuantAiRadarEmailTest(unittest.TestCase):
+    def test_formal_flow_report_uses_v3_delivery_contract(self):
+        status = email_delivery.email_delivery_status(
+            "2026-07-29",
+            state_dir=Path("/nonexistent"),
+        )
+        self.assertEqual(
+            status["dedupe_key"],
+            "quant-ai-radar-daily:2026-07-29:v3",
+        )
+        self.assertEqual(
+            status["contract"],
+            "quant-ai-radar-daily-email-v3",
+        )
+
     def test_mobile_contract_requires_420px(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "report.html"

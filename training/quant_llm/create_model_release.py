@@ -26,6 +26,100 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_merged_model(
+    *,
+    endpoint_model: str,
+    base_model: str,
+    adapter_artifact_rows: list[dict[str, str]],
+    merged_manifest: Path,
+    merged_model_root: Path,
+) -> dict[str, Any]:
+    """Bind a BF16 merge to the already-evaluated adapter release."""
+
+    manifest_path = merged_manifest.expanduser().resolve()
+    model_root = merged_model_root.expanduser().resolve()
+    manifest = read_object(manifest_path, "merged-model manifest")
+    if manifest.get("schema_version") != "quant.merged_hf_model.v1":
+        raise ValueError("merged-model manifest schema is unsupported")
+    if manifest.get("status") != "complete":
+        raise ValueError("merged-model manifest is not complete")
+    if manifest.get("model_name") != endpoint_model:
+        raise ValueError("merged-model name does not match endpoint_model")
+    if manifest.get("precision") != "bfloat16":
+        raise ValueError("merged-model precision must be bfloat16")
+    if not model_root.is_dir():
+        raise ValueError(f"merged-model root is missing: {model_root}")
+    if Path(base_model).expanduser().resolve() != model_root:
+        raise ValueError("base_model must be the verified merged-model root")
+
+    declared_files = manifest.get("files")
+    if not isinstance(declared_files, list) or not declared_files:
+        raise ValueError("merged-model manifest has no model files")
+    verified_files = []
+    for index, row in enumerate(declared_files):
+        if not isinstance(row, dict):
+            raise ValueError(f"merged-model file {index} is not an object")
+        relative = Path(str(row.get("path") or ""))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"merged-model file escapes root: {relative}")
+        path = (model_root / relative).resolve()
+        try:
+            path.relative_to(model_root)
+        except ValueError as exc:
+            raise ValueError(f"merged-model file escapes root: {path}") from exc
+        if not path.is_file():
+            raise ValueError(f"merged-model file is missing: {path}")
+        if path.stat().st_size != int(row.get("bytes") or -1):
+            raise ValueError(f"merged-model file size mismatch: {path}")
+        digest = sha256_file(path)
+        if digest != str(row.get("sha256") or ""):
+            raise ValueError(f"merged-model file SHA256 mismatch: {path}")
+        verified_files.append(
+            {
+                "path": relative.as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": digest,
+            }
+        )
+
+    source_adapter_hashes = sorted(
+        str(row.get("sha256") or "") for row in adapter_artifact_rows
+    )
+    merged_adapter_rows = manifest.get("adapter_artifacts")
+    if not isinstance(merged_adapter_rows, list):
+        raise ValueError("merged-model manifest has no adapter artifacts")
+    merged_adapter_hashes = sorted(
+        str(row.get("sha256") or "")
+        for row in merged_adapter_rows
+        if isinstance(row, dict)
+    )
+    if merged_adapter_hashes != source_adapter_hashes:
+        raise ValueError(
+            "merged-model adapter artifacts do not match the evaluated release"
+        )
+
+    declared_content_sha = str(manifest.get("content_sha256") or "")
+    content_core = dict(manifest)
+    content_core.pop("content_sha256", None)
+    observed_content_sha = hashlib.sha256(
+        canonical_json(content_core).encode("utf-8")
+    ).hexdigest()
+    if declared_content_sha != observed_content_sha:
+        raise ValueError("merged-model content SHA256 is invalid")
+    return {
+        "manifest": {
+            "path": str(manifest_path),
+            "sha256": sha256_file(manifest_path),
+        },
+        "root": str(model_root),
+        "model_name": endpoint_model,
+        "precision": "bfloat16",
+        "content_sha256": observed_content_sha,
+        "total_bytes": sum(row["bytes"] for row in verified_files),
+        "file_count": len(verified_files),
+    }
+
+
 def read_object(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"{label} is missing: {path}")
@@ -44,6 +138,8 @@ def build_release(
     artifacts: list[Path],
     dataset_manifest: Path,
     evaluation_report: Path,
+    merged_manifest: Path | None = None,
+    merged_model_root: Path | None = None,
 ) -> dict[str, Any]:
     root = adapter_root.expanduser().resolve()
     if not root.is_dir():
@@ -74,7 +170,13 @@ def build_release(
     evaluation_value = read_object(evaluation, "evaluation report")
     if evaluation_value.get("schema_version") != "quant.frozen_test_evaluation.v1":
         raise ValueError("evaluation report schema is not the frozen-test contract")
-    if evaluation_value.get("endpoint_model") != endpoint_model:
+    evaluation_endpoint_model = str(
+        evaluation_value.get("endpoint_model") or ""
+    )
+    if (
+        evaluation_endpoint_model != endpoint_model
+        and merged_manifest is None
+    ):
         raise ValueError("evaluation endpoint_model does not match the release")
     if evaluation_value.get("adapter_set_sha256") != adapter_set_sha:
         raise ValueError("evaluation was not run against the released adapter artifacts")
@@ -99,7 +201,7 @@ def build_release(
     failed = sorted(key for key, value in required_gates.items() if value is not True)
     if failed:
         raise ValueError(f"evaluation report gates failed: {failed}")
-    return {
+    release = {
         "schema_version": RELEASE_SCHEMA,
         "status": "accepted",
         "model_id": model_id,
@@ -122,8 +224,22 @@ def build_release(
             "temperature": 0,
             "scope": "data_interpretation_not_trade_execution",
             "fallback_model_allowed": False,
+            "evaluation_endpoint_model": evaluation_endpoint_model,
         },
     }
+    if (merged_manifest is None) != (merged_model_root is None):
+        raise ValueError(
+            "merged_manifest and merged_model_root must be supplied together"
+        )
+    if merged_manifest is not None and merged_model_root is not None:
+        release["merged_model"] = validate_merged_model(
+            endpoint_model=endpoint_model,
+            base_model=base_model,
+            adapter_artifact_rows=artifact_rows,
+            merged_manifest=merged_manifest,
+            merged_model_root=merged_model_root,
+        )
+    return release
 
 
 def write_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -151,6 +267,8 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path, action="append", required=True)
     parser.add_argument("--dataset-manifest", type=Path, required=True)
     parser.add_argument("--evaluation-report", type=Path, required=True)
+    parser.add_argument("--merged-manifest", type=Path)
+    parser.add_argument("--merged-model-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     release = build_release(
@@ -161,6 +279,8 @@ def main() -> int:
         artifacts=args.artifact,
         dataset_manifest=args.dataset_manifest,
         evaluation_report=args.evaluation_report,
+        merged_manifest=args.merged_manifest,
+        merged_model_root=args.merged_model_root,
     )
     write_atomic(args.output, release)
     print(json.dumps({"status": "accepted", "output": str(args.output.resolve())}))

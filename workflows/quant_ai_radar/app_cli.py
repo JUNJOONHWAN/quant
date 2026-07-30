@@ -231,6 +231,9 @@ def build_daily_commands(
         model_endpoint=_model_endpoint(),
         release_manifest=_release_manifest(),
         workers=str(workers),
+        timeout_seconds=os.environ.get(
+            "QUANT_AI_MODEL_TIMEOUT_SECONDS", "360"
+        ),
         token_file=_token_file(),
         max_constituent_available_lag_days=os.environ.get(
             "QUANT_AI_MAX_CONSTITUENT_AVAILABLE_LAG_DAYS", "45"
@@ -301,6 +304,77 @@ def run_json_command(command: list[str]) -> dict[str, Any]:
     return payload
 
 
+def daily_completion_status() -> dict[str, Any] | None:
+    """Return the exact completed Oracle target, otherwise require a run."""
+
+    oracle = _read_json(DEFAULT_ORACLE_STATUS) or {}
+    target = str(oracle.get("target_as_of_date") or "")[:10]
+    report = _read_json(DEFAULT_OUTPUT_ROOT / "status" / "latest.json") or {}
+    quality = (
+        report.get("quality_audit")
+        if isinstance(report.get("quality_audit"), dict)
+        else {}
+    )
+    scores = (
+        quality.get("scores")
+        if isinstance(quality.get("scores"), dict)
+        else {}
+    )
+    model = (
+        report.get("model_release")
+        if isinstance(report.get("model_release"), dict)
+        else {}
+    )
+    merged = (
+        model.get("merged_model")
+        if isinstance(model.get("merged_model"), dict)
+        else {}
+    )
+    email = email_delivery_status(target) if target else {}
+    complete = bool(
+        target
+        and str(report.get("as_of_date") or "") == target
+        and report.get("schema_version") == "quant.ai_radar_report.v2"
+        and report.get("deployment_mode") == "reference_publish"
+        and report.get("selected_model_scope_complete") is True
+        and quality.get("schema_version") == QUALITY_SCHEMA_VERSION
+        and quality.get("status") == "green"
+        and quality.get("publishable_reference_report") is True
+        and scores
+        and all(
+            isinstance(value, (int, float)) and float(value) >= 8.0
+            for value in scores.values()
+        )
+        and model.get("status") == "accepted"
+        and model.get("model_id") == "Qwen3-8B-FLOW"
+        and model.get("endpoint_model") == "Qwen3-8B-FLOW"
+        and merged.get("precision") == "bfloat16"
+        and str(merged.get("manifest_sha256") or "")
+        and str(merged.get("content_sha256") or "")
+        and email.get("complete") is True
+    )
+    if not complete:
+        return None
+    run_dir = DEFAULT_OUTPUT_ROOT / "runs" / target
+    report_path = run_dir / "market_report.json"
+    if not all(
+        path.is_file() and path.stat().st_size > 0
+        for path in (
+            report_path,
+            run_dir / "market_report.html",
+            run_dir / "market_report_email_420.html",
+        )
+    ):
+        return None
+    return {
+        "as_of_date": target,
+        "run_dir": str(run_dir),
+        "report": str(report_path),
+        "queue_counts": report.get("queue_counts"),
+        "email_delivery": email,
+    }
+
+
 def run_daily(
     *,
     shadow: bool,
@@ -309,6 +383,31 @@ def run_daily(
     max_ai_stocks: int,
     smoke_max_items: int = 0,
 ) -> dict[str, Any]:
+    production_run = not shadow and not smoke_max_items
+    completed = daily_completion_status() if production_run else None
+    if completed is not None:
+        result = {
+            "schema_version": "quant.ai_radar_app_run.v1",
+            "status": "PASS",
+            "app_id": APP_ID,
+            "action": "daily",
+            "shadow": False,
+            "smoke_max_items": 0,
+            "operations_app_run_id": os.environ.get("OPERATIONS_APP_RUN_ID"),
+            "engine_status": "already_complete",
+            "generation_skipped": True,
+            "skip_reason": "oracle_target_already_green_and_email_v3_complete",
+            "as_of_date": completed["as_of_date"],
+            "run_dir": completed["run_dir"],
+            "report": completed["report"],
+            "production_latest_published": True,
+            "queue_counts": completed.get("queue_counts"),
+            "email_delivery": completed["email_delivery"],
+            "completed_at_kst": _now_kst(),
+        }
+        write_json(APP_STATE_PATH, result)
+        return result
+
     commands = build_daily_commands(
         shadow=shadow,
         workers=workers,
@@ -342,7 +441,6 @@ def run_daily(
             "Radar engine did not reach a complete state: "
             f"{radar.get('status')}"
         )
-    production_run = not shadow and not smoke_max_items
     if production_run:
         if (
             radar.get("status") != "complete"

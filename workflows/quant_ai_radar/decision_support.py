@@ -772,12 +772,48 @@ def audit_report_quality(
         2,
     )
 
+    narratives = report.get("multistage_narratives") or {}
+    expected_sector_count = len(radar.get("integrated_rotation_clusters") or [])
+    sector_explanations = narratives.get("sector_explanations") or []
+    security_explanations = narratives.get("security_explanations") or []
+    editorial = narratives.get("editorial") or {}
+    requires_narratives = report.get("schema_version") == "quant.ai_radar_report.v2"
+    narrative_checks = (
+        not requires_narratives
+        or narratives.get("schema_version")
+        == "quant.ai_radar_multistage_narratives.v1",
+        not requires_narratives
+        or (
+            len(sector_explanations) == expected_sector_count
+            and expected_sector_count > 0
+        ),
+        not requires_narratives or bool(security_explanations),
+        not requires_narratives
+        or all(
+            bool(editorial.get(key))
+            for key in (
+                "headline",
+                "executive_summary",
+                "rotation_summary",
+                "selection_summary",
+                "risk_summary",
+            )
+        ),
+        not requires_narratives
+        or int(narratives.get("model_call_count") or 0) >= 3,
+    )
+    multistage_explanation = round(
+        sum(narrative_checks) / len(narrative_checks) * 10.0,
+        2,
+    )
+
     report_usability_checks = (
         bool(report.get("market_dashboard")),
         bool(report.get("rendered_reports")),
         bool(results),
         bool(report.get("market_judgement", {}).get("summary")),
         bool(report.get("market_judgement", {}).get("confirmations")),
+        not requires_narratives or bool(narratives),
     )
     report_usability = round(
         sum(report_usability_checks) / len(report_usability_checks) * 10.0,
@@ -791,6 +827,7 @@ def audit_report_quality(
         "security_analysis": security_analysis,
         "market_structure": market_structure,
         "model_judgement_integration": model_judgement_integration,
+        "multistage_explanation": multistage_explanation,
         "report_usability": report_usability,
     }
     failed = sorted(
@@ -807,6 +844,13 @@ def audit_report_quality(
         "security_report_count": len(results),
         "complete_security_brief_count": len(complete_briefs),
         "model_consistent_judgement_count": model_consistent,
+        "multistage_narrative_checks": {
+            "schema": narrative_checks[0],
+            "all_rotation_clusters": narrative_checks[1],
+            "material_securities": narrative_checks[2],
+            "editorial": narrative_checks[3],
+            "minimum_model_calls": narrative_checks[4],
+        },
         "unique_model_conclusion_count": len(set(conclusions)),
         "mean_evidence_strength_score": round(
             fmean(

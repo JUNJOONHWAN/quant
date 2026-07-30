@@ -309,6 +309,18 @@ DB와 승인 LoRA로 즉시 분석한다. ETF 관계가 없으면 학습된
 `all_stock_control_analysis`로 해석한다. 당일 가격·품질·PIT 증거가 없으면
 추측 답변 대신 fail-closed 사유를 저장한다.
 
+일일 batch와 사용자 지정 분석은 corporate action에서도 같은 계약을
+사용한다. Oracle은 Massive 발견본, FMP 교차확인본, 검증된 발행사·거래소
+공지를 source-preserving version으로 저장한다. provider 행의
+`available_date`는 최초 관측일이며 소급하지 않는다. 발행사·거래소 공지는
+문서화된 공지일을 사용할 수 있다. 분석 기준일에는
+`effective_date<=as_of`와 `available_date<=as_of`를 모두 만족하고,
+공식 공지이거나 Massive와 FMP의 비율이 정확히 일치한 이벤트만 적용한다.
+분할 효력일 이전의 가격은 `old_shares/new_shares`, 거래량은
+`new_shares/old_shares`로 변환한 뒤에만 특징·학습 예시·추론 입력을 만든다.
+따라서 현재 시점에 늦게 발견한 provider split을 과거 분석에 소급하는
+lookahead는 허용되지 않는다.
+
 ```bash
 PYTHONPATH=$PWD /usr/bin/python3 \
   -m workflows.quant_ai_radar.analyze_on_demand AAPL NVDA

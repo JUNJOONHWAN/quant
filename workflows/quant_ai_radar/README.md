@@ -142,6 +142,19 @@ The SFT liquidity and leakage gates are reused unchanged:
 - FMP ETF membership visible only after its derived next-session gate;
 - no present-day active list removes a historically valid observation.
 
+Split and reverse-split handling is owned by the Oracle database, not by the
+report renderer. Oracle stores source-preserving Massive and FMP provider
+versions plus any verified issuer/exchange notice. Provider rows become
+available only on their first observed capture date; an official notice may
+use its documented announcement date. AI Radar reads only rows whose
+`effective_date` and `available_date` are both no later than the report
+`as_of_date`, then accepts an event only when it is official or the exact ratio
+is corroborated by both Massive and FMP. Pre-effective price and volume rows
+are converted to the latest visible share basis before eligibility, feature
+calculation, training-example construction, or model inference. A provider
+event discovered after the analysis date is retained in the source ledger but
+cannot be backdated into that analysis.
+
 The current-signal gate does not delete history. It only prevents an ETF whose
 last visible observation is stale, malformed, or outside the plausibility
 contract from transmitting that old value into today's stock ranking. ETF
@@ -243,7 +256,9 @@ approval.
 
 The daily 64 ETF / 192 stock ceilings do not restrict an explicit user
 request. Any symbol with a valid current packet can be analyzed with the same
-accepted model, including a no-ETF-relation `all_stock_control_analysis`:
+accepted model, including a no-ETF-relation `all_stock_control_analysis`.
+On-demand analysis loads the same sealed Oracle corporate-action ledger and
+applies the same pre-feature price/volume basis conversion as the daily run:
 
 ```bash
 PYTHONPATH=$PWD /usr/bin/python3 \
@@ -277,9 +292,10 @@ never resumed by this workflow. PIT FMP constituents come from the latest
 visible stored snapshot and fail closed when their provider-available date is
 older than the configured maximum lag.
 
-The active Operations-managed Hermes schedule runs Tue-Sat at 14:30 KST using
-the timezone-bound expression `30 14 * * 2-6`. The disabled systemd fallback
-stores the same intent as `Tue..Sat 05:30 UTC`. Production completion now means
+The active Operations-managed Hermes readiness schedule runs Tue-Sat at
+06:00, 12:00, and 18:00 KST using the timezone-bound expression
+`0 6,12,18 * * 2-6` with `Asia/Seoul`. It does not run hourly overnight.
+Production completion means
 the complete selected queue is empty of pending/running/error work, every
 report quality score is at least 8/10, the rendered report passes the 420px
 HTML contract, and Gmail returns a message id (or the same-date delivery ledger
@@ -348,6 +364,64 @@ separate semantic gate still rejects reversed directional comparisons.
 Every category must be at least `8.0`. A lower score produces
 `shadow_quality_failed_not_published` or blocks reference publication. This is
 a program/runtime contract and does not require retraining the released adapter.
+
+## 다단계 AI 해설
+
+일일 production report는 숫자 계산과 AI 설명을 분리한다. Python이 전체
+정량 스캔, 시장 폭, 가격-ETF Flow regime, 섹터 회전, ETF-구성종목 전달
+값을 확정한다. 그 뒤 released Qwen3-8B LoRA가 다음 순서로만 설명한다.
+
+1. 모든 Oracle rotation cluster를 3개씩 나눠 전체 시장 문맥 안에서 해설
+2. 강세 확인, 약세 확인, 가격-Flow 괴리 lane의 상위 종목을 각각 최대
+   4개씩 골라 소속 섹터와 ETF 전달 경로를 해설
+3. 앞의 모든 해설과 전체 결정론 집계를 다시 읽어 편집장 종합문 작성
+
+모델은 숫자, 날짜, raw 상태 코드, 매수·매도 지시를 쓸 수 없다. 정확한
+수치와 한국어 상태명은 renderer가 소유한다. sector 전체 coverage, 주요
+종목 coverage, 편집장 종합, 최소 다단계 호출이 하나라도 빠지면 v2
+production quality gate는 red로 닫힌다. 원문과 호출 hash는
+`market_report.json`의 `multistage_narratives`와
+`multistage_narrative_trace`에 남는다.
+
+v2 설명 경로에는 다른 writer 모델, 규칙 기반 해설, hardcoded 설명
+fallback이 없다. Qwen3-8B-FLOW 응답이 문장 완결성, 섹터 상태, 실제
+ETF-종목 연결, 비인과적 표현, 종목 coverage 계약을 통과하지 못하면
+renderer와 420px 이메일 모두 실패한다. Python은 모델이 반환한 항목의
+순서 복원, 숫자 제거, 한국어 상태 label, 표시용 반올림만 수행한다.
+
+각 sector/security/editorial stage는 결정론적 입력 SHA256과 검증된 모델
+원문을 `runs/YYYY-MM-DD/narrative_stages/`에 원자적으로 checkpoint한다.
+재시작은 입력 hash와 현재 계약을 다시 검증한 stage만 재사용하고, 실패한
+stage만 같은 trained model로 재호출한다. 성공 stage를 다른 문구로
+재작성하거나 모델 장애를 숨기지 않는다.
+
+## Hermes heartbeat production integration
+
+Hermes는 실행 조정, 상태 감시, 메일 완료 확인만 소유한다.
+`Qwen3-8B-FLOW`가 유일한 해설 writer다. 관리 앱 ID는
+`quant-ai-radar`이며 허트비트의 예약 리포트 층에는
+`AI Radar 종합`으로 표시된다.
+
+준비 확인 시각은 KST 화–토 `06:00`, `12:00`, `18:00`이다. 새벽
+반복 실행은 없다. 각 시각에도 데이터 준비나 모델 호출 전에 Oracle의
+봉인 기준일, v2 green 리포트, Gmail v3 원장을 비교한다. 정확히 일치하면
+`engine_status=already_complete`로 즉시 종료하며 추론과 메일 발송을
+반복하지 않는다. Oracle 기준일이 진전됐거나 리포트·메일 최종 게이트가
+미완료일 때만 모델 실행을 시작한다.
+
+허트비트는 다음 조건을 모두 통과한 결과만 완료로 인정한다.
+
+- Oracle 기준일과 리포트 `as_of_date` 일치
+- v2 스키마, `reference_publish`, 모든 품질 점수 8점 이상
+- 회전 군집 9개, 주요 종목 해설 12개 이상, 모델 단계 8개 이상
+- 기록된 모든 해설 호출 모델이 `Qwen3-8B-FLOW`
+- 승인 release가 BF16 merge manifest와 전체 shard hash를 결속
+- `status/latest.json`과 기준일 run report의 hash 일치
+- 전체 HTML과 420px HTML 존재
+- Gmail v3 원장의 message ID 및 report/mobile/attachment hash 일치
+
+관리 앱 lock은 겹치는 실행을 차단하고 Gmail 원장은 미국 시장 기준일별
+v2 메일을 한 번만 허용한다. 다른 writer 폴백과 거래 실행 경로는 없다.
 
 ## Outputs
 

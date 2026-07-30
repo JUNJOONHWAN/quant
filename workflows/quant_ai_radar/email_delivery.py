@@ -16,6 +16,15 @@ from typing import Any, Mapping
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .presentation import (
+    bar_width,
+    confidence_pct,
+    label_market_state,
+    label_regime,
+    label_rotation_state,
+    whole,
+)
+from .report_narratives import validate_report_narratives
 
 DEFAULT_OUTPUT_ROOT = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR"
@@ -27,7 +36,7 @@ DEFAULT_GMAIL_OAUTH_FILE = (
 DEFAULT_GMAIL_RECIPIENT_FILE = (
     Path.home() / ".dgx-secrets/files/google/etfradar-gmail-recipient"
 )
-EMAIL_CONTRACT_VERSION = "v2"
+EMAIL_CONTRACT_VERSION = "v3"
 QUALITY_SCHEMA_VERSION = "quant.ai_radar_quality_audit.v2"
 MAX_GMAIL_INLINE_BYTES = 90_000
 
@@ -231,7 +240,7 @@ def email_delivery_status(
     return {
         "status": "DONE" if complete else "MISSING",
         "complete": complete,
-        "contract": "quant-ai-radar-daily-email-v2",
+        "contract": f"quant-ai-radar-daily-email-{EMAIL_CONTRACT_VERSION}",
         "dedupe_key": key,
         "message_id": message_id,
         "recipient_count": int(record.get("recipient_count") or 0),
@@ -309,8 +318,8 @@ def _candidate_rows(rows: Any) -> str:
     body = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             _e(row.get("symbol")),
-            _e(row.get("regime")),
-            _e(_number(row.get("confidence"), 2)),
+            _e(label_regime(row.get("regime"))),
+            _e(confidence_pct(row.get("confidence"))),
         )
         for row in values[:6]
         if isinstance(row, Mapping)
@@ -326,6 +335,7 @@ def _number(value: Any, digits: int = 1) -> Any:
 
 
 def _email_html(report: Mapping[str, Any]) -> str:
+    validate_report_narratives(report)
     market = report.get("market_judgement")
     market = market if isinstance(market, Mapping) else {}
     dashboard = report.get("market_dashboard")
@@ -344,11 +354,15 @@ def _email_html(report: Mapping[str, Any]) -> str:
     oracle = oracle if isinstance(oracle, Mapping) else {}
     rotations = dashboard.get("rotation_clusters")
     rotations = rotations if isinstance(rotations, list) else []
+    narratives = report.get("multistage_narratives")
+    narratives = narratives if isinstance(narratives, Mapping) else {}
+    editorial = narratives.get("editorial")
+    editorial = editorial if isinstance(editorial, Mapping) else {}
     rotation_rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             _e(row.get("cluster")),
-            _e(row.get("state")),
-            _e(_number(row.get("score"))),
+            _e(label_rotation_state(row.get("state"))),
+            _e(whole(row.get("score"))),
         )
         for row in rotations[:8]
         if isinstance(row, Mapping)
@@ -366,6 +380,16 @@ def _email_html(report: Mapping[str, Any]) -> str:
     divergence = list(lanes.get("divergence_etfs") or []) + list(
         lanes.get("divergence_stocks") or []
     )
+    security_cards = "".join(
+        """<div class="mini"><strong>{}</strong><p>{}</p>
+<p class="muted">{}</p></div>""".format(
+            _e(row.get("symbol")),
+            _e(row.get("headline")),
+            _e(row.get("group_context")),
+        )
+        for row in list(narratives.get("security_explanations") or [])[:6]
+        if isinstance(row, Mapping)
+    )
     return f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -381,31 +405,43 @@ border-radius:10px;padding:10px}}table{{width:100%;table-layout:fixed;
 border-collapse:collapse}}th,td{{padding:7px;border-bottom:1px solid #26324f;
 text-align:left;overflow-wrap:anywhere}}th{{color:#9ba9c8}}.pill{{display:inline-block;
 padding:3px 7px;border:1px solid #26324f;border-radius:999px;margin:2px;
-color:#72e0bd}}@media(max-width:420px){{main{{padding:10px}}}}
+color:#72e0bd}}.bar{{height:9px;background:#09101e;border-radius:999px;
+overflow:hidden;margin:6px 0}}.bar span{{display:block;height:100%;
+background:linear-gradient(90deg,#72e0bd,#7aa7ff)}}.callout{{border-left:3px
+solid #72e0bd}}@media(max-width:420px){{main{{padding:10px}}}}
 </style></head><body><main>
 <h1>Quant AI Radar</h1>
 <p class="meta">미국 기준일 {_e(report.get("as_of_date"))} · 생성
 {_e(report.get("generated_at_kst"))}<br>참고용 분석 · 실주문 미연결</p>
-<section class="card"><div class="muted">Market state</div>
-<div class="metric">{_e(market.get("market_state"))}</div>
-<p>{_e(market.get("summary"))}</p></section>
+<section class="card callout"><div class="muted">오늘의 시장 국면</div>
+<div class="metric">{_e(label_market_state(market.get("market_state")))}</div>
+<h2>{_e(editorial.get("headline"))}</h2>
+<p>{_e(editorial.get("executive_summary"))}</p>
+<p><strong>회전:</strong> {_e(editorial.get("rotation_summary"))}</p>
+<p><strong>위험:</strong> {_e(editorial.get("risk_summary"))}</p></section>
 <section class="card"><h2>시장 구조</h2><div class="grid">
-<div class="mini"><div class="muted">Confidence</div><div class="metric">{_e(market.get("confidence"))}</div></div>
+<div class="mini"><div class="muted">AI 판단 신뢰도</div><div class="metric">{_e(confidence_pct(market.get("confidence")))}</div>
+<div class="bar"><span style="width:{bar_width((market.get('confidence') or 0) * 100)}%"></span></div></div>
 <div class="mini"><div class="muted">AI 완료</div><div class="metric">{_e(quality.get("security_report_count", selection.get("selected_count")))}</div></div>
-<div class="mini"><div class="muted">가격 양수</div><div class="metric">{_e(breadth.get("price_positive_pct"))}%</div></div>
-<div class="mini"><div class="muted">Flow 양수</div><div class="metric">{_e(breadth.get("etf_flow_positive_pct"))}%</div></div>
+<div class="mini"><div class="muted">가격 강세</div><div class="metric">{_e(whole(breadth.get("price_positive_pct"), suffix="%"))}</div>
+<div class="bar"><span style="width:{bar_width(breadth.get('price_positive_pct'))}%"></span></div></div>
+<div class="mini"><div class="muted">ETF 자금 강세</div><div class="metric">{_e(whole(breadth.get("etf_flow_positive_pct"), suffix="%"))}</div>
+<div class="bar"><span style="width:{bar_width(breadth.get('etf_flow_positive_pct'))}%"></span></div></div>
 </div></section>
 <section class="card"><h2>섹터·테마 회전</h2><table><thead><tr>
-<th>Cluster</th><th>State</th><th>Score</th></tr></thead>
+<th>분류</th><th>상태</th><th>강도</th></tr></thead>
 <tbody>{rotation_rows}</tbody></table></section>
+<section class="card"><h2>주요 종목 AI 해설</h2>
+<p>{_e(editorial.get("selection_summary"))}</p>
+<div class="grid">{security_cards}</div></section>
 <section class="card"><h2>강세 확인 관찰</h2><table><thead><tr>
-<th>Symbol</th><th>Regime</th><th>신뢰도</th></tr></thead>
+<th>종목</th><th>판정</th><th>신뢰도</th></tr></thead>
 <tbody>{_candidate_rows(positive)}</tbody></table></section>
 <section class="card"><h2>약세 확인 위험</h2><table><thead><tr>
-<th>Symbol</th><th>Regime</th><th>신뢰도</th></tr></thead>
+<th>종목</th><th>판정</th><th>신뢰도</th></tr></thead>
 <tbody>{_candidate_rows(negative)}</tbody></table></section>
 <section class="card"><h2>가격–Flow 괴리</h2><table><thead><tr>
-<th>Symbol</th><th>Regime</th><th>신뢰도</th></tr></thead>
+<th>종목</th><th>판정</th><th>신뢰도</th></tr></thead>
 <tbody>{_candidate_rows(divergence)}</tbody></table></section>
 <section class="card"><h2>품질·신선도</h2><p>{score_pills}</p>
 <p class="muted">Oracle 기준일 {_e(oracle.get("target_as_of_date"))} ·

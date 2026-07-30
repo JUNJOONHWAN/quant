@@ -24,6 +24,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from quant_dataset.config import load_credentials
+from quant_dataset.corporate_actions import capture_corporate_actions
 from quant_dataset.pipeline import DatasetPipeline
 from quant_dataset.providers import ApiRequestError
 from quant_dataset.storage import canonical_json, redacted_request_metadata
@@ -37,6 +38,10 @@ LOCK_FILE = "state/oracle_incremental.lock"
 ET = ZoneInfo("America/New_York")
 FMP_LEGACY_EOD_BULK_URL = (
     "https://financialmodelingprep.com/api/v4/batch-historical-eod"
+)
+DEFAULT_VERIFIED_CORPORATE_ACTIONS = Path(
+    "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/oracle/"
+    "incremental/state/verified_corporate_actions.json"
 )
 
 
@@ -667,7 +672,7 @@ def _status_target(status_path: Path) -> str | None:
         return None
     if status.get("status") != "COMPLETE" or status.get("missing_sessions"):
         return None
-    if status.get("schema") != "quant.market_structure_oracle.incremental.v2":
+    if status.get("schema") != "quant.market_structure_oracle.incremental.v3":
         return None
     if not ((status.get("snapshot_seal") or {}).get("receipt_sha256")):
         return None
@@ -739,6 +744,19 @@ def _materialize(
         session_rows_by_source[session] = _market_rows_by_source(
             database_path, session
         )
+    corporate_actions = capture_corporate_actions(
+        pipeline=pipeline,
+        start_date=(
+            date.fromisoformat(base_end) + timedelta(days=1)
+        ).isoformat(),
+        end_date=target,
+        official_ledger_path=DEFAULT_VERIFIED_CORPORATE_ACTIONS,
+    )
+    if corporate_actions["invalid_row_count"]:
+        raise IncrementalStoreError(
+            "corporate-action normalization rejected provider rows: "
+            f"{corporate_actions['invalid_row_count']}"
+        )
     flow_result = pipeline.capture_etf_flows(
         target,
         lookback_days=10,
@@ -768,7 +786,7 @@ def _materialize(
         max_etfs=constituent_refresh_max_etfs,
     )
     receipt = {
-        "schema": "quant.market_structure_oracle.incremental.v2",
+        "schema": "quant.market_structure_oracle.incremental.v3",
         "source_contract": "oracle_owned_fmp_massive_no_etf_radar_dependency",
         "base_history_end": base_end,
         "target_as_of_date": target,
@@ -795,6 +813,7 @@ def _materialize(
                 "effective_date,processed_date,available_at_date <= as_of"
             ),
         },
+        "corporate_actions": corporate_actions,
         "etf_constituents": constituent_refresh,
         "database": str(database_path),
     }

@@ -19,6 +19,7 @@ from quant_dataset.shared_market import (
 from quant_dataset.storage import Database, canonical_json
 from workflows.quant_ai_radar.analyze_on_demand import (
     OnDemandError,
+    _analysis_packet as on_demand_analysis_packet,
     _symbols as on_demand_symbols,
 )
 from workflows.quant_ai_radar.market_report import (
@@ -545,6 +546,81 @@ class QuantAiRadarTest(unittest.TestCase):
         with self.assertRaises(OnDemandError):
             on_demand_symbols(["bad symbol"])
 
+    def test_on_demand_packet_uses_same_corporate_action_adjustment(self):
+        class Pipeline:
+            def analysis_packet_for_pair(
+                self,
+                symbol,
+                as_of_date,
+                *,
+                lookback_days,
+                recompute_quality,
+            ):
+                self.call = {
+                    "symbol": symbol,
+                    "as_of_date": as_of_date,
+                    "lookback_days": lookback_days,
+                    "recompute_quality": recompute_quality,
+                }
+                return {
+                    "symbol": symbol,
+                    "packet_id": "before",
+                    "history": [
+                        {
+                            "trade_date": "2026-07-14",
+                            "sources": [
+                                {
+                                    "source": "massive",
+                                    "close": 3.0,
+                                    "volume": 1000.0,
+                                }
+                            ],
+                        }
+                    ],
+                }
+
+        pipeline = Pipeline()
+        ledger = {
+            "sha256": "oracle-ledger-sha",
+            "events_by_symbol": {
+                "TZA": [
+                    {
+                        "symbol": "TZA",
+                        "action_type": "reverse_split",
+                        "effective_date": "2026-07-15",
+                        "available_date": "2026-06-10",
+                        "old_shares": 10.0,
+                        "new_shares": 1.0,
+                        "price_factor_for_prior_rows": 10.0,
+                        "volume_factor_for_prior_rows": 0.1,
+                        "verification_status": "official",
+                    }
+                ]
+            },
+        }
+        packet = on_demand_analysis_packet(
+            pipeline,
+            symbol="TZA",
+            as_of_date="2026-07-29",
+            corporate_actions=ledger,
+        )
+        source = packet["history"][0]["sources"][0]
+        self.assertEqual(source["close"], 30.0)
+        self.assertEqual(source["volume"], 100.0)
+        self.assertEqual(
+            packet["verified_corporate_actions"]["ledger_sha256"],
+            "oracle-ledger-sha",
+        )
+        self.assertEqual(
+            pipeline.call,
+            {
+                "symbol": "TZA",
+                "as_of_date": "2026-07-29",
+                "lookback_days": 21,
+                "recompute_quality": False,
+            },
+        )
+
     def test_shadow_mode_is_explicit_and_opt_in(self):
         parser = radar_parser()
         self.assertFalse(parser.parse_args(["--prepare-only"]).shadow)
@@ -995,6 +1071,106 @@ class QuantAiRadarTest(unittest.TestCase):
             loaded = load_model_release(release_path)
             self.assertEqual(loaded.model_id, "quant-v1")
             weights.write_bytes(b"tampered")
+            with self.assertRaises(ModelGateError):
+                load_model_release(release_path)
+
+    def test_merged_bf16_release_binds_evaluated_adapter_and_model_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = root / "adapter"
+            adapter.mkdir()
+            weights = adapter / "adapter_model.safetensors"
+            config = adapter / "adapter_config.json"
+            weights.write_bytes(b"weights")
+            config.write_text("{}\n", encoding="utf-8")
+            dataset = root / "dataset.json"
+            dataset.write_text('{"schema_version":"dataset"}\n', encoding="utf-8")
+            frozen_test = root / "test.jsonl"
+            frozen_test.write_text('{"example_id":"one"}\n', encoding="utf-8")
+            predictions = root / "predictions.jsonl"
+            predictions.write_text('{"example_id":"one"}\n', encoding="utf-8")
+            adapter_set_sha, _ = adapter_artifact_set(
+                adapter, [weights, config]
+            )
+            evaluation = root / "evaluation.json"
+            evaluation.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "quant.frozen_test_evaluation.v1",
+                        "endpoint_model": "qwen3-8b-quant-lora-v1",
+                        "adapter_set_sha256": adapter_set_sha,
+                        "dataset_manifest": {"sha256": sha256(dataset)},
+                        "frozen_test": {
+                            "path": str(frozen_test),
+                            "sha256": sha256(frozen_test),
+                        },
+                        "predictions": {
+                            "path": str(predictions),
+                            "sha256": sha256(predictions),
+                        },
+                        "status": "green",
+                        "prohibited_violation_count": 0,
+                        "required_gates": {
+                            "full_test": True,
+                            "no_lookahead": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            merged_root = root / "Qwen3-8B-FLOW-BF16"
+            merged_root.mkdir()
+            model_file = merged_root / "model.safetensors"
+            model_file.write_bytes(b"merged-bf16-weights")
+            merge_core = {
+                "schema_version": "quant.merged_hf_model.v1",
+                "status": "complete",
+                "model_name": "Qwen3-8B-FLOW",
+                "precision": "bfloat16",
+                "adapter_artifacts": [
+                    {"path": str(weights), "sha256": sha256(weights)},
+                    {"path": str(config), "sha256": sha256(config)},
+                ],
+                "files": [
+                    {
+                        "path": model_file.name,
+                        "bytes": model_file.stat().st_size,
+                        "sha256": sha256(model_file),
+                    }
+                ],
+            }
+            merge_core["content_sha256"] = hashlib.sha256(
+                json.dumps(
+                    merge_core,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            merge_manifest = merged_root / "merge_manifest.json"
+            merge_manifest.write_text(
+                json.dumps(merge_core), encoding="utf-8"
+            )
+            release_value = build_release(
+                model_id="Qwen3-8B-FLOW",
+                endpoint_model="Qwen3-8B-FLOW",
+                base_model=str(merged_root),
+                adapter_root=adapter,
+                artifacts=[weights, config],
+                dataset_manifest=dataset,
+                evaluation_report=evaluation,
+                merged_manifest=merge_manifest,
+                merged_model_root=merged_root,
+            )
+            release_path = root / "release.json"
+            release_path.write_text(json.dumps(release_value), encoding="utf-8")
+            loaded = load_model_release(release_path)
+            self.assertEqual(loaded.endpoint_model, "Qwen3-8B-FLOW")
+            self.assertEqual(
+                loaded.public_metadata()["merged_model"]["precision"],
+                "bfloat16",
+            )
+            model_file.write_bytes(b"tampered")
             with self.assertRaises(ModelGateError):
                 load_model_release(release_path)
 

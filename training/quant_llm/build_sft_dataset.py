@@ -292,14 +292,26 @@ def _preferred_price_rows(packet: Mapping[str, Any]) -> List[dict]:
             continue
         candidates.sort(key=lambda row: (preferred.get(str(row.get("source")), 9), str(row.get("source"))))
         selected = candidates[0]
-        raw_close = _as_number(selected.get("close"))
+        close = _as_number(selected.get("close"))
+        raw_close = _as_number(
+            selected.get("raw_close_before_corporate_action")
+        )
+        if raw_close is None:
+            raw_close = close
+        adjusted_by_action = bool(
+            selected.get("corporate_action_adjustment")
+        )
         result.append(
             {
                 "trade_date": _canonical_date(day["trade_date"]),
                 "source": selected.get("source"),
-                "close": raw_close,
+                "close": close,
                 "raw_close": raw_close,
-                "price_basis": "raw_close_pit_conservative",
+                "price_basis": (
+                    "verified_pit_corporate_action_adjusted"
+                    if adjusted_by_action
+                    else "raw_close_pit_conservative"
+                ),
                 "volume": _as_number(selected.get("volume")),
             }
         )

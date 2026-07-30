@@ -78,9 +78,17 @@ SOURCE_CAPABILITY_POLICY = {
         ],
     },
     "phase2_corporate_actions": {
-        "enabled": False,
-        "implementation_status": "planned_not_implemented",
+        "enabled": True,
+        "implementation_status": (
+            "implemented_oracle_massive_discovery_fmp_corroboration"
+        ),
         "category": "dividends_splits_ticker_events",
+        "massive_endpoint": "/stocks/v1/splits",
+        "fmp_endpoint": "/stable/splits",
+        "point_in_time_policy": (
+            "provider rows use first observed capture date; official notices "
+            "may use documented announcement availability"
+        ),
     },
     "phase2_float_short": {
         "enabled": False,

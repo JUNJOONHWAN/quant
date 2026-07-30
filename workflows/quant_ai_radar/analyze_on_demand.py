@@ -33,6 +33,10 @@ from workflows.quant_ai_radar.model_runtime import (  # noqa: E402
     TrainedQuantClient,
     load_model_release,
 )
+from workflows.quant_ai_radar.corporate_actions import (  # noqa: E402
+    adjust_packet_for_verified_corporate_actions,
+    load_oracle_corporate_actions,
+)
 from workflows.quant_ai_radar.universe import resolve_as_of_date, write_json  # noqa: E402
 from workflows.quant_ai_radar.report_renderer import (  # noqa: E402
     render_single_security_html,
@@ -79,6 +83,25 @@ def _symbols(raw: list[str]) -> list[str]:
     return result
 
 
+def _analysis_packet(
+    pipeline: DatasetPipeline,
+    *,
+    symbol: str,
+    as_of_date: str,
+    corporate_actions: dict[str, Any],
+) -> dict[str, Any]:
+    packet = pipeline.analysis_packet_for_pair(
+        symbol,
+        as_of_date,
+        lookback_days=21,
+        recompute_quality=False,
+    )
+    return adjust_packet_for_verified_corporate_actions(
+        packet,
+        corporate_actions,
+    )
+
+
 def analyze(args: argparse.Namespace) -> dict[str, Any]:
     symbols = _symbols(args.symbols)
     data_root = args.data_root.expanduser().resolve()
@@ -111,16 +134,20 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         database=database,
         read_only=True,
     )
+    corporate_actions = load_oracle_corporate_actions(
+        database,
+        as_of_date=as_of,
+    )
     output_dir = args.output_root.expanduser().resolve() / "on_demand" / as_of
     results = []
     for symbol in symbols:
         output_path = output_dir / f"{symbol}.json"
         try:
-            packet = pipeline.analysis_packet_for_pair(
-                symbol,
-                as_of,
-                lookback_days=21,
-                recompute_quality=False,
+            packet = _analysis_packet(
+                pipeline,
+                symbol=symbol,
+                as_of_date=as_of,
+                corporate_actions=corporate_actions,
             )
             eligibility = packet_eligibility(packet)
             if not eligibility["eligible"]:
@@ -152,6 +179,13 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
                     "eligibility": eligibility,
                     "model_release": release.public_metadata(),
                     "shared_market_store": binding.public_metadata(),
+                    "oracle_corporate_actions": {
+                        "schema_version": corporate_actions["schema_version"],
+                        "sha256": corporate_actions["sha256"],
+                        "accepted_event_count": len(
+                            corporate_actions["events"]
+                        ),
+                    },
                     "judgement": judgement,
                     "trace": trace,
                     "scope": "data_interpretation_not_trade_execution",
@@ -195,6 +229,11 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "as_of_date": as_of,
         "requested_symbols": symbols,
+        "oracle_corporate_actions": {
+            "schema_version": corporate_actions["schema_version"],
+            "sha256": corporate_actions["sha256"],
+            "accepted_event_count": len(corporate_actions["events"]),
+        },
         "results": results,
         "generated_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
     }

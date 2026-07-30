@@ -45,6 +45,7 @@ def build_stage_commands(
     model_endpoint: str,
     release_manifest: str,
     workers: str,
+    timeout_seconds: str = "360",
     token_file: str = "",
     max_constituent_available_lag_days: str = "45",
     constituent_stale_days: str = "45",
@@ -76,6 +77,8 @@ def build_stage_commands(
         model_endpoint,
         "--workers",
         workers,
+        "--timeout",
+        timeout_seconds,
         "--max-constituent-available-lag-days",
         max_constituent_available_lag_days,
         "--max-ai-etfs",
@@ -99,6 +102,9 @@ def main() -> int:
         model_endpoint=model_endpoint,
         release_manifest=release_manifest,
         workers=os.environ.get("QUANT_AI_WORKERS", "4"),
+        timeout_seconds=os.environ.get(
+            "QUANT_AI_MODEL_TIMEOUT_SECONDS", "360"
+        ),
         token_file=os.environ.get("QUANT_AI_MODEL_TOKEN_FILE", "").strip(),
         max_constituent_available_lag_days=os.environ.get(
             "QUANT_AI_MAX_CONSTITUENT_AVAILABLE_LAG_DAYS", "45"

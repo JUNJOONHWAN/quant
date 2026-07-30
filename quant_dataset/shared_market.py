@@ -18,6 +18,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
+from .corporate_actions import corporate_action_summary
 from .storage import canonical_json
 
 
@@ -94,6 +95,8 @@ class SharedMarketBinding:
     latest_constituent_effective_date: str
     latest_constituent_available_date: str
     constituent_available_lag_days: int
+    corporate_action_visible_record_count: int
+    corporate_action_projection_sha256: str
     source_fingerprint_sha256: str
     source_fingerprint: dict[str, Any]
 
@@ -115,6 +118,12 @@ class SharedMarketBinding:
             ),
             "constituent_available_lag_days": (
                 self.constituent_available_lag_days
+            ),
+            "corporate_action_visible_record_count": (
+                self.corporate_action_visible_record_count
+            ),
+            "corporate_action_projection_sha256": (
+                self.corporate_action_projection_sha256
             ),
             "source_fingerprint_sha256": self.source_fingerprint_sha256,
             "single_writer": "market_structure_oracle_incremental_store",
@@ -148,6 +157,17 @@ def load_shared_market_binding(
     if status.get("status") != "COMPLETE":
         raise SharedMarketStoreError(
             f"Oracle incremental store is not COMPLETE: {status.get('status')}"
+        )
+    status_schema = str(
+        status.get("schema")
+        or "quant.market_structure_oracle.incremental.v2"
+    )
+    if status_schema not in {
+        "quant.market_structure_oracle.incremental.v2",
+        "quant.market_structure_oracle.incremental.v3",
+    }:
+        raise SharedMarketStoreError(
+            f"unsupported Oracle incremental schema: {status_schema}"
         )
     missing_sessions = list(status.get("missing_sessions") or [])
     if missing_sessions:
@@ -318,6 +338,32 @@ def load_shared_market_binding(
         raise SharedMarketStoreError(
             "Oracle status and SQLite snapshot seal do not match"
         )
+    if status_schema == "quant.market_structure_oracle.incremental.v3":
+        try:
+            corporate_summary = corporate_action_summary(incremental, target)
+        except sqlite3.Error as exc:
+            raise SharedMarketStoreError(
+                "Oracle corporate-action ledger is missing or invalid"
+            ) from exc
+        expected_corporate = status.get("corporate_actions") or {}
+        if (
+            corporate_summary["visible_projection_sha256"]
+            != expected_corporate.get("visible_projection_sha256")
+            or corporate_summary["visible_record_count"]
+            != expected_corporate.get("visible_record_count")
+            or corporate_summary["projection_count"]
+            != expected_corporate.get("projection_count")
+        ):
+            raise SharedMarketStoreError(
+                "Oracle corporate-action ledger does not match the snapshot seal"
+            )
+    else:
+        corporate_summary = {
+            "projection_count": 0,
+            "version_count": 0,
+            "visible_record_count": 0,
+            "visible_projection_sha256": hashlib.sha256(b"[]").hexdigest(),
+        }
 
     effective_candidates = [
         value
@@ -349,7 +395,7 @@ def load_shared_market_binding(
         )
 
     fingerprint = {
-        "schema_version": "quant.shared_market_source_fingerprint.v1",
+        "schema_version": "quant.shared_market_source_fingerprint.v2",
         "base": {
             "path": str(base),
             "bytes": base.stat().st_size,
@@ -363,6 +409,18 @@ def load_shared_market_binding(
             "daily_rows": daily_rows,
             "etf_flow_version_count": incremental_flow_count,
             "etf_constituent_observation_count": incremental_constituent_count,
+            "corporate_action_projection_count": corporate_summary[
+                "projection_count"
+            ],
+            "corporate_action_version_count": corporate_summary[
+                "version_count"
+            ],
+            "corporate_action_visible_record_count": corporate_summary[
+                "visible_record_count"
+            ],
+            "corporate_action_projection_sha256": corporate_summary[
+                "visible_projection_sha256"
+            ],
             "snapshot_seal": {
                 "schema_version": seal_schema,
                 "source_contract": source_contract,
@@ -388,6 +446,12 @@ def load_shared_market_binding(
         latest_constituent_effective_date=latest_constituent_effective,
         latest_constituent_available_date=latest_constituent_available,
         constituent_available_lag_days=constituent_lag,
+        corporate_action_visible_record_count=corporate_summary[
+            "visible_record_count"
+        ],
+        corporate_action_projection_sha256=corporate_summary[
+            "visible_projection_sha256"
+        ],
         source_fingerprint_sha256=fingerprint_sha,
         source_fingerprint=fingerprint,
     )
@@ -540,6 +604,37 @@ class SharedReadOnlyDatabase:
             (row for row in rows if str(row["trade_date"]) in selected),
             key=lambda row: (str(row["trade_date"]), str(row["source"])),
         )
+
+    def corporate_action_rows(self, as_of_date: str) -> list[dict[str, Any]]:
+        """Return only split evidence visible and effective by the snapshot."""
+
+        as_of = date.fromisoformat(as_of_date).isoformat()
+        if as_of != self.binding.target_as_of_date:
+            raise SharedMarketStoreError(
+                "corporate-action date does not match the sealed Oracle target"
+            )
+        if not self.binding.corporate_action_visible_record_count:
+            return []
+        connection = sqlite3.connect(
+            f"file:{self.binding.incremental_database}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT c.*,r.payload_sha256,r.raw_relative_path
+                FROM corporate_actions c
+                JOIN raw_artifacts r ON r.id=c.raw_artifact_id
+                WHERE c.effective_date<=? AND c.available_date<=?
+                ORDER BY c.symbol,c.effective_date,c.provider,
+                         c.provider_event_id
+                """,
+                (as_of, as_of),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
 
     def flow_source_paths(self) -> tuple[Path, Path]:
         """Expose immutable source files for indexed PIT flow reads."""

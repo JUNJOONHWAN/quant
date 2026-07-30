@@ -70,6 +70,7 @@ class QuantAiRadarAppTest(unittest.TestCase):
                     "http://127.0.0.1:8018/v1/chat/completions"
                 ),
                 "QUANT_AI_RELEASE_MANIFEST": "/tmp/release.json",
+                "QUANT_AI_MODEL_TIMEOUT_SECONDS": "420",
             },
             clear=False,
         ):
@@ -83,6 +84,7 @@ class QuantAiRadarAppTest(unittest.TestCase):
         radar = commands[1]
         self.assertIn("--shadow", radar)
         self.assertEqual(radar[radar.index("--workers") + 1], "8")
+        self.assertEqual(radar[radar.index("--timeout") + 1], "420")
         self.assertEqual(radar[radar.index("--max-ai-etfs") + 1], "64")
         self.assertEqual(radar[radar.index("--max-ai-stocks") + 1], "192")
         self.assertEqual(radar[radar.index("--smoke-max-items") + 1], "2")
@@ -120,6 +122,8 @@ class QuantAiRadarAppTest(unittest.TestCase):
             "queue_counts": {"done": 255, "error": 0},
         }
         with mock.patch.object(
+            app_cli, "daily_completion_status", return_value=None
+        ), mock.patch.object(
             app_cli, "build_daily_commands", return_value=[["prepare"], ["radar"]]
         ):
             with mock.patch.object(
@@ -145,6 +149,34 @@ class QuantAiRadarAppTest(unittest.TestCase):
                         )
         deliver.assert_called_once_with(Path("/tmp/run/market_report.json"))
         self.assertTrue(result["email_delivery"]["complete"])
+
+    def test_production_daily_skips_completed_oracle_target(self):
+        completed = {
+            "as_of_date": "2026-07-29",
+            "run_dir": "/tmp/run",
+            "report": "/tmp/run/market_report.json",
+            "queue_counts": {"done": 255, "error": 0},
+            "email_delivery": {
+                "status": "DONE",
+                "complete": True,
+                "message_id": "gmail-id",
+            },
+        }
+        with mock.patch.object(
+            app_cli, "daily_completion_status", return_value=completed
+        ), mock.patch.object(app_cli, "build_daily_commands") as build, mock.patch.object(
+            app_cli, "run_json_command"
+        ) as run, mock.patch.object(app_cli, "write_json"):
+            result = app_cli.run_daily(
+                shadow=False,
+                workers=4,
+                max_ai_etfs=64,
+                max_ai_stocks=192,
+            )
+        build.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(result["generation_skipped"])
+        self.assertEqual(result["engine_status"], "already_complete")
 
     def test_shadow_daily_never_sends_email(self):
         radar = {
