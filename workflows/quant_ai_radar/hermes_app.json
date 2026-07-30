@@ -79,10 +79,13 @@
     "workdir": "/home/zooh/Documents/GitHub/quant"
   },
   "schedule": {
+    "cron_job_id": "df8877b710a4",
     "enabled": true,
+    "executor": "hermes-cron",
     "expression": "30 14 * * 2-6",
     "owner": "operations",
-    "timezone": "Asia/Seoul"
+    "timezone": "Asia/Seoul",
+    "wrapper": "/home/zooh/.hermes/scripts/operations_app_df8877b710a4.py"
   },
   "schema": "hermes-independent-app-v1",
   "updated_at": "2026-07-30T07:00:00Z"
