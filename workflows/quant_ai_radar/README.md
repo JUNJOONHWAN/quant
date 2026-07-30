@@ -54,9 +54,10 @@ hermes apps run quant-ai-radar \
 ```
 
 App Manager seals request JSON and passes only its file path and canonical
-SHA-256 to the app. The app schedule is registered disabled. Registering or
-running this application does not enable the existing systemd timer, resume the
-paused FMP history backfill, modify ETF Flow, or place trades.
+SHA-256 to the app. The active Hermes schedule is Tue-Sat 14:30 KST; the
+systemd timer remains a disabled fallback. Registering or running this
+application does not resume the paused FMP history backfill, modify ETF Flow,
+or place trades.
 
 Market Structure Oracle and Quant AI Radar remain separate applications.
 Oracle owns the current-market incremental database; AI Radar reads that
@@ -69,6 +70,9 @@ input/output examples are in
 The authoritative current-data ownership, new-listing, lookahead, locking, and
 recovery contract is
 [`ORACLE_SHARED_DATA_CONTRACT.md`](ORACLE_SHARED_DATA_CONTRACT.md).
+The staged plan for using the accepted LoRA more deeply through daily change
+memory, historical analogs, calibration, reviewer passes, and a future
+challenger adapter is [`V3_ROADMAP.md`](V3_ROADMAP.md).
 
 ## End-to-end contract
 
@@ -273,12 +277,19 @@ never resumed by this workflow. PIT FMP constituents come from the latest
 visible stored snapshot and fail closed when their provider-available date is
 older than the configured maximum lag.
 
-The supplied timer expresses a KST Tue-Sat 09:15 intent as the explicit UTC
-stored schedule `Tue..Sat 00:15 UTC`. It is installed disabled. Enable it only
-after training, evaluation, release creation, model serving, and a successful
-non-publishable smoke. Do not enable it until an observed capacity benchmark
-proves that the complete selected queue finishes inside the daily operating
-window and the shadow run has no pending, running, or error rows.
+The active Operations-managed Hermes schedule runs Tue-Sat at 14:30 KST using
+the timezone-bound expression `30 14 * * 2-6`. The disabled systemd fallback
+stores the same intent as `Tue..Sat 05:30 UTC`. Production completion now means
+the complete selected queue is empty of pending/running/error work, every
+report quality score is at least 8/10, the rendered report passes the 420px
+HTML contract, and Gmail returns a message id (or the same-date delivery ledger
+proves that the report was already sent). Shadow and smoke runs never send
+email.
+
+The Gmail implementation is owned by Quant AI Radar and does not import ETF
+RADAR application code. It reuses the protected host OAuth and recipient files
+as shared infrastructure, records only recipient count and Gmail message id,
+and deduplicates one message per US `as_of_date`.
 
 Validate a completed manual shadow with the observed wall-clock duration:
 

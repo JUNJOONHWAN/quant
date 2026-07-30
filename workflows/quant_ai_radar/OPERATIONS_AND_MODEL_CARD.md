@@ -532,8 +532,9 @@ shadow는 timer 활성화용 연속 5회에는 포함하지 않는다.
 사용자 의도:
 
 ```text
-KST: 화~토 09:15
-UTC 저장값: Tue..Sat 00:15
+KST: 화~토 14:30
+Hermes 저장/실행값: 30 14 * * 2-6 (Asia/Seoul)
+systemd 비상 폴백 UTC 저장값: Tue..Sat 05:30
 reporting timezone: Asia/Seoul
 ```
 
@@ -542,8 +543,11 @@ reporting timezone: Asia/Seoul
 - `quant-ai-radar-daily.service`
 - `quant-ai-radar-daily.timer`
 
-서비스 파일은 설치·daemon-reload·부팅 복구까지 검증하되 timer는 shadow
-승인 전 `disabled/inactive`를 유지한다. vLLM은
+기본 실행기는 Hermes Operations App Manager이며, 전체 일일 분석 뒤
+품질 GREEN, 420px HTML, Gmail message id까지 모두 끝나야 PASS다. 같은
+미국 기준일 재시도는 발송 원장으로 중복 메일을 막는다. Shadow/Smoke는
+메일을 보내지 않는다. systemd timer는 비상 폴백으로
+`disabled/inactive`를 유지한다. vLLM은
 `quant-qwen3-lora-vllm-8018`의 `unless-stopped` 정책으로 복구한다.
 
 FMP 역사 백필은 이 서비스가 절대 재개하지 않는다.

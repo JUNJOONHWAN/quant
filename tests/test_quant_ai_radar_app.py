@@ -110,6 +110,69 @@ class QuantAiRadarAppTest(unittest.TestCase):
         self.assertEqual(values["max_ai_etfs"], 40)
         self.assertEqual(values["max_ai_stocks"], 120)
 
+    def test_production_daily_requires_email_completion(self):
+        radar = {
+            "status": "complete",
+            "as_of_date": "2026-07-29",
+            "run_dir": "/tmp/run",
+            "report": "/tmp/run/market_report.json",
+            "production_latest_published": True,
+            "queue_counts": {"done": 255, "error": 0},
+        }
+        with mock.patch.object(
+            app_cli, "build_daily_commands", return_value=[["prepare"], ["radar"]]
+        ):
+            with mock.patch.object(
+                app_cli,
+                "run_json_command",
+                side_effect=[{"status": "COMPLETE"}, radar],
+            ):
+                with mock.patch.object(
+                    app_cli,
+                    "deliver_daily_report",
+                    return_value={
+                        "status": "DONE",
+                        "complete": True,
+                        "message_id": "gmail-id",
+                    },
+                ) as deliver:
+                    with mock.patch.object(app_cli, "write_json"):
+                        result = app_cli.run_daily(
+                            shadow=False,
+                            workers=4,
+                            max_ai_etfs=64,
+                            max_ai_stocks=192,
+                        )
+        deliver.assert_called_once_with(Path("/tmp/run/market_report.json"))
+        self.assertTrue(result["email_delivery"]["complete"])
+
+    def test_shadow_daily_never_sends_email(self):
+        radar = {
+            "status": "shadow_complete_not_published",
+            "as_of_date": "2026-07-29",
+            "production_latest_published": False,
+        }
+        with mock.patch.object(
+            app_cli, "build_daily_commands", return_value=[["prepare"], ["radar"]]
+        ):
+            with mock.patch.object(
+                app_cli,
+                "run_json_command",
+                side_effect=[{"status": "COMPLETE"}, radar],
+            ):
+                with mock.patch.object(
+                    app_cli, "deliver_daily_report"
+                ) as deliver:
+                    with mock.patch.object(app_cli, "write_json"):
+                        result = app_cli.run_daily(
+                            shadow=True,
+                            workers=4,
+                            max_ai_etfs=64,
+                            max_ai_stocks=192,
+                        )
+        deliver.assert_not_called()
+        self.assertEqual(result["email_delivery"]["status"], "NOT_REQUIRED")
+
     def test_on_demand_symbols_bypass_daily_selection_via_existing_entrypoint(self):
         with mock.patch.dict(
             os.environ,

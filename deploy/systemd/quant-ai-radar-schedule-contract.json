@@ -1,24 +1,33 @@
 {
   "schema_version": "quant.ai_radar_schedule_contract.v1",
-  "status": "prepared_disabled_pending_shadow_approval",
+  "status": "active_hermes_cron_with_email_final_gate",
   "intended_timezone": "Asia/Seoul",
   "intended_local_time": "Tue-Sat 14:30 KST",
   "stored_rrule_timezone": "UTC",
-  "scheduler_execution_timezone": "UTC",
+  "scheduler_execution_timezone": "Asia/Seoul",
   "stored_rrule": "Tue..Sat *-*-* 05:30:00 UTC",
+  "active_scheduler": "hermes-cron",
+  "active_scheduler_expression": "30 14 * * 2-6",
+  "active_scheduler_expression_timezone": "Asia/Seoul",
+  "systemd_timer_role": "disabled_fallback",
+  "systemd_fallback_scheduler_execution_timezone": "UTC",
   "reporting_timezone": "KST",
   "out_of_window_action": "scheduler_timezone_mismatch",
   "timer_unit": "quant-ai-radar-daily.timer",
   "service_unit": "quant-ai-radar-daily.service",
-  "activation_gate": [
+  "production_final_gate": [
     "accepted Qwen3-8B LoRA release hash verified",
     "Massive prior-US-day grouped EOD availability verified after US midnight",
     "vLLM restart recovery verified",
-    "one complete frozen-date shadow run",
-    "five consecutive daily shadows with zero lookahead, stale, hash, schema, queue, or OOM failures",
-    "explicit user approval"
+    "complete selected inference queue with zero pending, running, or error rows",
+    "all report quality scores at least 8.0 of 10",
+    "420px HTML contract verified",
+    "Gmail API returns a non-empty message_id or same-date dedupe ledger proves prior delivery",
+    "explicit user activation request on 2026-07-30"
   ],
-  "must_remain_disabled_before_gate": true,
+  "email_width_px": 420,
+  "email_dedupe_scope": "one message per US as_of_date",
+  "must_remain_disabled_before_gate": false,
   "fmp_historical_backfill_must_remain_paused": true,
   "trade_execution_connected": false
 }

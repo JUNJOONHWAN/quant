@@ -60,20 +60,21 @@ def _page(title: str, body: str) -> str:
 --muted:#9ba9c8;--accent:#72e0bd;--warn:#ffcc72;--bad:#ff8e9d}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Noto Sans KR",sans-serif}}
-main{{max-width:1180px;margin:auto;padding:24px}} a{{color:var(--accent)}}
+main{{width:100%;max-width:420px;margin:0 auto;padding:14px}} a{{color:var(--accent)}}
 h1,h2,h3{{line-height:1.2}} .meta,.muted{{color:var(--muted)}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}
-.card{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}}
-.metric{{font-size:26px;font-weight:750}} .pill{{display:inline-block;padding:3px 9px;
+.grid{{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}}
+.card{{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}}
+.metric{{font-size:24px;font-weight:750}} .pill{{display:inline-block;padding:3px 9px;
 border:1px solid var(--line);border-radius:999px;margin:2px;color:var(--accent)}}
-table{{width:100%;border-collapse:collapse}} th,td{{padding:9px;border-bottom:1px solid
-var(--line);text-align:left;vertical-align:top}} th{{color:var(--muted)}}
+table{{width:100%;table-layout:fixed;border-collapse:collapse}} th,td{{padding:7px;
+border-bottom:1px solid var(--line);text-align:left;vertical-align:top;
+overflow-wrap:anywhere}} th{{color:var(--muted)}}
 input{{width:100%;padding:12px;background:#0d1528;color:var(--text);border:1px solid
 var(--line);border-radius:10px;margin:10px 0 16px}} pre{{white-space:pre-wrap;
 word-break:break-word;background:#09101e;border:1px solid var(--line);padding:12px;
 border-radius:10px;max-height:520px;overflow:auto}}
 .positive{{color:var(--accent)}} .negative{{color:var(--bad)}}
-@media(max-width:600px){{main{{padding:14px}}th:nth-child(n+4),td:nth-child(n+4){{display:none}}}}
+@media(max-width:420px){{main{{padding:10px}}th:nth-child(n+4),td:nth-child(n+4){{display:none}}}}
 </style>
 </head><body><main>{body}</main></body></html>
 """
@@ -348,6 +349,10 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
         for name, score in (quality.get("scores") or {}).items()
     )
     breadth = dashboard.get("breadth") or {}
+    completed_ai_count = quality.get(
+        "security_report_count",
+        selection.get("selected_count"),
+    )
     market_body = f"""
 <h1>Quant AI Radar</h1>
 <p class="meta">기준일 {_e(report["as_of_date"])} · 생성 {_e(report["generated_at_kst"])}
@@ -360,7 +365,7 @@ const q=document.getElementById('q');q.addEventListener('input',()=>{{
  <section class="card"><div class="muted">전체 ETF 관련 후보</div>
   <div class="metric">{_e(selection.get("full_candidate_count"))}</div></section>
  <section class="card"><div class="muted">AI 상세 분석</div>
-  <div class="metric">{_e(selection.get("selected_count"))}</div></section>
+  <div class="metric">{_e(completed_ai_count)}</div></section>
 </div>
 <section class="card"><h2>시장 해석</h2><p>{_e(market.get("summary"))}</p>
 <p><a href="security_index.html">ETF·종목 상세 분석 보기 →</a></p></section>

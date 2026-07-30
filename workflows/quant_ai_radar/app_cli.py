@@ -33,6 +33,11 @@ from workflows.quant_ai_radar.model_runtime import load_model_release  # noqa: E
 from workflows.quant_ai_radar.decision_support import (  # noqa: E402
     QUALITY_SCHEMA_VERSION,
 )
+from workflows.quant_ai_radar.email_delivery import (  # noqa: E402
+    deliver_daily_report,
+    email_delivery_status,
+    email_transport_status,
+)
 from workflows.quant_ai_radar.relation_index import (  # noqa: E402
     DEFAULT_RELATION_INDEX,
 )
@@ -337,6 +342,28 @@ def run_daily(
             "Radar engine did not reach a complete state: "
             f"{radar.get('status')}"
         )
+    production_run = not shadow and not smoke_max_items
+    if production_run:
+        if (
+            radar.get("status") != "complete"
+            or not radar.get("production_latest_published")
+            or not radar.get("report")
+        ):
+            raise AppCliError(
+                "production Radar did not publish an accepted report"
+            )
+        email_delivery = deliver_daily_report(Path(str(radar["report"])))
+        if not email_delivery.get("complete"):
+            raise AppCliError(
+                "production email final gate did not complete: "
+                f"{email_delivery.get('status')}"
+            )
+    else:
+        email_delivery = {
+            "status": "NOT_REQUIRED",
+            "complete": True,
+            "reason": "shadow_or_smoke_run",
+        }
     result = {
         **state,
         "status": "PASS",
@@ -348,6 +375,7 @@ def run_daily(
             "production_latest_published", False
         ),
         "queue_counts": radar.get("queue_counts"),
+        "email_delivery": email_delivery,
         "completed_at_kst": _now_kst(),
     }
     write_json(APP_STATE_PATH, result)
@@ -625,6 +653,7 @@ def preflight() -> dict[str, Any]:
         "path": str(DEFAULT_RELATION_INDEX),
     }
     checks["model_endpoint"] = endpoint_status()
+    checks["email_transport"] = email_transport_status()
     if (
         checks["model_endpoint"].get("status") == "confirmed"
         and release.endpoint_model
@@ -663,6 +692,7 @@ def status() -> dict[str, Any]:
     app_state = _read_json(APP_STATE_PATH)
     daily_cycle = _read_json(DEFAULT_OUTPUT_ROOT / "status" / "daily_cycle.json")
     oracle = _read_json(DEFAULT_ORACLE_STATUS)
+    latest_as_of = str((latest or {}).get("as_of_date") or "")
     return {
         "schema_version": "quant.ai_radar_app_status.v1",
         "status": "confirmed" if endpoint["status"] == "confirmed" else "partial",
@@ -693,6 +723,9 @@ def status() -> dict[str, Any]:
             "source_owner": "market-structure-oracle",
             **(_oracle_summary(oracle) or {}),
         },
+        "email_delivery": (
+            email_delivery_status(latest_as_of) if latest_as_of else None
+        ),
         "fmp_historical_backfill": "PAUSED",
         "timer_activation_changed": False,
         "trade_execution": "NOT_APPLICABLE",
