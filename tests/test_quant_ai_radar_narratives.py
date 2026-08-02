@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 
 from workflows.quant_ai_radar.email_delivery import _email_html
-from workflows.quant_ai_radar.model_runtime import ResponseContractError
+from workflows.quant_ai_radar.model_runtime import (
+    ResponseContractError,
+    parse_json_object,
+)
 from workflows.quant_ai_radar.presentation import (
     confidence_pct,
     label_regime,
@@ -14,8 +17,14 @@ from workflows.quant_ai_radar.presentation import (
     whole,
 )
 from workflows.quant_ai_radar.report_narratives import (
+    _adapt_native_narrative_items,
     _clean_prose,
+    _items_schema,
+    build_native_judgement_narratives,
     build_multistage_narratives,
+)
+from workflows.quant_ai_radar.market_report import (
+    synthesize_market_from_native_judgements,
 )
 from workflows.quant_ai_radar.report_renderer import render_reports
 
@@ -73,6 +82,10 @@ class FakeNarrativeClient:
                 row = {id_key: identifier}
                 for key in item_schema["required"]:
                     if key != id_key:
+                        property_schema = item_schema["properties"][key]
+                        if "enum" in property_schema:
+                            row[key] = property_schema["enum"][0]
+                            continue
                         required = (
                             mentions.get(identifier, {}).get(key) or []
                         )
@@ -101,6 +114,63 @@ class ReorderedNarrativeClient(FakeNarrativeClient):
         response, trace = self.complete(**kwargs)
         if isinstance(response.get("items"), list):
             response["items"].reverse()
+        return response, trace
+
+
+class SectorHeadlineWithoutStatePhraseClient(FakeNarrativeClient):
+    def complete_messages(self, **kwargs):
+        response, trace = self.complete(**kwargs)
+        prompt = "\n".join(
+            str(message.get("content") or "")
+            for message in kwargs.get("messages") or []
+        )
+        if "STAGE=sector_batch_" in prompt:
+            for row in response.get("items") or []:
+                row["headline"] = (
+                    "섹터 내부 신호의 정합성과 반대 근거를 함께 살펴봅니다."
+                )
+        return response, trace
+
+
+class MotiveRepairNarrativeClient(SectorHeadlineWithoutStatePhraseClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sector_attempts = 0
+
+    def complete_messages(self, **kwargs):
+        response, trace = super().complete_messages(**kwargs)
+        prompt = "\n".join(
+            str(message.get("content") or "")
+            for message in kwargs.get("messages") or []
+        )
+        if "STAGE=sector_batch_" in prompt:
+            self.sector_attempts += 1
+            if self.sector_attempts <= 1:
+                for row in response.get("items") or []:
+                    row["explanation"] = (
+                        "투자자의 기대가 섹터 흐름을 이끈다는 설명입니다."
+                    )
+        return response, trace
+
+
+class BatchSplitNarrativeClient(FakeNarrativeClient):
+    def complete_messages(self, **kwargs):
+        response, trace = self.complete(**kwargs)
+        prompt = "\n".join(
+            str(message.get("content") or "")
+            for message in kwargs.get("messages") or []
+        )
+        item_schema = kwargs["response_schema"]["properties"].get("items")
+        identifiers = []
+        if item_schema:
+            properties = item_schema["items"]["properties"]
+            identifiers = next(
+                (value["enum"] for value in properties.values() if "enum" in value),
+                [],
+            )
+        if "STAGE=sector_batch_" in prompt and len(identifiers) > 1:
+            for row in response.get("items") or []:
+                row["explanation"] = "투자자의 기대가 흐름을 이끈다는 설명입니다."
         return response, trace
 
 
@@ -151,6 +221,122 @@ def _result(symbol: str, regime: str, price: str, flow: str) -> dict:
 
 
 class QuantAiRadarNarrativeTest(unittest.TestCase):
+    def test_training_native_daily_path_reuses_original_judgements_only(self):
+        positive = "price_flow_positive_confirmation"
+        rows = [_result("AAA", positive, "positive", "positive")]
+        aggregate = {
+            "analyzed_security_count": 1,
+            "task_type_counts": {"stock_constituent_flow_analysis": 1},
+            "price_signal_counts": {"positive": 1},
+            "etf_flow_signal_counts": {"positive": 1},
+            "regime_counts": {positive: 1},
+            "mean_model_confidence": 0.7,
+            "candidate_rankings": {
+                "stocks_by_regime": {
+                    positive: [{"symbol": "AAA", "regime": positive}]
+                },
+                "etfs_by_regime": {},
+            },
+            "etf_leaders": [],
+            "stock_leaders": [{"symbol": "AAA", "regime": positive}],
+        }
+        radar = {
+            "release_binding": {
+                "release_id": "test-release",
+                "trade_date_us": "2026-07-29",
+            },
+            "master_eligibility_counts": {"eligible": 1},
+            "master_flow_status_counts": {"visible": 1},
+            "accumulation_clusters": [
+                {
+                    "cluster": "Technology",
+                    "accumulation_state": "positive",
+                    "top_related_stocks": ["AAA:10%"],
+                }
+            ],
+            "integrated_rotation_clusters": [
+                {
+                    "integrated_cluster": "Technology",
+                    "integrated_state": "rotation_in",
+                    "breadth_score": 50,
+                    "top_related_stocks": ["AAA:10%"],
+                }
+            ],
+        }
+        market, market_trace, _ = synthesize_market_from_native_judgements(
+            as_of_date="2026-07-29",
+            aggregate=aggregate,
+            radar=radar,
+            results=rows,
+        )
+        narratives, narrative_trace = build_native_judgement_narratives(
+            aggregate=aggregate,
+            radar=radar,
+            market_judgement=market,
+            results=rows,
+        )
+        self.assertEqual(market_trace["source_contract"], "quant.analysis_packet.v3")
+        self.assertTrue(market_trace["aggregation_only"])
+        self.assertEqual(
+            narratives["learned_pattern_prompt_contract"],
+            "quant.analysis_packet.v3",
+        )
+        self.assertEqual(narratives["model_call_count"], 1)
+        self.assertEqual(narrative_trace["model_call_count"], 1)
+        self.assertEqual(
+            narrative_trace["stages"][0]["calls"],
+            [rows[0]["trace"]],
+        )
+
+    def test_native_sector_contract_maps_legacy_fields_without_rewriting_prose(self):
+        response, changed = _adapt_native_narrative_items(
+            {
+                "items": [
+                    {
+                        "cluster": "Unclassified",
+                        "headline": "비분류 영역의 흐름을 함께 살펴봅니다.",
+                        "supporting_analysis": "가격과 흐름의 관계가 엇갈려 확인이 필요합니다.",
+                        "counterpoint": "직접 연결 근거는 제한적입니다.",
+                        "stock_context": ["CRSP", "TSM", "NVS"],
+                        "trend_state": "rotation_out",
+                    },
+                    {"cluster": "Unclassified", "headline": "반복 항목"},
+                ]
+            },
+            id_key="cluster",
+            expected_ids=["Unclassified"],
+            text_fields=(
+                "headline",
+                "explanation",
+                "counterpoint",
+                "stock_context",
+            ),
+        )
+        self.assertTrue(changed)
+        self.assertEqual(len(response["items"]), 1)
+        self.assertEqual(
+            response["items"][0]["explanation"],
+            "가격과 흐름의 관계가 엇갈려 확인이 필요합니다.",
+        )
+        self.assertEqual(response["items"][0]["stock_context"], "CRSP, TSM, NVS")
+
+    def test_parser_keeps_first_complete_object_before_repeated_json(self):
+        value = parse_json_object(
+            '{"items":[{"cluster":"Unclassified"}]}\n'
+            '{"item":"Unclassified"}{"item":"Unclassified"}'
+        )
+        self.assertEqual(value, {"items": [{"cluster": "Unclassified"}]})
+
+    def test_narrative_schema_prevents_digit_generation(self):
+        schema = _items_schema(
+            id_key="cluster",
+            expected_ids=["Industrials"],
+            text_fields=("headline", "explanation"),
+        )
+        properties = schema["properties"]["items"]["items"]["properties"]
+        self.assertEqual(properties["headline"]["pattern"], r"^[^0-9]*$")
+        self.assertEqual(properties["explanation"]["pattern"], r"^[^0-9]*$")
+
     def test_clean_prose_normalizes_missing_terminal_punctuation(self):
         cleaned, changed = _clean_prose(
             "기술 섹터 안에서 AVGO의 가격과 ETF 흐름이 함께 약화"
@@ -207,7 +393,7 @@ class QuantAiRadarNarrativeTest(unittest.TestCase):
             ],
             "accumulation_clusters": [],
         }
-        client = FakeNarrativeClient()
+        client = BatchSplitNarrativeClient()
         narratives, trace = build_multistage_narratives(
             client=client,
             aggregate=aggregate,
@@ -226,7 +412,55 @@ class QuantAiRadarNarrativeTest(unittest.TestCase):
         )
         self.assertEqual(narratives["model_call_count"], 3)
         self.assertEqual(trace["model_call_count"], 3)
-        self.assertEqual(client.calls, 3)
+        self.assertEqual(client.calls, 7)
+        self.assertEqual(
+            trace["stages"][0]["batch_fallback"],
+            "single_item_after_contract_failure",
+        )
+
+    def test_sector_headline_preserves_model_prose_without_exact_state_phrase(self):
+        positive = "price_flow_positive_confirmation"
+        rows = [_result("AAA", positive, "positive", "positive")]
+        aggregate = {
+            "analyzed_security_count": 1,
+            "price_signal_counts": {"positive": 1},
+            "etf_flow_signal_counts": {"positive": 1},
+            "regime_counts": {positive: 1},
+            "candidate_rankings": {
+                "stocks_by_regime": {
+                    positive: [{"symbol": "AAA", "regime": positive}]
+                },
+                "etfs_by_regime": {},
+            },
+            "etf_leaders": [],
+            "stock_leaders": [],
+        }
+        radar = {
+            "integrated_rotation_clusters": [
+                {
+                    "integrated_cluster": "Industrials",
+                    "integrated_state": "mixed",
+                    "breadth_score": 50,
+                    "top_related_stocks": ["AAA:10%"],
+                }
+            ],
+            "accumulation_clusters": [],
+        }
+        client = MotiveRepairNarrativeClient()
+        narratives, _ = build_multistage_narratives(
+            client=client,
+            aggregate=aggregate,
+            radar=radar,
+            market_judgement={"market_state": "rotation", "summary": "시장 회전"},
+            results=rows,
+        )
+        headline = narratives["sector_explanations"][0]["headline"]
+        self.assertEqual(
+            headline,
+            "섹터 내부 신호의 정합성과 반대 근거를 함께 살펴봅니다.",
+        )
+        self.assertNotIn(label_rotation_state("mixed"), headline)
+        self.assertEqual(client.sector_attempts, 2)
 
     def test_model_item_order_is_normalized_without_replacing_model_prose(self):
         positive = "price_flow_positive_confirmation"

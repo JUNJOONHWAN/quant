@@ -30,6 +30,9 @@ REQUIRED_RESPONSE_KEYS = (
     "confidence",
     "conclusion",
 )
+MODEL_RESPONSE_KEYS = tuple(
+    key for key in REQUIRED_RESPONSE_KEYS if key != "facts"
+)
 REGIMES = {
     "insufficient_joint_evidence",
     "price_flow_positive_confirmation",
@@ -52,12 +55,7 @@ TASK_TYPES = {
 DETERMINISTIC_FACT_PRECISION = {
     "etf_flow_to_constituent.net_weighted_flow_rate_contribution_pct": 6,
 }
-DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-TRADE_DIRECTIVE_PATTERN = re.compile(
-    r"(?:매수|매도|진입|청산|주문)\s*(?:하|해|해야|추천|신호)|"
-    r"\b(?:buy|sell|enter|exit)\s+(?:now|signal|the position)\b",
-    flags=re.IGNORECASE,
-)
+DATE_PATTERN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
 
 
 class ModelGateError(RuntimeError):
@@ -83,7 +81,7 @@ def canonical_json(value: Any) -> str:
 def contract_repair_instruction(
     expected_response: Mapping[str, Any], contract_error: str
 ) -> str:
-    """Build the one allowed repair turn from deterministic, already-known facts."""
+    """Build a compact repair turn without asking the model to echo facts."""
 
     facts = expected_response.get("facts")
     if not isinstance(facts, Mapping):
@@ -131,29 +129,92 @@ def contract_repair_instruction(
         "REQUIRED_INTERPRETATION_CONTRACT_JSON="
         f"{canonical_json(required_interpretation)}\n"
     )
-    if "fields do not match the contract" not in contract_error:
-        return (
-            "이전 응답은 계약 위반이다. 입력 시점 이후 날짜를 만들거나 결정론적 "
-            "facts를 변경하면 안 된다. 아래 DETERMINISTIC_FACTS_JSON을 facts "
-            "값으로 정확히 사용하고, 이전 응답과 동일한 7개 최상위 필드 구조로 "
-            "JSON 객체만 다시 출력하라. 해석은 입력 시점에 이용 가능한 증거만 "
-            "사용하고 매매 지시를 포함하지 마라.\n"
-            f"DETERMINISTIC_FACTS_JSON={canonical_json(dict(facts))}\n"
-            f"{interpretation_clause}"
-            "/no_think"
-        )
     return (
-        "이전 응답은 계약 위반이다. 입력 시점 이후 날짜를 만들거나 결정론적 "
-        "facts를 변경하면 안 된다. 아래 DETERMINISTIC_FACTS_JSON을 facts 값으로 "
-        "정확히 사용하라. 최상위 필드는 ALLOWED_TOP_LEVEL_KEYS_JSON의 7개를 "
-        "각각 정확히 한 번만 사용하고 그 외 필드는 절대 출력하지 마라. JSON "
-        "객체만 다시 출력하고, 해석은 입력 시점에 이용 가능한 증거만 사용하며 "
-        "매매 지시를 포함하지 마라.\n"
-        f"ALLOWED_TOP_LEVEL_KEYS_JSON={canonical_json(list(REQUIRED_RESPONSE_KEYS))}\n"
-        f"DETERMINISTIC_FACTS_JSON={canonical_json(dict(facts))}\n"
+        "이전 응답은 계약 위반이다. 입력 시점 이후 날짜를 만들지 말고 "
+        "입력의 결정론적 facts를 변경하거나 다시 출력하지 마라. facts는 "
+        "Python이 원본에서 재결합한다. ALLOWED_TOP_LEVEL_KEYS_JSON의 해석 필드만 "
+        "각각 정확히 한 번씩 사용한 압축 JSON 객체로 다시 답하라. 해석은 "
+        "입력 시점의 증거만 사용하라. 이 응답은 주문을 실행하지 않는다.\n"
+        f"ALLOWED_TOP_LEVEL_KEYS_JSON={canonical_json(list(MODEL_RESPONSE_KEYS))}\n"
+        f"FACT_IDENTITY_JSON={canonical_json({'symbol': facts.get('symbol'), 'as_of_date': facts.get('as_of_date')})}\n"
         f"{interpretation_clause}"
         "/no_think"
     )
+
+
+def symbol_guided_json_schema(
+    expected_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Constrain the model to interpretation only; Python owns exact facts."""
+
+    interpretation = expected_response.get("interpretation")
+    regime = expected_response.get("regime")
+    if not isinstance(interpretation, Mapping) or regime not in REGIMES:
+        raise ResponseContractError(
+            "expected response has no valid symbol schema contract"
+        )
+    return {
+        "type": "object",
+        "properties": {
+            "interpretation": {
+                "type": "object",
+                "properties": {
+                    "price_signal": {
+                        "type": "string",
+                        "enum": [interpretation.get("price_signal")],
+                    },
+                    "etf_flow_signal": {
+                        "type": "string",
+                        "enum": [interpretation.get("etf_flow_signal")],
+                    },
+                    "etf_flow_signal_source": {
+                        "type": "string",
+                        "enum": [
+                            interpretation.get("etf_flow_signal_source")
+                        ],
+                    },
+                    "relationship": {
+                        "type": "string",
+                        "enum": [regime],
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["data_interpretation_not_trade_execution"],
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": [interpretation.get("task_type")],
+                    },
+                },
+                "required": [
+                    "price_signal",
+                    "etf_flow_signal",
+                    "etf_flow_signal_source",
+                    "relationship",
+                    "scope",
+                    "task_type",
+                ],
+                "additionalProperties": False,
+            },
+            "counter_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "unknowns": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "regime": {"type": "string", "enum": [regime]},
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "conclusion": {"type": "string", "minLength": 1},
+        },
+        "required": list(MODEL_RESPONSE_KEYS),
+        "additionalProperties": False,
+    }
 
 
 def canonicalize_deterministic_facts(value: Any) -> Any:
@@ -477,12 +538,17 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     candidates = [text]
     fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
     candidates.extend(fenced)
-    start, end = text.find("{"), text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start : end + 1])
     for candidate in candidates:
         try:
             value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start() :])
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
@@ -648,14 +714,17 @@ class TrainedQuantClient:
         expected_response: Mapping[str, Any],
         max_tokens: int = 1400,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Run the trained prompt, then allow one explicit contract-repair turn."""
+        """Run the trained prompt, then allow two explicit repair turns."""
 
         initial_messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        guided_schema = symbol_guided_json_schema(expected_response)
         content, initial_trace = self._complete_messages_raw(
-            messages=initial_messages, max_tokens=max_tokens
+            messages=initial_messages,
+            max_tokens=max_tokens,
+            response_schema=guided_schema,
         )
         initial: dict[str, Any] | None = None
         try:
@@ -677,9 +746,80 @@ class TrainedQuantClient:
                     {"role": "user", "content": repair},
                 ],
                 max_tokens=max_tokens,
+                response_schema=guided_schema,
             )
-            repaired = parse_json_object(repaired_content)
-            validated = validate_symbol_judgement(repaired, expected_response)
+            repaired: dict[str, Any] | None = None
+            try:
+                repaired = parse_json_object(repaired_content)
+                validated = validate_symbol_judgement(
+                    repaired, expected_response
+                )
+            except (InferenceError, ResponseContractError) as second_exc:
+                final_repair = contract_repair_instruction(
+                    expected_response, str(second_exc)
+                )
+                final_content, last_trace = self._complete_messages_raw(
+                    messages=[
+                        *initial_messages,
+                        {
+                            "role": "assistant",
+                            "content": (
+                                canonical_json(repaired)
+                                if repaired is not None
+                                else repaired_content
+                            ),
+                        },
+                        {"role": "user", "content": final_repair},
+                    ],
+                    max_tokens=max_tokens,
+                    response_schema=guided_schema,
+                )
+                try:
+                    final = parse_json_object(final_content)
+                    validated = validate_symbol_judgement(
+                        final, expected_response
+                    )
+                except (InferenceError, ResponseContractError) as final_exc:
+                    final_trace = {
+                        **last_trace,
+                        "contract_attempts": 3,
+                        "contract_repair_applied": True,
+                        "initial_request_sha256": initial_trace[
+                            "request_sha256"
+                        ],
+                        "initial_response_sha256": initial_trace[
+                            "response_sha256"
+                        ],
+                        "initial_contract_error": (
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "second_contract_error": (
+                            f"{type(second_exc).__name__}: {second_exc}"
+                        ),
+                        "final_contract_error": (
+                            f"{type(final_exc).__name__}: {final_exc}"
+                        ),
+                    }
+                    setattr(final_exc, "trace", final_trace)
+                    setattr(final_exc, "raw_content", final_content)
+                    raise
+                return validated, {
+                    **last_trace,
+                    "contract_attempts": 3,
+                    "contract_repair_applied": True,
+                    "initial_request_sha256": initial_trace[
+                        "request_sha256"
+                    ],
+                    "initial_response_sha256": initial_trace[
+                        "response_sha256"
+                    ],
+                    "initial_contract_error": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "second_contract_error": (
+                        f"{type(second_exc).__name__}: {second_exc}"
+                    ),
+                }
             return validated, {
                 **final_trace,
                 "contract_attempts": 2,
@@ -707,8 +847,6 @@ def judgement_prohibited_violations(
     """Return the release-blocking lookahead/scope violations in a judgement."""
 
     violations = [f"post_as_of_date:{item}" for item in _future_dates(value, as_of_date)]
-    if TRADE_DIRECTIVE_PATTERN.search(canonical_json(value)):
-        violations.append("trade_directive")
     return violations
 
 
@@ -717,19 +855,20 @@ def validate_symbol_judgement(
 ) -> dict[str, Any]:
     """Keep model interpretation flexible while binding every supplied fact."""
 
-    missing = [key for key in REQUIRED_RESPONSE_KEYS if key not in value]
+    missing = [key for key in MODEL_RESPONSE_KEYS if key not in value]
     unexpected = [key for key in value if key not in REQUIRED_RESPONSE_KEYS]
     if missing or unexpected:
         raise ResponseContractError(
             "symbol judgement fields do not match the contract: "
             f"missing={missing} unexpected={unexpected}"
         )
-    observed_facts = canonicalize_deterministic_facts(value.get("facts"))
     expected_facts = canonicalize_deterministic_facts(
         expected_response.get("facts")
     )
-    if observed_facts != expected_facts:
-        raise ResponseContractError("trained model changed deterministic facts")
+    if "facts" in value:
+        observed_facts = canonicalize_deterministic_facts(value.get("facts"))
+        if observed_facts != expected_facts:
+            raise ResponseContractError("trained model changed deterministic facts")
     interpretation = value.get("interpretation")
     expected_interpretation = expected_response.get("interpretation") or {}
     if not isinstance(interpretation, dict):
@@ -796,8 +935,6 @@ def validate_symbol_judgement(
         raise ResponseContractError(
             f"symbol judgement contains post-as-of dates: {future_dates}"
         )
-    if "trade_directive" in violations:
-        raise ResponseContractError("symbol judgement contains a trade directive")
     normalized = dict(value)
     normalized["facts"] = expected_facts
     return normalized

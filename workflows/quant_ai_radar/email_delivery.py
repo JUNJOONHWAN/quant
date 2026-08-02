@@ -227,13 +227,68 @@ def _dedupe_key(as_of_date: str) -> str:
     )
 
 
+def _report_source_fingerprint(report: Mapping[str, Any]) -> str:
+    source = report.get("source_status")
+    source = source if isinstance(source, Mapping) else {}
+    oracle = source.get("shared_oracle_store")
+    oracle = oracle if isinstance(oracle, Mapping) else {}
+    value = str(oracle.get("source_fingerprint_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise EmailDeliveryError(
+            "report is not bound to a valid Oracle source fingerprint"
+        )
+    return value
+
+
+def _revision_dedupe_key(
+    as_of_date: str,
+    source_fingerprint_sha256: str,
+    report_sha256: str,
+) -> str:
+    return (
+        f"{_dedupe_key(as_of_date)}:revision:"
+        f"{source_fingerprint_sha256[:12]}:{report_sha256[:12]}"
+    )
+
+
 def email_delivery_status(
     as_of_date: str,
     *,
     state_dir: Path = DEFAULT_STATE_DIR,
+    report_sha256: str = "",
+    source_fingerprint_sha256: str = "",
 ) -> dict[str, Any]:
-    key = _dedupe_key(as_of_date)
-    record = (_read_ledger(state_dir).get("sent") or {}).get(key)
+    base_key = _dedupe_key(as_of_date)
+    sent = _read_ledger(state_dir).get("sent") or {}
+    candidates = [
+        (str(key), value)
+        for key, value in sent.items()
+        if (
+            str(key) == base_key
+            or str(key).startswith(f"{base_key}:revision:")
+        )
+        and isinstance(value, Mapping)
+    ]
+    if report_sha256:
+        candidates = [
+            item
+            for item in candidates
+            if str(item[1].get("report_sha256") or "") == report_sha256
+        ]
+    if source_fingerprint_sha256:
+        candidates = [
+            item
+            for item in candidates
+            if str(
+                item[1].get("source_fingerprint_sha256") or ""
+            )
+            == source_fingerprint_sha256
+        ]
+    candidates.sort(
+        key=lambda item: str(item[1].get("sent_at_utc") or ""),
+        reverse=True,
+    )
+    key, record = candidates[0] if candidates else (base_key, {})
     record = record if isinstance(record, Mapping) else {}
     message_id = str(record.get("message_id") or "")
     complete = bool(message_id)
@@ -244,6 +299,10 @@ def email_delivery_status(
         "dedupe_key": key,
         "message_id": message_id,
         "recipient_count": int(record.get("recipient_count") or 0),
+        "report_sha256": str(record.get("report_sha256") or ""),
+        "source_fingerprint_sha256": str(
+            record.get("source_fingerprint_sha256") or ""
+        ),
         "state_path": str(_ledger_path(state_dir)),
     }
 
@@ -381,11 +440,15 @@ def _email_html(report: Mapping[str, Any]) -> str:
         lanes.get("divergence_stocks") or []
     )
     security_cards = "".join(
-        """<div class="mini"><strong>{}</strong><p>{}</p>
-<p class="muted">{}</p></div>""".format(
+        """<div class="mini"><strong>{}</strong><p><span class="pill">현재 학습 패턴</span></p>
+<p>{}</p><p>{}</p><p class="muted">패턴 근거: {}</p>
+<p class="muted">반대 근거: {}</p><p class="muted">다음 확인: {}</p></div>""".format(
             _e(row.get("symbol")),
             _e(row.get("headline")),
-            _e(row.get("group_context")),
+            _e(row.get("learned_pattern") or row.get("group_context")),
+            _e(row.get("pattern_evidence") or row.get("etf_transmission")),
+            _e(row.get("pattern_risk") or row.get("counterpoint")),
+            _e(row.get("watch_condition")),
         )
         for row in list(narratives.get("security_explanations") or [])[:6]
         if isinstance(row, Mapping)
@@ -478,6 +541,8 @@ def deliver_daily_report(
             "report directory does not match as_of_date: "
             f"{resolved_report.parent.name} != {as_of_date}"
         )
+    report_sha256 = _sha256(resolved_report)
+    source_fingerprint_sha256 = _report_source_fingerprint(report)
     quality = _validate_quality(report)
     if not quality["complete"]:
         raise EmailDeliveryError(
@@ -511,7 +576,12 @@ def deliver_daily_report(
     lock_path = state_dir / "email_delivery.lock"
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        existing = email_delivery_status(as_of_date, state_dir=state_dir)
+        existing = email_delivery_status(
+            as_of_date,
+            state_dir=state_dir,
+            report_sha256=report_sha256,
+            source_fingerprint_sha256=source_fingerprint_sha256,
+        )
         if existing["complete"]:
             return {
                 **existing,
@@ -521,6 +591,20 @@ def deliver_daily_report(
                 "transport": "gmail_api",
             }
 
+        previous = email_delivery_status(
+            as_of_date,
+            state_dir=state_dir,
+        )
+        is_revision = previous["complete"]
+        delivery_key = (
+            _revision_dedupe_key(
+                as_of_date,
+                source_fingerprint_sha256,
+                report_sha256,
+            )
+            if is_revision
+            else _dedupe_key(as_of_date)
+        )
         market = report.get("market_judgement")
         market = market if isinstance(market, Mapping) else {}
         selection = report.get("selection")
@@ -534,11 +618,13 @@ def deliver_daily_report(
             or 0
         )
         subject = (
-            f"[AI Radar] {as_of_date} · {market_state} · "
+            f"[AI Radar{' 정정' if is_revision else ''}] "
+            f"{as_of_date} · {market_state} · "
             f"AI 분석 {selected_count}건"
         )
         plain_body = (
-            "Quant AI Radar 일일 리포트\n"
+            "Quant AI Radar "
+            f"{'원장 개정 정정' if is_revision else '일일'} 리포트\n"
             f"미국 시장 기준일: {as_of_date}\n"
             f"시장 상태: {market_state}\n"
             f"AI 상세 분석: {selected_count}건\n"
@@ -557,13 +643,15 @@ def deliver_daily_report(
             raise EmailDeliveryError("Gmail API returned no message id")
 
         ledger = _read_ledger(state_dir)
-        ledger["sent"][_dedupe_key(as_of_date)] = {
+        ledger["sent"][delivery_key] = {
             "message_id": message_id,
             "recipient_count": len(recipients),
             "subject": subject,
             "as_of_date": as_of_date,
             "report_path": str(resolved_report),
-            "report_sha256": _sha256(resolved_report),
+            "report_sha256": report_sha256,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "revision_of": previous["dedupe_key"] if is_revision else None,
             "html_path": str(html_path),
             "html_sha256": mobile["sha256"],
             "attachment_path": str(attachment_path),
@@ -572,8 +660,13 @@ def deliver_daily_report(
         }
         _atomic_json(_ledger_path(state_dir), ledger)
         return {
-            **email_delivery_status(as_of_date, state_dir=state_dir),
-            "send_status": "DONE",
+            **email_delivery_status(
+                as_of_date,
+                state_dir=state_dir,
+                report_sha256=report_sha256,
+                source_fingerprint_sha256=source_fingerprint_sha256,
+            ),
+            "send_status": "REVISION_DONE" if is_revision else "DONE",
             "html_contract": mobile,
             "quality_contract": quality,
             "transport": "gmail_api",

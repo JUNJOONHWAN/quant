@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
+import sqlite3
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import date, datetime
@@ -34,7 +36,7 @@ from training.quant_llm.build_sft_dataset import (  # noqa: E402
 from workflows.quant_ai_radar.market_report import (  # noqa: E402
     aggregate_judgements,
     oracle_market_summary,
-    synthesize_market,
+    synthesize_market_from_native_judgements,
 )
 from workflows.quant_ai_radar.oracle_features import (  # noqa: E402
     build_oracle_market_features,
@@ -69,11 +71,15 @@ from workflows.quant_ai_radar.selection import (  # noqa: E402
 )
 from workflows.quant_ai_radar.report_renderer import render_reports  # noqa: E402
 from workflows.quant_ai_radar.report_narratives import (  # noqa: E402
-    build_multistage_narratives,
+    build_native_judgement_narratives,
 )
 from workflows.quant_ai_radar.decision_support import (  # noqa: E402
     audit_report_quality,
     build_market_dashboard,
+)
+from workflows.quant_ai_radar.training_native import (  # noqa: E402
+    TRAINING_NATIVE_PROMPT_CONTRACT,
+    complete_training_native_judgement,
 )
 
 
@@ -82,7 +88,7 @@ DEFAULT_DATA_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET")
 DEFAULT_OUTPUT_ROOT = Path("/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR")
 DEFAULT_RELEASE_MANIFEST = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/"
-    "qwen3_8b_quant_lora_v1/release_manifest.json"
+    "Qwen3-8B-FLOW/release_manifest.json"
 )
 DEFAULT_SECRETS_PATH = Path("/home/zooh/.dgx-secrets/secrets.env")
 SUCCESSFUL_RUN_STATUSES = frozenset(
@@ -117,6 +123,83 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _archive_changed_source_run(
+    run_dir: Path,
+    *,
+    source_fingerprint_sha256: str,
+) -> dict[str, Any]:
+    """Preserve and rotate a same-date queue when the sealed source changed."""
+
+    queue_path = run_dir / "selected_run_queue.sqlite3"
+    if not queue_path.is_file():
+        return {
+            "status": "not_required",
+            "reason": "no_existing_queue",
+        }
+    try:
+        with sqlite3.connect(
+            f"file:{queue_path}?mode=ro",
+            uri=True,
+        ) as connection:
+            metadata = {
+                str(key): json.loads(str(value))
+                for key, value in connection.execute(
+                    "SELECT key,value_json FROM run_metadata"
+                )
+            }
+    except (sqlite3.Error, json.JSONDecodeError) as exc:
+        raise RadarRunError(
+            "existing run queue metadata is unreadable; refusing to "
+            f"overwrite it: {type(exc).__name__}: {exc}"
+        ) from exc
+    previous = str(
+        metadata.get("dataset_source_fingerprint_sha256") or ""
+    )
+    if previous == source_fingerprint_sha256:
+        return {
+            "status": "reused",
+            "source_fingerprint_sha256": previous,
+        }
+    if not previous:
+        raise RadarRunError(
+            "existing run queue has no dataset source fingerprint"
+        )
+
+    stamp = datetime.now(KST).strftime("%Y%m%dT%H%M%SKST")
+    archive_dir = (
+        run_dir
+        / "revisions"
+        / (
+            f"{previous[:12]}_to_"
+            f"{source_fingerprint_sha256[:12]}_{stamp}"
+        )
+    )
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for child in list(run_dir.iterdir()):
+        if child.name == "revisions":
+            continue
+        destination = archive_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination)
+        else:
+            shutil.copy2(child, destination)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{queue_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    manifest = {
+        "schema_version": "quant.ai_radar_source_revision_archive.v1",
+        "status": "archived",
+        "reason": "sealed_oracle_source_fingerprint_changed",
+        "previous_source_fingerprint_sha256": previous,
+        "next_source_fingerprint_sha256": source_fingerprint_sha256,
+        "archived_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
+        "archive_dir": str(archive_dir),
+    }
+    write_json(archive_dir / "revision_manifest.json", manifest)
+    return manifest
+
+
 def _token(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -131,13 +214,25 @@ def _token(path: Path | None) -> str | None:
 def _response_work(
     client: TrainedQuantClient, example: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    expected = json.loads(str(example["response"]))
-    return client.complete_validated(
-        system=str(example["context"]),
-        user=str(example["instruction"]),
-        expected_response=expected,
-        max_tokens=1400,
+    return complete_training_native_judgement(
+        client=client,
+        example=example,
+        max_tokens=900,
     )
+
+
+def _inference_failure_trace(exc: Exception) -> dict[str, Any]:
+    trace = getattr(exc, "trace", None)
+    result = dict(trace) if isinstance(trace, dict) else {}
+    raw_content = getattr(exc, "raw_content", None)
+    if isinstance(raw_content, str):
+        result["failed_response_sha256"] = hashlib.sha256(
+            raw_content.encode("utf-8")
+        ).hexdigest()
+        result["failed_response_text"] = raw_content
+    result["error_type"] = type(exc).__name__
+    result["error"] = str(exc)
+    return result
 
 
 def _status_document(
@@ -171,7 +266,11 @@ def _handle_future(
             result=judgement,
         )
     except Exception as exc:
-        queue.mark_error(symbol, f"{type(exc).__name__}: {exc}")
+        queue.mark_error(
+            symbol,
+            f"{type(exc).__name__}: {exc}",
+            trace=_inference_failure_trace(exc),
+        )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -202,6 +301,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = args.output_root.expanduser().resolve() / "runs" / as_of
     run_dir.mkdir(parents=True, exist_ok=True)
     state_path = run_dir / "run_state.json"
+    source_fingerprint = dataset_source_fingerprint(shared_database, as_of)
+    source_revision = _archive_changed_source_run(
+        run_dir,
+        source_fingerprint_sha256=source_fingerprint["sha256"],
+    )
 
     relation_index = load_verified_relation_index(
         shared_binding, args.relation_index
@@ -213,6 +317,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     universe_manifest["shared_market_store"] = shared_binding.public_metadata()
     universe_manifest["relation_index"] = relation_index
+    universe_manifest["source_revision"] = source_revision
     oracle_features = build_oracle_market_features(
         shared_database, candidates, as_of
     )
@@ -247,7 +352,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not dataset_manifest.is_file():
         raise RadarRunError(f"quant dataset manifest is missing: {dataset_manifest}")
     queue = RadarQueue(run_dir / "selected_run_queue.sqlite3")
-    source_fingerprint = dataset_source_fingerprint(shared_database, as_of)
     corporate_actions = load_oracle_corporate_actions(
         shared_database,
         as_of_date=as_of,
@@ -300,6 +404,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "model_release_manifest_sha256": release.manifest_sha256,
             "model_id": release.model_id,
+            "training_native_prompt_contract": TRAINING_NATIVE_PROMPT_CONTRACT,
         }
     )
     if not args.model_endpoint:
@@ -367,7 +472,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         context = inflight.pop(completed)
                         _handle_future(future=completed, context=context, queue=queue)
             except Exception as exc:
-                queue.mark_error(symbol, f"{type(exc).__name__}: {exc}")
+                queue.mark_error(
+                    symbol,
+                    f"{type(exc).__name__}: {exc}",
+                    trace=_inference_failure_trace(exc),
+                )
         for completed in list(inflight):
             _handle_future(
                 future=completed, context=inflight[completed], queue=queue
@@ -403,11 +512,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_jsonl(run_dir / "security_judgements.jsonl", results)
     aggregate = aggregate_judgements(results)
     radar = oracle_market_summary(oracle_features)
-    synthesis, synthesis_trace, catalog = synthesize_market(
-        client=client,
+    synthesis, synthesis_trace, catalog = synthesize_market_from_native_judgements(
         as_of_date=as_of,
         aggregate=aggregate,
         radar=radar,
+        results=results,
     )
     report = {
         "schema_version": "quant.ai_radar_report.v2",
@@ -458,13 +567,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "security_judgements_path": str(run_dir / "security_judgements.jsonl"),
     }
     report["market_dashboard"] = build_market_dashboard(aggregate, radar)
-    narratives, narrative_trace = build_multistage_narratives(
-        client=client,
+    narratives, narrative_trace = build_native_judgement_narratives(
         aggregate=aggregate,
         radar=radar,
         market_judgement=synthesis,
         results=results,
-        checkpoint_dir=run_dir / "narrative_stages",
     )
     report["multistage_narratives"] = narratives
     report["multistage_narrative_trace"] = narrative_trace

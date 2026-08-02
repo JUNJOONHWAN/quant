@@ -52,7 +52,9 @@ def prepare(args: argparse.Namespace) -> dict:
         "status": "complete",
         "mode": ensured["ensure_mode"],
         "target_as_of_date": binding.target_as_of_date,
-        "source_contract": "oracle_owned_fmp_massive_no_etf_radar_dependency",
+        "source_contract": binding.source_fingerprint["incremental"][
+            "snapshot_seal"
+        ]["source_contract"],
         "binding": binding.public_metadata(),
         "relation_index": relation_index,
         "fmp_historical_backfill_resumed": False,

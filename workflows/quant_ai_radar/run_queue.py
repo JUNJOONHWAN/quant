@@ -202,11 +202,27 @@ class RadarQueue:
                 ),
             )
 
-    def mark_error(self, symbol: str, error: str) -> None:
+    def mark_error(
+        self,
+        symbol: str,
+        error: str,
+        *,
+        trace: Mapping[str, Any] | None = None,
+    ) -> None:
         with self.connect() as connection:
             connection.execute(
-                "UPDATE items SET status='error',error=?,updated_at_utc=? WHERE symbol=?",
-                (error[:4000], utc_now(), symbol),
+                "UPDATE items SET status='error',error=?,trace_json=?,"
+                "updated_at_utc=? WHERE symbol=?",
+                (
+                    error[:4000],
+                    (
+                        json.dumps(trace, sort_keys=True, ensure_ascii=False)
+                        if trace
+                        else None
+                    ),
+                    utc_now(),
+                    symbol,
+                ),
             )
 
     def counts(self) -> dict[str, int]:

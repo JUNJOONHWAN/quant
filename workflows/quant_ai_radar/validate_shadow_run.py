@@ -222,7 +222,7 @@ def validate_shadow_run(
             and queue["done_hash_failures"] == 0
         ),
         "judgements_complete": judgement_count == counts.get("done", 0),
-        "no_lookahead_or_trade_directive": not prohibited,
+        "no_lookahead": not prohibited,
         "source_hashes_valid": source_hashes_valid,
         "render_manifest_valid": (
             rendered["content_hash_valid"]

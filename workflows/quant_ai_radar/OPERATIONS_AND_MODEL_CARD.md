@@ -14,7 +14,10 @@ Quant AI Radar는 주문 프로그램이 아니다. 목표는 다음 세 층을 
    수치를 계산한다.
 2. 학습된 Qwen3-8B LoRA가 그 사실만 해석해 가격과 ETF Flow의 확인,
    불일치, 반대 증거, 미확인 사항과 시장 국면을 구조화한다.
-3. 리포트 계층이 전체 시장, 중요 ETF, ETF 자금 전달의 영향을 받는
+3. 개별 종목 요청에서는 Python이 과거 point-in-time 유사사례의 실제
+   후행 성과를 계산하고 Qwen 27B가 8B 패턴과 그 분포를 종합해 확률적
+   전망을 작성한다. 일일 리포트에는 이 27B 계층을 사용하지 않는다.
+4. 리포트 계층이 전체 시장, 중요 ETF, ETF 자금 전달의 영향을 받는
    종목을 사용자가 검색·검토할 수 있게 제공한다.
 
 모델이 해서는 안 되는 일:
@@ -53,7 +56,7 @@ Quant AI Radar는 주문 프로그램이 아니다. 목표는 다음 세 층을 
 |---|---|---|
 | FMP | 원시 일봉 OHLCV, 과거 ETF 구성종목 | 일봉 거래일, 구성종목 acceptance 이후 첫 미국 거래세션 |
 | Massive ETF Global | ETF fund flow, NAV, shares outstanding, assets | effective+2 미국 세션과 processed+1 세션 중 늦은 날 |
-| Massive grouped daily | Oracle의 FMP 장기 이력 이후 최신 일봉 | 봉의 확정된 거래일 |
+| FMP active master + legacy EOD + 종목별 EOD | Oracle의 FMP 장기 이력 이후 모든 활성 주식·ETF 일봉 | BAR/NO_BAR/QUARANTINED_INVALID_BAR/ERROR 전수 원장과 확정 거래일 |
 | Oracle 파생 feature | 전체 ETF Flow·가격, ETF-구성종목 전달효과, 섹터 회전 | Oracle snapshot seal과 source fingerprint SHA256 |
 
 FMP의 재무·뉴스·기관·내부자 등 확장 역사 백필은 현재 일시중지 상태이며
@@ -241,12 +244,14 @@ restart=unless-stopped
 
 ## 8. 매일 활용하는 최적 구조
 
-10년치를 매일 모델에 다시 넣지 않는다. 장기 이력은 학습과 결정론적
-feature 계산의 기반이며, 모델의 일일 입력은 짧은 당일 패킷이다.
+10년치를 매일 모델 프롬프트에 다시 넣지 않는다. 장기 이력은 학습과
+결정론적 feature 계산의 기반이며, 모델의 일일 입력은 짧은 당일 패킷이다.
+개별 종목 분석만 분석 시점마다 파생 인덱스에서 유사사례를 검색해 완결된
+후행 성과 분포를 계산한다. 이것은 추가 학습이 아니라 읽기 전용 검색이다.
 
 ```text
 Oracle single writer
-  -> immutable FMP base + current Massive incremental DB
+  -> immutable base + FMP 일봉 증분 + Massive ETF Flow 증분
   -> COMPLETE Oracle snapshot seal 및 SHA 검증
   -> read-only shared point-in-time overlay
   -> ETF/종목 관계 인덱스 증분 갱신
@@ -256,7 +261,15 @@ Oracle single writer
   -> 승인 LoRA 구조화 판단
   -> 전체 시장 synthesis
   -> 시장/종목 리포트 + coverage ledger
+  -> 420px Gmail 전송 + message-id 완료 proof
 ```
+
+같은 시장 날짜의 Oracle source fingerprint가 바뀌면 기존 AI queue를
+재사용하지 않는다. 이전 queue·리포트는 revision archive로 보존하고 새
+fingerprint로 전 단계를 다시 계산한다. 동일 fingerprint 재시도는
+checkpoint를 재사용하고 메일을 중복 발송하지 않지만, 실제 원장 개정은
+정정 메일 한 번을 별도 proof로 남긴다. 세부 절차와 장애 이력은
+`DAILY_ORACLE_AI_RADAR_RUNBOOK.md`를 따른다.
 
 ### 관계 인덱스
 
@@ -305,9 +318,11 @@ FMP 구성종목 2천만 행은 최초 1회만 distinct relation으로 변환한
 
 일일 64/192 ceiling은 자동 batch에만 적용한다. 사용자가 특정 ticker를
 요청하면 선택 목록 밖이라도 `analyze_on_demand.py`가 같은 sealed Oracle
-DB와 승인 LoRA로 즉시 분석한다. ETF 관계가 없으면 학습된
-`all_stock_control_analysis`로 해석한다. 당일 가격·품질·PIT 증거가 없으면
-추측 답변 대신 fail-closed 사유를 저장한다.
+DB에서 승인 LoRA로 현재 패턴을 판독하고, 과거 유사사례의 완결된 후행
+성과를 계산한 뒤 Qwen 27B가 확률적 전망을 종합한다. ETF 관계가 없으면
+학습된 `all_stock_control_analysis`로 현재 패턴을 해석한다. 당일
+가격·품질·PIT 증거, 유사사례, 또는 지정된 27B endpoint가 없으면 추측
+답변이나 다른 모델 fallback 대신 fail-closed 사유를 저장한다.
 
 일일 batch와 사용자 지정 분석은 corporate action에서도 같은 계약을
 사용한다. Oracle은 Massive 발견본, FMP 교차확인본, 검증된 발행사·거래소
@@ -571,7 +586,11 @@ FMP 역사 백필은 이 서비스가 절대 재개하지 않는다.
 
 - Python: 전체 종목 전수 계산, PIT 필터, 정규화, 순위, 해시
 - Oracle feature snapshot: ETF 전체 흐름·cluster·rotation 후보 생성
-- 학습 LoRA: 중요한 당일 증거의 확인/불일치/반대증거/unknown 해석
+- 학습 LoRA: 중요한 당일 증거와 개별 종목의 현재 학습 패턴,
+  확인/불일치/반대증거/unknown 해석
+- historical analogue engine: 개별 종목과 같은 task/regime의 과거 사례
+  검색, 완결된 후행 성과와 SPY 대비 분포 계산
+- Qwen 27B: 개별 종목에서만 8B 패턴·유사사례 분포·현재 시장 문맥 종합
 - 최종 market synthesis: 선택 결과와 전체 Oracle 시장 구조를 연결
 - 사용자: 리포트를 참고해 실전 판단 여부를 결정
 
@@ -601,9 +620,11 @@ Python은 다음을 전담한다.
 시장 synthesis는 현재 evidence catalog에서 만든 vLLM guided JSON Schema를
 사용한다. 확인/반대 근거 ID는 enum 밖의 값을 생성할 수 없다. 모델이
 근거 설명문을 임의로 다시 쓰지 않도록 최종 리포트에는 선택된 evidence
-ID의 정확한 catalog 객체를 렌더링한다. 자유문장에 포함된 숫자는 제거해
-renderer 소유 수치와 이중화하지 않으며, 비교 방향 역전은 semantic gate가
-별도로 차단한다. 요약은 가격 폭, ETF 자금, 섹터 회전, 괴리·위험 중 최소
+ID의 정확한 catalog 객체를 렌더링한다. 일일 자유문장에 숫자·날짜·미래
+전망·가격과 Flow의 인과 과장·근거 없는 투자자 동기가 포함되면 문장을
+삭제하거나 치환하지 않고 같은 8B에 계약 재응답을 요구한다. 비교 방향
+역전은 semantic gate가 별도로 차단한다. 요약은 가격 폭, ETF 자금, 섹터
+회전, 괴리·위험 중 최소
 세 축을 실제 판단문으로 연결해야 하며, `한국어 제한`, `한국어로 해석`,
 `근거를 제시하지 않음` 같은 메타 문구는 publish 전에 거부된다.
 
@@ -636,3 +657,29 @@ CLI와 Hermes는 `action=ask`로 동일 앱을 호출한다. 명시 ticker 질�
 - expert human label을 추가하면 reviewer agreement와 별도 provenance 필요
 - Nemotron 30B 등 비교 모델은 동일 frozen test·동일 schema로 별도 평가
 - 실주문 연결은 이 분석 프로젝트의 범위 밖이며 별도 승인·리스크 시스템 필요
+
+## 17. 개별 종목 inference-only 전망 계약
+
+개별 종목의 최종 구조는 다음과 같다.
+
+```text
+sealed Oracle current packet
+  -> Qwen3-8B-FLOW 현재 학습 패턴 판독
+  -> 131,568개 SFT 후보 corpus의 동일 task/regime 유사사례 검색
+  -> read-only 일봉 원장에서 5/20/60-session 실제 후행 성과 계산
+  -> outcome_end_date <= analysis_as_of_date 누수 차단
+  -> Qwen 27B가 패턴·성과 분포·동일 기준일 시장 문맥 종합
+  -> 개별 JSON + 420px HTML
+```
+
+고정 수치와 계산은 Python이 소유한다. 유사사례는 한 종목당 최대 두 건으로
+제한해 장수 종목이 표본을 독점하지 못하게 하며, adjusted close를 우선하고
+SPY 초과성과를 별도 계산한다. Qwen 27B는 `매수 검토`, `보유 관찰`, `관망`,
+`비중 축소 검토`, `회피` 중 하나를 직접 고르고 근거·반대 근거·무효화
+조건을 작성한다. Python은 그 선택을 바꾸지 않는다.
+
+27B 문장에 입력에 없는 숫자·날짜·가격 수준·내부 evidence ID·영문 상태
+코드가 섞이면 같은 판단을 근거 안에서 다시 서술하도록 최대 세 번
+재요청한다. 끝까지 계약을 통과하지 못하면 개별 분석 전체가 실패한다.
+다른 모델이나 고정 문구 fallback은 없다. 상세 수용 기준은
+`INFERENCE_ONLY_FORECAST_PRD.md`를 따른다.

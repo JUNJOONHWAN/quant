@@ -97,11 +97,12 @@ described as a trading or order-execution application.
 
 Market Structure Oracle is the single writer for the shared current-market
 database. Both apps may request preparation, but the interprocess lock permits
-only one Massive/FMP incremental capture and the other caller reuses the sealed
-snapshot. ETF RADAR remains a separate workflow and is not an Oracle/AI Radar
-source, release-date gate, universe gate, or inference input. New securities
-enter through Massive grouped daily; new ETFs enter through Massive flow/FMP
-profile discovery and receive missing-constituent refresh priority.
+only one FMP-price/Massive-ETF-Flow incremental capture and the other caller
+reuses the sealed snapshot. ETF RADAR remains a separate workflow and is not an
+Oracle/AI Radar source, release-date gate, universe gate, or inference input.
+New securities enter through the daily FMP active master and FMP EOD; new ETFs
+are corroborated by Massive Flow/FMP profile discovery and receive
+missing-constituent refresh priority.
 
 ## Domain Map
 

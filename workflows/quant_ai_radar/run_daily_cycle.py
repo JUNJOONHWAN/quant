@@ -96,7 +96,7 @@ def main() -> int:
     release_manifest = os.environ.get(
         "QUANT_AI_RELEASE_MANIFEST",
         "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/"
-        "qwen3_8b_quant_lora_v1/release_manifest.json",
+        "Qwen3-8B-FLOW/release_manifest.json",
     )
     commands = build_stage_commands(
         model_endpoint=model_endpoint,

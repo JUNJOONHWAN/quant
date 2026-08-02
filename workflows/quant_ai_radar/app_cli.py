@@ -30,6 +30,15 @@ from quant_dataset.shared_market import (  # noqa: E402
     load_shared_market_binding,
 )
 from workflows.quant_ai_radar.model_runtime import load_model_release  # noqa: E402
+from workflows.quant_ai_radar.forecast_synthesis import (  # noqa: E402
+    DEFAULT_FORECAST_ENDPOINT,
+    DEFAULT_FORECAST_MODEL,
+)
+from workflows.quant_ai_radar.historical_analog import (  # noqa: E402
+    DEFAULT_ANALOG_INDEX,
+    DEFAULT_EXAMPLE_DATABASE,
+    DEFAULT_PRICE_DATABASE,
+)
 from workflows.quant_ai_radar.decision_support import (  # noqa: E402
     QUALITY_SCHEMA_VERSION,
 )
@@ -43,6 +52,9 @@ from workflows.quant_ai_radar.relation_index import (  # noqa: E402
 )
 from workflows.quant_ai_radar.run_daily_cycle import build_stage_commands  # noqa: E402
 from workflows.quant_ai_radar.universe import write_json  # noqa: E402
+from workflows.market_structure_oracle.incremental_store import (  # noqa: E402
+    latest_closed_nyse_session,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -53,7 +65,7 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 DEFAULT_RELEASE_MANIFEST = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/"
-    "qwen3_8b_quant_lora_v1/release_manifest.json"
+    "Qwen3-8B-FLOW/release_manifest.json"
 )
 APP_STATE_PATH = DEFAULT_OUTPUT_ROOT / "status" / "app_cli.json"
 REQUEST_FIELDS = frozenset(
@@ -84,6 +96,11 @@ class AppCliError(RuntimeError):
 
 def _now_kst() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
+
+
+def _generated_today_kst(report: dict[str, Any]) -> bool:
+    generated_at = str(report.get("generated_at_kst") or "")
+    return generated_at[:10] == datetime.now(KST).date().isoformat()
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -219,6 +236,18 @@ def _model_endpoint() -> str:
     return endpoint
 
 
+def _forecast_model_endpoint() -> str:
+    return os.environ.get(
+        "QUANT_AI_FORECAST_MODEL_ENDPOINT", DEFAULT_FORECAST_ENDPOINT
+    ).strip()
+
+
+def _forecast_model_name() -> str:
+    return os.environ.get(
+        "QUANT_AI_FORECAST_MODEL_NAME", DEFAULT_FORECAST_MODEL
+    ).strip()
+
+
 def build_daily_commands(
     *,
     shadow: bool,
@@ -258,6 +287,28 @@ def build_analyze_command(symbols: list[str]) -> list[str]:
         _release_manifest(),
         "--model-endpoint",
         _model_endpoint(),
+        "--forecast-model-endpoint",
+        _forecast_model_endpoint(),
+        "--forecast-model-name",
+        _forecast_model_name(),
+        "--forecast-timeout",
+        os.environ.get("QUANT_AI_FORECAST_MODEL_TIMEOUT_SECONDS", "240"),
+        "--analog-example-database",
+        os.environ.get(
+            "QUANT_AI_ANALOG_EXAMPLE_DATABASE", str(DEFAULT_EXAMPLE_DATABASE)
+        ),
+        "--analog-price-database",
+        os.environ.get(
+            "QUANT_AI_ANALOG_PRICE_DATABASE", str(DEFAULT_PRICE_DATABASE)
+        ),
+        "--analog-index-database",
+        os.environ.get(
+            "QUANT_AI_ANALOG_INDEX_DATABASE", str(DEFAULT_ANALOG_INDEX)
+        ),
+        "--analog-neighbor-limit",
+        os.environ.get("QUANT_AI_ANALOG_NEIGHBOR_LIMIT", "80"),
+        "--analog-per-symbol-limit",
+        os.environ.get("QUANT_AI_ANALOG_PER_SYMBOL_LIMIT", "2"),
         "--max-constituent-available-lag-days",
         os.environ.get(
             "QUANT_AI_MAX_CONSTITUENT_AVAILABLE_LAG_DAYS", "45"
@@ -266,6 +317,13 @@ def build_analyze_command(symbols: list[str]) -> list[str]:
     token_file = _token_file()
     if token_file:
         command.extend(["--model-token-file", token_file])
+    forecast_token_file = os.environ.get(
+        "QUANT_AI_FORECAST_MODEL_TOKEN_FILE", ""
+    ).strip()
+    if forecast_token_file:
+        command.extend(
+            ["--forecast-model-token-file", forecast_token_file]
+        )
     return command
 
 
@@ -304,12 +362,32 @@ def run_json_command(command: list[str]) -> dict[str, Any]:
     return payload
 
 
-def daily_completion_status() -> dict[str, Any] | None:
-    """Return the exact completed Oracle target, otherwise require a run."""
+def daily_completion_status(
+    *,
+    expected_source_fingerprint_sha256: str,
+) -> dict[str, Any] | None:
+    """Return only a report and email bound to the current Oracle snapshot."""
 
     oracle = _read_json(DEFAULT_ORACLE_STATUS) or {}
     target = str(oracle.get("target_as_of_date") or "")[:10]
-    report = _read_json(DEFAULT_OUTPUT_ROOT / "status" / "latest.json") or {}
+    latest_path = DEFAULT_OUTPUT_ROOT / "status" / "latest.json"
+    run_dir = DEFAULT_OUTPUT_ROOT / "runs" / target
+    report_path = run_dir / "market_report.json"
+    report = _read_json(report_path) or {}
+    latest = _read_json(latest_path) or {}
+    source_status = (
+        report.get("source_status")
+        if isinstance(report.get("source_status"), dict)
+        else {}
+    )
+    shared_oracle = (
+        source_status.get("shared_oracle_store")
+        if isinstance(source_status.get("shared_oracle_store"), dict)
+        else {}
+    )
+    report_source_fingerprint = str(
+        shared_oracle.get("source_fingerprint_sha256") or ""
+    )
     quality = (
         report.get("quality_audit")
         if isinstance(report.get("quality_audit"), dict)
@@ -330,10 +408,33 @@ def daily_completion_status() -> dict[str, Any] | None:
         if isinstance(model.get("merged_model"), dict)
         else {}
     )
-    email = email_delivery_status(target) if target else {}
+    report_sha256 = (
+        hashlib.sha256(report_path.read_bytes()).hexdigest()
+        if report_path.is_file()
+        else ""
+    )
+    latest_sha256 = (
+        hashlib.sha256(latest_path.read_bytes()).hexdigest()
+        if latest_path.is_file()
+        else ""
+    )
+    email = (
+        email_delivery_status(
+            target,
+            report_sha256=report_sha256,
+            source_fingerprint_sha256=expected_source_fingerprint_sha256,
+        )
+        if target and report_sha256
+        else {}
+    )
     complete = bool(
         target
         and str(report.get("as_of_date") or "") == target
+        and str(latest.get("as_of_date") or "") == target
+        and report_sha256
+        and latest_sha256 == report_sha256
+        and report_source_fingerprint == expected_source_fingerprint_sha256
+        and _generated_today_kst(report)
         and report.get("schema_version") == "quant.ai_radar_report.v2"
         and report.get("deployment_mode") == "reference_publish"
         and report.get("selected_model_scope_complete") is True
@@ -355,8 +456,6 @@ def daily_completion_status() -> dict[str, Any] | None:
     )
     if not complete:
         return None
-    run_dir = DEFAULT_OUTPUT_ROOT / "runs" / target
-    report_path = run_dir / "market_report.json"
     if not all(
         path.is_file() and path.stat().st_size > 0
         for path in (
@@ -370,6 +469,7 @@ def daily_completion_status() -> dict[str, Any] | None:
         "as_of_date": target,
         "run_dir": str(run_dir),
         "report": str(report_path),
+        "source_fingerprint_sha256": report_source_fingerprint,
         "queue_counts": report.get("queue_counts"),
         "email_delivery": email,
     }
@@ -384,30 +484,6 @@ def run_daily(
     smoke_max_items: int = 0,
 ) -> dict[str, Any]:
     production_run = not shadow and not smoke_max_items
-    completed = daily_completion_status() if production_run else None
-    if completed is not None:
-        result = {
-            "schema_version": "quant.ai_radar_app_run.v1",
-            "status": "PASS",
-            "app_id": APP_ID,
-            "action": "daily",
-            "shadow": False,
-            "smoke_max_items": 0,
-            "operations_app_run_id": os.environ.get("OPERATIONS_APP_RUN_ID"),
-            "engine_status": "already_complete",
-            "generation_skipped": True,
-            "skip_reason": "oracle_target_already_green_and_email_v3_complete",
-            "as_of_date": completed["as_of_date"],
-            "run_dir": completed["run_dir"],
-            "report": completed["report"],
-            "production_latest_published": True,
-            "queue_counts": completed.get("queue_counts"),
-            "email_delivery": completed["email_delivery"],
-            "completed_at_kst": _now_kst(),
-        }
-        write_json(APP_STATE_PATH, result)
-        return result
-
     commands = build_daily_commands(
         shadow=shadow,
         workers=workers,
@@ -427,6 +503,55 @@ def run_daily(
     }
     write_json(APP_STATE_PATH, state)
     prepare = run_json_command(commands[0])
+    prepared_target = str(prepare.get("target_as_of_date") or "")[:10]
+    if production_run:
+        prepare_binding = (
+            prepare.get("binding")
+            if isinstance(prepare.get("binding"), dict)
+            else {}
+        )
+        expected_source_fingerprint = str(
+            prepare_binding.get("source_fingerprint_sha256") or ""
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_source_fingerprint):
+            raise AppCliError(
+                "Oracle prepare did not return a valid source fingerprint"
+            )
+        closed_target = latest_closed_nyse_session(
+            publish_grace_hour_et=16
+        )
+        if prepared_target != closed_target:
+            raise AppCliError(
+                "Oracle target is not yet vendor-publishable for the latest "
+                f"closed NYSE session: oracle={prepared_target or 'missing'} "
+                f"closed_session={closed_target}"
+            )
+        completed = daily_completion_status(
+            expected_source_fingerprint_sha256=(
+                expected_source_fingerprint
+            )
+        )
+        if completed is not None:
+            result = {
+                **state,
+                "status": "PASS",
+                "prepare": prepare,
+                "engine_status": "already_complete",
+                "generation_skipped": True,
+                "skip_reason": (
+                    "current_oracle_target_generated_today_green_and_"
+                    "email_v3_complete"
+                ),
+                "as_of_date": completed["as_of_date"],
+                "run_dir": completed["run_dir"],
+                "report": completed["report"],
+                "production_latest_published": True,
+                "queue_counts": completed.get("queue_counts"),
+                "email_delivery": completed["email_delivery"],
+                "completed_at_kst": _now_kst(),
+            }
+            write_json(APP_STATE_PATH, result)
+            return result
     state["status"] = "running_full_scan_prioritized_inference"
     state["prepare"] = prepare
     write_json(APP_STATE_PATH, state)
@@ -791,9 +916,78 @@ def status() -> dict[str, Any]:
     daily_cycle = _read_json(DEFAULT_OUTPUT_ROOT / "status" / "daily_cycle.json")
     oracle = _read_json(DEFAULT_ORACLE_STATUS)
     latest_as_of = str((latest or {}).get("as_of_date") or "")
+    prepare = (
+        (app_state or {}).get("prepare")
+        if isinstance((app_state or {}).get("prepare"), dict)
+        else {}
+    )
+    prepared_binding = (
+        prepare.get("binding")
+        if isinstance(prepare.get("binding"), dict)
+        else {}
+    )
+    current_source_fingerprint = str(
+        prepared_binding.get("source_fingerprint_sha256") or ""
+    )
+    binding_error = (
+        ""
+        if re.fullmatch(r"[0-9a-f]{64}", current_source_fingerprint)
+        else "current prepared Oracle source fingerprint is unavailable"
+    )
+    latest_source = (
+        (latest or {}).get("source_status")
+        if isinstance((latest or {}).get("source_status"), dict)
+        else {}
+    )
+    latest_oracle = (
+        latest_source.get("shared_oracle_store")
+        if isinstance(latest_source.get("shared_oracle_store"), dict)
+        else {}
+    )
+    latest_source_fingerprint = str(
+        latest_oracle.get("source_fingerprint_sha256") or ""
+    )
+    report_path = (
+        DEFAULT_OUTPUT_ROOT
+        / "runs"
+        / latest_as_of
+        / "market_report.json"
+    )
+    report_sha256 = (
+        hashlib.sha256(report_path.read_bytes()).hexdigest()
+        if report_path.is_file()
+        else ""
+    )
+    publication_source_current = bool(
+        current_source_fingerprint
+        and latest_source_fingerprint == current_source_fingerprint
+    )
+    email = (
+        email_delivery_status(
+            latest_as_of,
+            report_sha256=report_sha256,
+            source_fingerprint_sha256=current_source_fingerprint,
+        )
+        if latest_as_of and report_sha256 and current_source_fingerprint
+        else None
+    )
+    publication_current = bool(
+        publication_source_current
+        and email
+        and email.get("complete") is True
+    )
+    running = str((app_state or {}).get("status") or "").startswith("running_")
+    if endpoint["status"] != "confirmed" or binding_error:
+        overall_status = "partial"
+    elif running:
+        overall_status = "running"
+    elif publication_current:
+        overall_status = "confirmed"
+    else:
+        overall_status = "waiting"
     return {
         "schema_version": "quant.ai_radar_app_status.v1",
-        "status": "confirmed" if endpoint["status"] == "confirmed" else "partial",
+        "status": overall_status,
         "app_id": APP_ID,
         "checked_at_kst": _now_kst(),
         "model_endpoint": endpoint,
@@ -805,11 +999,22 @@ def status() -> dict[str, Any]:
                     "selected_model_scope_complete"
                 ),
                 "queue_counts": latest.get("queue_counts"),
-                "market_report_json": str(
-                    DEFAULT_OUTPUT_ROOT
-                    / "runs"
-                    / str(latest.get("as_of_date"))
-                    / "market_report.json"
+                "market_report_json": str(report_path),
+                "report_sha256": report_sha256,
+                "source_fingerprint_sha256": latest_source_fingerprint,
+                "current_oracle_source_fingerprint_sha256": (
+                    current_source_fingerprint
+                ),
+                "source_matches_current_oracle": publication_source_current,
+                "publication_current": publication_current,
+                "publication_status": (
+                    "CURRENT"
+                    if publication_current
+                    else (
+                        "WAITING_EMAIL"
+                        if publication_source_current
+                        else "STALE_ORACLE_SOURCE"
+                    )
                 ),
             }
             if latest
@@ -820,10 +1025,10 @@ def status() -> dict[str, Any]:
         "data_backend_status": {
             "source_owner": "market-structure-oracle",
             **(_oracle_summary(oracle) or {}),
+            "source_fingerprint_sha256": current_source_fingerprint,
+            "binding_error": binding_error or None,
         },
-        "email_delivery": (
-            email_delivery_status(latest_as_of) if latest_as_of else None
-        ),
+        "email_delivery": email,
         "fmp_historical_backfill": "PAUSED",
         "timer_activation_changed": False,
         "trade_execution": "NOT_APPLICABLE",

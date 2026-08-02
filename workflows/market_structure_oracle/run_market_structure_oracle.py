@@ -1899,7 +1899,7 @@ def _render_html(payload: dict[str, Any]) -> str:
     incremental = payload["incremental_market_data"]
     source_rows = "".join(
         (
-            "<tr><td>Massive grouped daily</td><td>Massive</td>"
+            "<tr><td>활성종목·일별 가격 원장</td><td>FMP</td>"
             f"<td>{html.escape(str(session))}</td><td>Oracle single writer</td>"
             f"<td>{int(rows):,}</td></tr>"
         )
@@ -1916,7 +1916,7 @@ def _render_html(payload: dict[str, Any]) -> str:
     incremental_section = f"""<section class=\"card\"><h2>현재 시장 증분 DB — 완결</h2>
 <p>기준 원본 FMP 장기 이력 종료 <b>{incremental['base_history_end']}</b> →
 현재 기준일 <b>{incremental['target_as_of_date']}</b>. 누락 거래일 없이
-{len(incremental['expected_sessions'])}개 NYSE 세션을 Massive 전시장 일봉으로 누적했습니다.</p>
+{len(incremental['expected_sessions'])}개 NYSE 세션을 FMP 전시장 일봉으로 누적했습니다.</p>
 <p class=\"muted\">가격 전환: {html.escape(incremental['base_price_source'])} +
 {html.escape(incremental['incremental_price_source'])}. ETF Flow는 D+2 기준
 effective <b>{incremental['etf_flow']['latest_effective_date']}</b>까지 반영됩니다.</p>
@@ -2031,7 +2031,7 @@ th:first-child,td:first-child{{text-align:left}}code{{color:#93c5fd}}.warn{{colo
 <b>{validation['always_up_hit_rate']:.1%}</b> · Brier skill
 <b>{validation['brier_skill_vs_expanding_base']:+.1%}</b></p>
 <p class="warn">{validation['forecast_confidence']}</p></section>
-<section class="card"><h2>출처·기간·대상 계약</h2><p>장기 PIT 상태 큐브: FMP 기준 이력 + Oracle 증분 Massive 전시장 일봉 {payload['coverage']['calendar_start']} → {payload['coverage']['calendar_end']} · {payload['coverage']['sessions']:,} 세션 · {payload['coverage']['symbols_with_observations']:,} 심볼. ETF Flow는 {payload['coverage']['latest_effective_date_visible']} effective까지 D+2 정책으로 반영합니다.</p><p>Oracle이 Massive 일봉·ETF Flow와 FMP ETF 구성종목을 단일 writer로 갱신하고 봉인합니다. ETF RADAR는 별도 앱이며 이 리포트의 데이터·릴리스 게이트가 아닙니다.</p></section>
+<section class="card"><h2>출처·기간·대상 계약</h2><p>장기 PIT 상태 큐브: FMP 기준 이력 + Oracle 증분 FMP 전시장 일봉 {payload['coverage']['calendar_start']} → {payload['coverage']['calendar_end']} · {payload['coverage']['sessions']:,} 세션 · {payload['coverage']['symbols_with_observations']:,} 심볼. ETF Flow는 {payload['coverage']['latest_effective_date_visible']} effective까지 D+2 정책으로 반영합니다.</p><p>Oracle이 FMP 활성종목·일봉·기업행위와 Massive ETF Flow, FMP ETF 구성종목을 단일 writer로 갱신하고 봉인합니다. ETF RADAR는 별도 앱이며 이 리포트의 데이터·릴리스 게이트가 아닙니다.</p></section>
 </main></body></html>"""
 
 

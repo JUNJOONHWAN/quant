@@ -125,11 +125,24 @@ class QuantAiRadarAppTest(unittest.TestCase):
             app_cli, "daily_completion_status", return_value=None
         ), mock.patch.object(
             app_cli, "build_daily_commands", return_value=[["prepare"], ["radar"]]
+        ), mock.patch.object(
+            app_cli,
+            "latest_closed_nyse_session",
+            return_value="2026-07-29",
         ):
             with mock.patch.object(
                 app_cli,
                 "run_json_command",
-                side_effect=[{"status": "COMPLETE"}, radar],
+                side_effect=[
+                    {
+                        "status": "complete",
+                        "target_as_of_date": "2026-07-29",
+                        "binding": {
+                            "source_fingerprint_sha256": "a" * 64,
+                        },
+                    },
+                    radar,
+                ],
             ):
                 with mock.patch.object(
                     app_cli,
@@ -164,19 +177,80 @@ class QuantAiRadarAppTest(unittest.TestCase):
         }
         with mock.patch.object(
             app_cli, "daily_completion_status", return_value=completed
-        ), mock.patch.object(app_cli, "build_daily_commands") as build, mock.patch.object(
-            app_cli, "run_json_command"
-        ) as run, mock.patch.object(app_cli, "write_json"):
+        ), mock.patch.object(
+            app_cli,
+            "build_daily_commands",
+            return_value=[["prepare"], ["radar"]],
+        ) as build, mock.patch.object(
+            app_cli,
+            "run_json_command",
+            return_value={
+                "status": "complete",
+                "target_as_of_date": "2026-07-29",
+                "binding": {
+                    "source_fingerprint_sha256": "a" * 64,
+                },
+            },
+        ) as run, mock.patch.object(
+            app_cli,
+            "latest_closed_nyse_session",
+            return_value="2026-07-29",
+        ), mock.patch.object(app_cli, "write_json"):
             result = app_cli.run_daily(
                 shadow=False,
                 workers=4,
                 max_ai_etfs=64,
                 max_ai_stocks=192,
             )
-        build.assert_not_called()
-        run.assert_not_called()
+        build.assert_called_once()
+        run.assert_called_once_with(["prepare"])
         self.assertTrue(result["generation_skipped"])
         self.assertEqual(result["engine_status"], "already_complete")
+        self.assertIn("generated_today", result["skip_reason"])
+
+    def test_production_daily_rejects_stale_oracle_target_after_prepare(self):
+        with mock.patch.object(
+            app_cli,
+            "build_daily_commands",
+            return_value=[["prepare"], ["radar"]],
+        ), mock.patch.object(
+            app_cli,
+            "run_json_command",
+            return_value={
+                "status": "complete",
+                "target_as_of_date": "2026-07-29",
+                "binding": {
+                    "source_fingerprint_sha256": "a" * 64,
+                },
+            },
+        ) as run, mock.patch.object(
+            app_cli,
+            "latest_closed_nyse_session",
+            return_value="2026-07-30",
+        ), mock.patch.object(app_cli, "write_json"):
+            with self.assertRaisesRegex(
+                app_cli.AppCliError, "not yet vendor-publishable"
+            ):
+                app_cli.run_daily(
+                    shadow=False,
+                    workers=4,
+                    max_ai_etfs=64,
+                    max_ai_stocks=192,
+                )
+        run.assert_called_once_with(["prepare"])
+
+    def test_generated_today_kst_is_a_completion_gate(self):
+        today = app_cli.datetime.now(app_cli.KST).date().isoformat()
+        self.assertTrue(
+            app_cli._generated_today_kst(
+                {"generated_at_kst": f"{today}T07:15:00+09:00"}
+            )
+        )
+        self.assertFalse(
+            app_cli._generated_today_kst(
+                {"generated_at_kst": "2026-07-30T22:09:46+09:00"}
+            )
+        )
 
     def test_shadow_daily_never_sends_email(self):
         radar = {
@@ -335,6 +409,84 @@ class QuantAiRadarAppTest(unittest.TestCase):
         self.assertEqual(summary["flow_record_count"], 34996)
         self.assertNotIn("capture", summary)
         self.assertNotIn("etf_radar_release_artifacts", summary)
+
+    def test_status_marks_old_report_stale_during_current_source_rerun(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            as_of_date = "2026-07-30"
+            report_path = root / "runs" / as_of_date / "market_report.json"
+            latest_path = root / "status" / "latest.json"
+            app_state_path = root / "status" / "app_cli.json"
+            oracle_path = root / "oracle.json"
+            report_path.parent.mkdir(parents=True)
+            latest_path.parent.mkdir(parents=True)
+            report = {
+                "as_of_date": as_of_date,
+                "deployment_mode": "reference_publish",
+                "selected_model_scope_complete": True,
+                "queue_counts": {"done": 253, "excluded": 3},
+                "source_status": {
+                    "shared_oracle_store": {
+                        "source_fingerprint_sha256": "a" * 64,
+                    }
+                },
+            }
+            encoded = json.dumps(report, sort_keys=True)
+            report_path.write_text(encoded, encoding="utf-8")
+            latest_path.write_text(encoded, encoding="utf-8")
+            app_state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "running_full_scan_prioritized_inference",
+                        "prepare": {
+                            "binding": {
+                                "source_fingerprint_sha256": "b" * 64,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            oracle_path.write_text(
+                json.dumps(
+                    {
+                        "status": "COMPLETE",
+                        "target_as_of_date": as_of_date,
+                        "missing_sessions": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                app_cli, "DEFAULT_OUTPUT_ROOT", root
+            ), mock.patch.object(
+                app_cli, "APP_STATE_PATH", app_state_path
+            ), mock.patch.object(
+                app_cli, "DEFAULT_ORACLE_STATUS", oracle_path
+            ), mock.patch.object(
+                app_cli,
+                "endpoint_status",
+                return_value={"status": "confirmed"},
+            ), mock.patch.object(
+                app_cli,
+                "email_delivery_status",
+                return_value={"status": "MISSING", "complete": False},
+            ) as email_status:
+                result = app_cli.status()
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(
+            result["latest_published"]["publication_status"],
+            "STALE_ORACLE_SOURCE",
+        )
+        self.assertFalse(
+            result["latest_published"]["source_matches_current_oracle"]
+        )
+        self.assertEqual(result["email_delivery"]["status"], "MISSING")
+        email_status.assert_called_once_with(
+            as_of_date,
+            report_sha256=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            source_fingerprint_sha256="b" * 64,
+        )
 
 
 if __name__ == "__main__":

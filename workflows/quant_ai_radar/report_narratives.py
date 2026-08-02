@@ -14,19 +14,18 @@ from .decision_support import build_market_dashboard, build_security_brief
 from .model_runtime import (
     ModelResponseParseError,
     ResponseContractError,
-    TRADE_DIRECTIVE_PATTERN,
     TrainedQuantClient,
     canonical_json,
 )
-from .presentation import label_rotation_state
-
-
-NARRATIVE_SCHEMA_VERSION = "quant.ai_radar_multistage_narratives.v1"
-NARRATIVE_CONTRACT_VERSION = "quant.ai_radar_narrative_contract.v4"
-EDITORIAL_CONTRACT_VERSION = "quant.ai_radar_editorial_contract.v2"
+from .presentation import label_regime, label_rotation_state, label_signal
+NARRATIVE_SCHEMA_VERSION = "quant.ai_radar_multistage_narratives.v2"
+NARRATIVE_CONTRACT_VERSION = "quant.ai_radar_narrative_contract.v11"
+EDITORIAL_CONTRACT_VERSION = "quant.ai_radar_editorial_contract.v3"
+LEARNED_PATTERN_PROMPT_CONTRACT = "quant.ai_radar_daily_learned_pattern.v1"
 SECTOR_BATCH_SIZE = 3
 SECURITY_BATCH_SIZE = 3
 SECURITY_PER_LANE = 4
+NARRATIVE_MAX_ATTEMPTS = 2
 PROSE_FIELDS = {
     "headline",
     "explanation",
@@ -39,6 +38,9 @@ PROSE_FIELDS = {
     "rotation_summary",
     "selection_summary",
     "risk_summary",
+    "learned_pattern",
+    "pattern_evidence",
+    "pattern_risk",
 }
 HANGUL = re.compile(r"[가-힣]")
 NUMBER = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|퍼센트|개|건|일|점)?")
@@ -47,10 +49,17 @@ RAW_CODE = re.compile(
     r"insufficient_joint_evidence)\b"
 )
 CAUSAL_OVERCLAIM = re.compile(
-    r"(?:ETF|자금|섹터|회전)[^.]{0,80}(?:가격|수익률)[^.]{0,50}"
-    r"(?:영향을\s*미치|유발하|원인이\s*(?:되|다))|"
-    r"(?:영향을\s*미치|유발하|원인이\s*(?:되|다))[^.]{0,50}"
-    r"(?:가격|수익률)"
+    r"(?:ETF|자금|섹터|회전)[^.]{0,80}(?:가격|주가|수익률)[^.]{0,50}"
+    r"(?:영향|유발|원인)|"
+    r"(?:가격|주가|수익률)[^.]{0,80}(?:ETF|자금|섹터|회전)[^.]{0,50}"
+    r"(?:영향|유발|원인)"
+)
+DAILY_FUTURE_OR_ACTION = re.compile(
+    r"(?:향후|미래|앞으로|과매수|목표가|매수|매도|비중\s*축소|"
+    r"(?:상승|하락|조정|반등|회복)\s*가능성)"
+)
+UNSUPPORTED_MOTIVE = re.compile(
+    r"(?:투자자|기관)[^.]{0,40}(?:심리|기대|관심|선호|의도)"
 )
 KOREAN_SENTENCE_ENDING = re.compile(
     r"(?:습니다|입니다|있다|없다|한다|된다|이다|필요하다|보인다|"
@@ -70,14 +79,55 @@ CLUSTER_TERMS = (
     "헬스케어",
     "산업 섹터",
     "금융",
+    "금융 서비스",
+    "금융서비스",
+    "금융주",
+    "은행",
+    "보험",
     "기술 섹터",
+    "기술주",
+    "IT",
+    "정보기술",
     "비분류",
     "경기소비재",
     "방어소비재",
+    "소비재",
+    "소비재 방어",
+    "소비재 순환",
     "소비재 섹터",
+    "산업군",
+    "에너지",
+    "헬스케어",
+    "건강케어",
+    "유틸리티",
+    "전력",
+    "산업",
+    "산업재",
+    "산업주",
+    "방산",
+    "항공",
+    "기술",
     "에너지 섹터",
     "유틸리티",
     "전력 섹터",
+    "소재",
+    "원자재",
+    "부동산",
+    "리츠",
+    "통신",
+    "통신서비스",
+    "커뮤니케이션",
+    "미디어",
+    "반도체",
+    "소프트웨어",
+    "바이오",
+    "의약",
+    "제약",
+    "성장주",
+    "가치주",
+    "필수소비재",
+    "경기소비재",
+    "소비자",
 )
 CLUSTER_LABELS = {
     "Healthcare": ("Healthcare", "건강케어", "헬스케어"),
@@ -86,7 +136,14 @@ CLUSTER_LABELS = {
     "Technology": ("Technology", "기술"),
     "Unclassified": ("Unclassified", "비분류"),
     "Consumer Cyclical": ("Consumer Cyclical", "경기소비재"),
-    "Consumer Defensive": ("Consumer Defensive", "방어소비재"),
+    "Consumer Defensive": (
+        "Consumer Defensive",
+        "방어소비재",
+        "필수소비재",
+        "소비재 방어",
+        "소비재 섹터",
+        "소비재",
+    ),
     "Energy": ("Energy", "에너지"),
     "Utilities": ("Utilities", "유틸리티", "전력"),
 }
@@ -101,14 +158,25 @@ NO_DIRECT_CLUSTER_LINK_TERMS = (
 )
 
 
+def _unsupported_cluster_terms(cluster: str) -> list[str]:
+    """Reject other groups without rejecting substrings of the verified label."""
+
+    allowed = set(CLUSTER_LABELS.get(cluster, (cluster,)))
+    return [
+        term
+        for term in CLUSTER_TERMS
+        if term not in allowed
+        and not any(term in allowed_term for allowed_term in allowed)
+    ]
+
+
 def _chunks(values: Sequence[Any], size: int) -> list[list[Any]]:
     return [list(values[index : index + size]) for index in range(0, len(values), size)]
 
 
 def _clean_prose(value: Any) -> tuple[str, bool]:
     original = str(value or "").strip()
-    cleaned = NUMBER.sub("", original)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", original).strip()
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     if cleaned and not _is_complete_sentence(cleaned):
         cleaned = f"{cleaned}."
@@ -137,6 +205,54 @@ def _is_complete_sentence(value: Any) -> bool:
     )
 
 
+def _adapt_native_narrative_items(
+    response: Mapping[str, Any],
+    *,
+    id_key: str,
+    expected_ids: Sequence[str],
+    text_fields: Sequence[str],
+    enum_fields: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    rows = response.get("items")
+    if not isinstance(rows, list):
+        return dict(response), False
+    adapted_rows: list[dict[str, Any]] = []
+    changed = False
+    for identifier in expected_ids:
+        source = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, Mapping)
+                and str(row.get(id_key) or "") == identifier
+            ),
+            None,
+        )
+        if source is None:
+            continue
+        adapted: dict[str, Any] = {id_key: identifier}
+        for field in text_fields:
+            value = source.get(field)
+            if field == "explanation" and not isinstance(value, str):
+                value = source.get("supporting_analysis")
+                changed = changed or isinstance(value, str)
+            if isinstance(value, list):
+                strings = [str(item).strip() for item in value if str(item).strip()]
+                value = ", ".join(strings) if field == "stock_context" else (
+                    strings[0] if strings else ""
+                )
+                changed = True
+            adapted[field] = value
+        for field in (enum_fields or {}):
+            adapted[field] = source.get(field)
+        if set(source) != set(adapted):
+            changed = True
+        adapted_rows.append(adapted)
+    if len(adapted_rows) != len(rows):
+        changed = True
+    return {"items": adapted_rows}, changed
+
+
 def _validate_items(
     response: Mapping[str, Any],
     *,
@@ -146,6 +262,7 @@ def _validate_items(
     required_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
     required_all_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
     forbidden_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    enum_fields: Mapping[str, Sequence[str]] | None = None,
 ) -> list[dict[str, Any]]:
     rows = response.get("items")
     if not isinstance(rows, list):
@@ -154,10 +271,68 @@ def _validate_items(
     for row in rows:
         if not isinstance(row, Mapping):
             raise ResponseContractError("narrative item must be an object")
+        for field in text_fields:
+            if not isinstance(row.get(field), str):
+                raise ResponseContractError(
+                    f"narrative item {field} must be a Korean prose string"
+                )
         normalized, _ = _normalize_item(row)
         identifier = str(normalized.get(id_key) or "")
         if not identifier:
             raise ResponseContractError(f"narrative item is missing {id_key}")
+        # Group membership is a source-of-truth relationship, not an AI claim.
+        # Canonicalize it from the deterministic contract so the model cannot
+        # copy unrelated clusters from the full market context into one symbol.
+        if id_key == "symbol" and "group_context" in text_fields:
+            allowed_groups = list(
+                (required_mentions or {})
+                .get(identifier, {})
+                .get("group_context", ())
+            )
+            if allowed_groups:
+                label = next(
+                    (
+                        str(value)
+                        for value in allowed_groups
+                        if any("가" <= char <= "힣" for char in str(value))
+                    ),
+                    str(allowed_groups[0]),
+                )
+                normalized["group_context"] = (
+                    f"{identifier}는 {label} 연결이 제공된 데이터에서 확인됩니다."
+                )
+            else:
+                normalized["group_context"] = (
+                    f"{identifier}는 제공된 직접 섹터 연결 근거 없음으로 분류됩니다."
+                )
+            # The model may repeat another cluster from COMPLETE_MARKET_CONTEXT
+            # in the explanatory prose. Keep the AI judgement, but neutralize
+            # unsupported cluster labels before any report or email renderer sees it.
+            allowed_group_set = set(allowed_groups)
+            for field in text_fields:
+                if field == "group_context":
+                    continue
+                text = str(normalized.get(field) or "")
+                for term in sorted(CLUSTER_TERMS, key=len, reverse=True):
+                    if term in allowed_group_set:
+                        continue
+                    if re.fullmatch(r"[A-Za-z][A-Za-z ]*", term):
+                        text = re.sub(
+                            rf"(?<![A-Za-z]){re.escape(term)}(?![A-Za-z])",
+                            "시장 회전 영역",
+                            text,
+                        )
+                    else:
+                        text = re.sub(
+                            rf"{re.escape(term)}\s*섹터",
+                            "시장 회전 영역",
+                            text,
+                        )
+                        text = text.replace(term, "시장 회전 영역")
+                text = text.replace("시장 회전 영역 섹터", "시장 회전 영역")
+                text = text.replace("시장 회전 영역는", "시장 회전 영역은")
+                text = text.replace("시장 회전 영역가", "시장 회전 영역이")
+                normalized[field] = text
         for field in text_fields:
             text = str(normalized.get(field) or "").strip()
             minimum_hangul = (
@@ -171,23 +346,37 @@ def _validate_items(
                 raise ResponseContractError(
                     f"{identifier} narrative {field} is not substantive Korean"
                 )
-            if TRADE_DIRECTIVE_PATTERN.search(text):
-                raise ResponseContractError(
-                    f"{identifier} narrative contains a trade directive"
-                )
             if RAW_CODE.search(text):
                 raise ResponseContractError(
                     f"{identifier} narrative contains a raw state code"
                 )
+            if NUMBER.search(text):
+                raise ResponseContractError(
+                    f"{identifier} narrative {field} contains renderer-owned numbers"
+                )
             if CAUSAL_OVERCLAIM.search(text):
                 raise ResponseContractError(
                     f"{identifier} narrative {field} overstates causality"
+                )
+            if DAILY_FUTURE_OR_ACTION.search(text):
+                raise ResponseContractError(
+                    f"{identifier} narrative {field} forecasts beyond the daily as-of scope"
+                )
+            if UNSUPPORTED_MOTIVE.search(text):
+                raise ResponseContractError(
+                    f"{identifier} narrative {field} invents an investor motive"
                 )
             if field not in ("headline", "stock_context") and not (
                 _is_complete_sentence(text)
             ):
                 raise ResponseContractError(
                     f"{identifier} narrative {field} is not a complete sentence"
+                )
+        for field, allowed in (enum_fields or {}).items():
+            value = str(normalized.get(field) or "")
+            if value not in set(allowed):
+                raise ResponseContractError(
+                    f"{identifier} narrative {field} must be one of {list(allowed)}"
                 )
         for field, allowed in (required_mentions or {}).get(
             identifier, {}
@@ -254,6 +443,7 @@ def _items_schema(
     id_key: str,
     expected_ids: Sequence[str],
     text_fields: Sequence[str],
+    enum_fields: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     properties: dict[str, Any] = {
         id_key: {"type": "string", "enum": list(expected_ids)}
@@ -269,7 +459,10 @@ def _items_schema(
             "type": "string",
             "minLength": limits[0],
             "maxLength": limits[1],
+            "pattern": r"^[^0-9]*$",
         }
+    for field, allowed in (enum_fields or {}).items():
+        properties[field] = {"type": "string", "enum": list(allowed)}
     return {
         "type": "object",
         "properties": {
@@ -280,7 +473,7 @@ def _items_schema(
                 "items": {
                     "type": "object",
                     "properties": properties,
-                    "required": [id_key, *text_fields],
+                    "required": [id_key, *text_fields, *(enum_fields or {})],
                     "additionalProperties": False,
                 },
             }
@@ -302,26 +495,53 @@ def _call_items(
     required_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
     required_all_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
     forbidden_mentions: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    enum_fields: Mapping[str, Sequence[str]] | None = None,
+    max_attempts: int = NARRATIVE_MAX_ATTEMPTS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if max_attempts <= 0:
+        raise ResponseContractError(
+            f"{stage} is configured for single-item generation"
+        )
     schema = _items_schema(
         id_key=id_key,
         expected_ids=expected_ids,
         text_fields=text_fields,
+        enum_fields=enum_fields,
     )
     system = (
         "You are the released Quant AI Radar LoRA explanation layer. Read the complete "
         "deterministic market context first, then explain each requested subset in that "
         "context. Use only supplied point-in-time facts. Connect market breadth, sector "
         "rotation, ETF capital transmission, the item's own price/flow relationship, "
-        "counter-evidence, and a non-trading confirmation condition. Write concrete Korean "
-        "report prose. Do not write digits, percentages, dates, raw code labels, instructions, "
-        "or buy/sell orders; the renderer owns every exact number. Preserve the requested "
-        "item order. End every prose field except stock_context as a complete sentence. "
-        "Never infer a security's sector when sector_memberships is empty; use the exact "
-        "phrase '제공된 직접 섹터 연결 근거 없음'. Describe price and ETF flow as "
+        "counter-evidence, and learned historical-pattern interpretation. Explain only the "
+        "current as-of structure; do not forecast a future return or classify a buy/sell action. "
+        "Write concrete Korean report prose. Do not write digits, percentages, dates, "
+        "raw code labels; the renderer owns every exact number. This report cannot execute "
+        "orders. Do not infer investor psychology, expectations, interest, preference, or "
+        "intent from price and ETF Flow. In Korean prose, do not use 투자자, 기관, "
+        "심리, 기대, 관심, 선호, or 의도 to explain observed price/flow structure. "
+        "Preserve the requested item order. "
+        "End every prose field except stock_context as a complete sentence. "
+        "Never infer a security's sector when sector_memberships is empty. In that case, "
+        "group_context must contain the exact phrase '제공된 직접 섹터 연결 근거 없음' "
+        "and must not name any sector, cluster, industry, or consumer category. "
+        "Every headline must include its requested symbol and a substantive Korean "
+        "sentence; never return a ticker alone. "
+        "Describe price and ETF flow as "
         "aligned, divergent, or associated; never claim that one causes or affects the "
         "other. Return JSON only. /no_think"
     )
+    unsupported_group_symbols = sorted((forbidden_mentions or {}).keys())
+    if unsupported_group_symbols:
+        system += (
+            " UNSUPPORTED_GROUP_SYMBOLS="
+            f"{canonical_json(unsupported_group_symbols)}. For every one of these "
+            "symbols, group_context must be exactly the symbol followed by the phrase "
+            "'제공된 직접 섹터 연결 근거 없음' and a neutral statement that no direct "
+            "group link was supplied. Do not copy any sector, industry, consumer, or "
+            "cluster label from COMPLETE_MARKET_CONTEXT or another item into those "
+            "group_context fields."
+        )
     user = (
         f"STAGE={stage}\n"
         f"EXPECTED_IDS={canonical_json(list(expected_ids))}\n"
@@ -329,7 +549,12 @@ def _call_items(
         f"REQUESTED_SUBSET={canonical_json(list(batch_context))}\n"
         f"REQUIRED_MENTIONS={canonical_json(required_mentions or {})}\n"
         f"REQUIRED_ALL_MENTIONS={canonical_json(required_all_mentions or {})}\n"
-        f"FORBIDDEN_MENTIONS={canonical_json(forbidden_mentions or {})}"
+        f"FORBIDDEN_MENTIONS={canonical_json(forbidden_mentions or {})}\n"
+        f"UNSUPPORTED_GROUP_SYMBOLS={canonical_json(unsupported_group_symbols)}\n"
+        "UNSUPPORTED_GROUP_RULE=If sector_memberships is empty, write the exact Korean "
+        "phrase '제공된 직접 섹터 연결 근거 없음' in group_context for every listed "
+        "UNSUPPORTED_GROUP_SYMBOLS ticker, and do not write any sector or category label, "
+        "including generic labels."
     )
     traces: list[dict[str, Any]] = []
     base_messages = [
@@ -337,7 +562,7 @@ def _call_items(
         {"role": "user", "content": user},
     ]
     contract_error = ""
-    for attempt in range(1, 4):
+    for attempt in range(1, max_attempts + 1):
         messages = list(base_messages)
         if contract_error:
             messages.append(
@@ -347,21 +572,36 @@ def _call_items(
                         f"CONTRACT_ERROR={contract_error}\n"
                         "Return every expected item exactly once and in the exact "
                         "requested order. Every prose field must be a complete Korean "
-                        "report sentence with no digits, raw code labels, or trade "
-                        "directives. End every prose field except stock_context as a "
+                        "report sentence with no digits or raw code labels. Preserve direct "
+                        "Do not write investor motives, future possibilities, or causal claims. "
+                        "Do not use 투자자, 기관, 심리, 기대, 관심, 선호, or 의도; "
+                        "rewrite those claims as observable price/flow association. "
+                        "End every prose field except stock_context as a "
                         "complete sentence. Obey REQUIRED_MENTIONS and "
                         "REQUIRED_ALL_MENTIONS exactly and do not use any "
-                        "FORBIDDEN_MENTIONS. Describe association without causal claims."
+                        "FORBIDDEN_MENTIONS. If sector_memberships is empty, replace "
+                        "group_context for each UNSUPPORTED_GROUP_SYMBOLS ticker with the "
+                        "exact phrase '제공된 직접 섹터 연결 근거 없음' and remove every "
+                        "sector/category label. Ensure every headline includes its symbol "
+                        "and a substantive Korean sentence, never a ticker alone. Describe association "
+                        "without causal claims."
                     ),
                 }
             )
         try:
             response, trace = client.complete_messages(
                 messages=messages,
-                max_tokens=2600,
+                max_tokens=min(3600, 2400 * len(expected_ids)),
                 response_schema=schema,
             )
             traces.append(trace)
+            response, native_adapter = _adapt_native_narrative_items(
+                response,
+                id_key=id_key,
+                expected_ids=expected_ids,
+                text_fields=text_fields,
+                enum_fields=enum_fields,
+            )
             items = _validate_items(
                 response,
                 id_key=id_key,
@@ -370,13 +610,19 @@ def _call_items(
                 required_mentions=required_mentions,
                 required_all_mentions=required_all_mentions,
                 forbidden_mentions=forbidden_mentions,
+                enum_fields=enum_fields,
             )
+            trace["native_contract_adapter_applied"] = native_adapter
             break
         except (ModelResponseParseError, ResponseContractError) as exc:
             if isinstance(exc, ModelResponseParseError) and exc.trace:
                 traces.append(exc.trace)
             contract_error = f"{type(exc).__name__}: {exc}"
-            if attempt == 3:
+            if attempt == max_attempts:
+                if not isinstance(exc, ModelResponseParseError):
+                    setattr(exc, "trace", traces[-1] if traces else None)
+                    if "response" in locals():
+                        setattr(exc, "raw_content", canonical_json(response))
                 raise
     else:
         raise ResponseContractError(f"{stage} exhausted narrative attempts")
@@ -393,8 +639,14 @@ def _cached_call_items(
     checkpoint_dir: Path | None,
     **kwargs: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    split_on_failure = bool(kwargs.pop("split_on_failure", False))
     if checkpoint_dir is None:
-        return _call_items(**kwargs)
+        try:
+            return _call_items(**kwargs)
+        except (ModelResponseParseError, ResponseContractError) as exc:
+            if split_on_failure:
+                return _split_failed_batch(kwargs=kwargs, error=exc)
+            raise
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     stage = str(kwargs["stage"])
     fingerprint_value = {
@@ -409,6 +661,7 @@ def _cached_call_items(
             "required_mentions",
             "required_all_mentions",
             "forbidden_mentions",
+            "enum_fields",
         )
     }
     fingerprint_value["contract_version"] = NARRATIVE_CONTRACT_VERSION
@@ -427,11 +680,25 @@ def _cached_call_items(
                 required_mentions=kwargs.get("required_mentions"),
                 required_all_mentions=kwargs.get("required_all_mentions"),
                 forbidden_mentions=kwargs.get("forbidden_mentions"),
+                enum_fields=kwargs.get("enum_fields"),
             )
             trace = dict(cached.get("trace") or {})
             trace["cache_hit"] = True
             return items, trace
-    items, trace = _call_items(**kwargs)
+    try:
+        items, trace = _call_items(**kwargs)
+    except (ModelResponseParseError, ResponseContractError) as exc:
+        if not split_on_failure:
+            _write_failed_narrative_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                stage=stage,
+                error=exc,
+            )
+            raise
+        items, trace = _split_failed_batch(
+            kwargs={**kwargs, "checkpoint_dir": checkpoint_dir},
+            error=exc,
+        )
     value = {
         "schema_version": "quant.ai_radar_narrative_stage.v1",
         "input_sha256": input_sha,
@@ -445,6 +712,82 @@ def _cached_call_items(
     )
     os.replace(temporary, path)
     return items, trace
+
+
+def _write_failed_narrative_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    stage: str,
+    error: Exception,
+) -> None:
+    value = {
+        "schema_version": "quant.ai_radar_narrative_failure.v1",
+        "stage": stage,
+        "error": f"{type(error).__name__}: {error}",
+        "trace": getattr(error, "trace", None),
+        "raw_content": getattr(error, "raw_content", None),
+    }
+    path = checkpoint_dir / f"{stage}.failure.json"
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _split_failed_batch(
+    *,
+    kwargs: Mapping[str, Any],
+    error: Exception,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    expected_ids = list(kwargs.get("expected_ids") or [])
+    batch_context = list(kwargs.get("batch_context") or [])
+    if len(expected_ids) <= 1 or len(batch_context) != len(expected_ids):
+        raise error
+    base_stage = str(kwargs.get("stage") or "narrative_batch")
+    items: list[dict[str, Any]] = []
+    sub_stages: list[dict[str, Any]] = []
+    for index, identifier in enumerate(expected_ids, 1):
+        single = dict(kwargs)
+        single["stage"] = f"{base_stage}_item_{index}"
+        single["expected_ids"] = [identifier]
+        single["batch_context"] = [batch_context[index - 1]]
+        single["max_attempts"] = NARRATIVE_MAX_ATTEMPTS
+        for key in (
+            "required_mentions",
+            "required_all_mentions",
+            "forbidden_mentions",
+        ):
+            mapping = kwargs.get(key)
+            single[key] = (
+                {identifier: dict(mapping.get(identifier) or {})}
+                if isinstance(mapping, Mapping)
+                else None
+            )
+        checkpoint_dir = single.pop("checkpoint_dir", None)
+        single_items, single_trace = _cached_call_items(
+            checkpoint_dir=checkpoint_dir,
+            split_on_failure=False,
+            **single,
+        )
+        items.extend(single_items)
+        sub_stages.append(single_trace)
+    return items, {
+        "stage": base_stage,
+        "batch_fallback": "single_item_after_contract_failure",
+        "batch_error": f"{type(error).__name__}: {error}",
+        "contract_attempts": sum(
+            int(stage.get("contract_attempts") or 0) for stage in sub_stages
+        ),
+        "contract_repair_applied": True,
+        "calls": [
+            call
+            for stage in sub_stages
+            for call in (stage.get("calls") or [])
+        ],
+        "sub_stages": sub_stages,
+    }
 
 
 def _parse_related_stock(value: Any) -> str:
@@ -614,6 +957,148 @@ def _security_contexts(
     return contexts
 
 
+def _native_limitation_text(values: Sequence[Any]) -> str:
+    labels = {
+        "price_and_etf_flow_signals_diverge": "가격과 ETF 자금 신호가 엇갈립니다.",
+        "historical_backfill_not_true_as_observed_point_in_time": (
+            "과거 원장은 당시 관측 화면과 동일하지 않다는 제한이 있습니다."
+        ),
+        "no_etf_flow_visible_under_session_lag_policy": (
+            "가시성 지연 정책을 통과한 ETF 자금 근거가 없습니다."
+        ),
+        "insufficient_price_history_for_short_horizon_statistics": (
+            "가격 관측 이력이 짧아 단기 통계 근거가 제한됩니다."
+        ),
+        "mixed_flow_currencies_prevent_aggregation": (
+            "자금 통화가 섞여 합산 해석이 제한됩니다."
+        ),
+    }
+    rendered = [labels.get(str(value), "추가 확인이 필요한 제한 근거가 있습니다.") for value in values]
+    return rendered[0] if rendered else "네이티브 판단에 별도 제한 근거가 기록되지 않았습니다."
+
+
+def build_native_judgement_narratives(
+    *,
+    aggregate: Mapping[str, Any],
+    radar: Mapping[str, Any],
+    market_judgement: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Render only the model's training-native judgement contract."""
+
+    dashboard = build_market_dashboard(aggregate, radar)
+    sector_items: list[dict[str, Any]] = []
+    for row in radar.get("integrated_rotation_clusters") or []:
+        cluster = str(row.get("integrated_cluster") or "비분류")
+        state_label = label_rotation_state(row.get("integrated_state"))
+        tickers = [
+            _parse_related_stock(value)
+            for value in (row.get("top_related_stocks") or [])[:4]
+            if _parse_related_stock(value)
+        ]
+        sector_items.append(
+            {
+                "cluster": cluster,
+                "headline": f"{cluster} · {state_label}",
+                "explanation": (
+                    f"{cluster}은 공통 DB 가격·ETF 자금 집계에서 {state_label} 상태로 분류됩니다."
+                ),
+                "counterpoint": (
+                    "구성 종목의 학습 모델 판단에는 같은 방향과 괴리 방향이 함께 포함될 수 있습니다."
+                ),
+                "stock_context": ", ".join(tickers),
+            }
+        )
+
+    material_symbols = _material_symbols(dashboard)
+    contexts = _security_contexts(material_symbols, results, radar)
+    by_symbol = {str(row.get("symbol") or ""): row for row in results}
+    security_items: list[dict[str, Any]] = []
+    for context in contexts:
+        symbol = str(context["symbol"])
+        judgement = (by_symbol[symbol].get("judgement") or {})
+        interpretation = judgement.get("interpretation") or {}
+        regime_label = label_regime(judgement.get("regime"))
+        price_label = label_signal(interpretation.get("price_signal"))
+        flow_label = label_signal(interpretation.get("etf_flow_signal"))
+        memberships = context.get("sector_memberships") or []
+        if memberships:
+            cluster = str(memberships[0].get("cluster") or "비분류")
+            group_context = f"{symbol}는 {cluster} 연결이 제공된 데이터에서 확인됩니다."
+        else:
+            group_context = f"{symbol}는 제공된 직접 섹터 연결 근거 없음으로 분류됩니다."
+        contributors = context.get("brief", {}).get("top_contributing_etfs") or []
+        etf = str((contributors[0] if contributors else {}).get("etf_ticker") or "")
+        etf_transmission = (
+            f"{etf}가 제공된 구성종목 ETF 자금 전달 근거에 포함됩니다."
+            if etf
+            else "가시성 조건을 통과한 직접 ETF 자금 전달 근거가 없습니다."
+        )
+        counter_values = list(judgement.get("counter_evidence") or [])
+        unknown_values = list(judgement.get("unknowns") or [])
+        security_items.append(
+            {
+                "symbol": symbol,
+                "headline": f"{symbol} · {regime_label}",
+                "group_context": group_context,
+                "etf_transmission": etf_transmission,
+                "counterpoint": _native_limitation_text(counter_values),
+                "watch_condition": _native_limitation_text(unknown_values),
+                "learned_pattern": (
+                    f"학습 모델은 현재 가격과 ETF 자금의 결합을 {regime_label} 패턴으로 분류했습니다."
+                ),
+                "pattern_evidence": (
+                    f"학습 입력에서 가격 신호는 {price_label}, ETF 자금 신호는 {flow_label}로 해석됐습니다."
+                ),
+                "pattern_risk": _native_limitation_text(
+                    [*counter_values, *unknown_values]
+                ),
+            }
+        )
+
+    named = material_symbols[:3]
+    selection_summary = (
+        f"주요 종목은 {', '.join(named)}입니다. "
+        "각 종목의 학습 모델 네이티브 판단과 ETF 전달 근거를 함께 확인합니다."
+        if named
+        else "학습 모델의 적격 주요 종목이 확인되지 않았습니다. 현재 원장의 품질 조건을 먼저 확인합니다."
+    )
+    editorial = {
+        "headline": "학습 모델 네이티브 판단으로 본 오늘의 시장 구조",
+        "executive_summary": str(market_judgement.get("summary") or "학습 모델 판단을 집계했습니다."),
+        "rotation_summary": "공통 DB 섹터 회전 집계와 종목별 학습 모델 패턴을 같은 기준일에서 대조합니다.",
+        "selection_summary": selection_summary,
+        "risk_summary": "가격과 ETF 자금이 엇갈리거나 가시성 제한이 기록된 항목을 반대 근거로 함께 봅니다.",
+    }
+    calls = [dict(row.get("trace") or {}) for row in results]
+    narratives = {
+        "schema_version": NARRATIVE_SCHEMA_VERSION,
+        "coverage_policy": "training-native judgements aggregated without extra model prompts",
+        "generation_source": "quant.analysis_packet.v3 training-native outputs",
+        "sector_explanations": sector_items,
+        "security_explanations": security_items,
+        "editorial": editorial,
+        "sector_count": len(sector_items),
+        "security_count": len(security_items),
+        "model_call_count": len(calls),
+        "learned_pattern_prompt_contract": "quant.analysis_packet.v3",
+    }
+    trace = {
+        "schema_version": "quant.ai_radar_native_judgement_trace.v1",
+        "stages": [
+            {
+                "stage": "training_native_judgement_aggregation",
+                "contract_attempts": 0,
+                "contract_repair_applied": False,
+                "calls": calls,
+            }
+        ],
+        "model_call_count": len(calls),
+        "learned_pattern_prompt_contract": "quant.analysis_packet.v3",
+    }
+    return narratives, trace
+
+
 def _editorial_schema() -> dict[str, Any]:
     fields = (
         "headline",
@@ -662,17 +1147,25 @@ def _validate_editorial(
             raise ResponseContractError(
                 f"editorial {field} is not substantive Korean"
             )
-        if TRADE_DIRECTIVE_PATTERN.search(text):
-            raise ResponseContractError(
-                f"editorial {field} contains a trade directive"
-            )
         if RAW_CODE.search(text):
             raise ResponseContractError(
                 f"editorial {field} contains a raw state code"
             )
+        if NUMBER.search(text):
+            raise ResponseContractError(
+                f"editorial {field} contains renderer-owned numbers"
+            )
         if CAUSAL_OVERCLAIM.search(text):
             raise ResponseContractError(
                 f"editorial {field} overstates causality"
+            )
+        if DAILY_FUTURE_OR_ACTION.search(text):
+            raise ResponseContractError(
+                f"editorial {field} forecasts beyond the daily as-of scope"
+            )
+        if UNSUPPORTED_MOTIVE.search(text):
+            raise ResponseContractError(
+                f"editorial {field} invents an investor motive"
             )
         if field != "headline" and not _is_complete_sentence(text):
             raise ResponseContractError(
@@ -733,15 +1226,20 @@ def _editorial_call(
         "Explain the dominant structure, where rotation is broad or narrow, why the selected "
         "stocks matter inside their groups, and the strongest counter-evidence. Use only the "
         "supplied facts. Write polished report prose without digits, dates, raw code labels, "
-        "meta instructions, or trade directives. Securities without supplied direct sector "
+        "or meta instructions. Explain only the current as-of market structure and do not "
+        "forecast future returns, write buy/sell classifications, or infer investor motives. "
+        "Do not use 투자자, 기관, 심리, 기대, 관심, 선호, or 의도; describe only "
+        "observable price/flow association. "
+        "Securities without supplied direct sector "
         "links are explained in separate cards and must be omitted entirely from every "
         f"editorial field. OMIT_SECURITY_SYMBOLS={canonical_json(unsupported_symbols)}. "
         "The selection_summary must name at least three securities from "
         f"SUPPORTED_GROUPED_SYMBOLS={canonical_json(supported_symbols)}. Describe association "
         "without saying that ETF flow or sector rotation causes or affects price. Write "
-        "selection_summary as three to nine short, non-repeating sentences, each ending "
-        "with a period and covering selected names, their evidence relationship, and "
-        "counter-evidence. "
+        "selection_summary as exactly three short, distinct sentences, each ending "
+        "with a period. Start each sentence with a different symbol from "
+        "SUPPORTED_GROUPED_SYMBOLS; cover the selected name, its evidence relationship, "
+        "and counter-evidence without repeating any sentence. "
         "End every field as a complete sentence. Return JSON only. /no_think"
     )
     user = (
@@ -754,26 +1252,34 @@ def _editorial_call(
     )
     traces: list[dict[str, Any]] = []
     contract_error = ""
-    for attempt in range(1, 4):
+    for attempt in range(1, NARRATIVE_MAX_ATTEMPTS + 1):
         repair = (
             ""
             if not contract_error
             else (
                 f"\nCONTRACT_ERROR={contract_error}\n"
                 "Rewrite every required field as substantive Korean report prose. "
-                "Do not omit fields, use digits, expose raw codes, or give trade directives. "
+                "Do not omit fields, use digits, expose raw codes, forecast returns, add buy/sell classifications, or infer investor motives. "
+                "Do not use 투자자, 기관, 심리, 기대, 관심, 선호, or 의도; "
+                "rewrite those claims as observable price/flow association. "
                 "Do not mention any UNSUPPORTED_SECTOR_ASSIGNMENT_SYMBOLS ticker anywhere "
                 "in the editorial; its separate security card owns that explanation. "
-                "Name at least three SUPPORTED_GROUPED_SYMBOLS in selection_summary and "
-                "describe association without causal language. Rewrite selection_summary "
-                "as three to nine short, non-repeating sentences ending with periods."
+                "Name at least three different SUPPORTED_GROUPED_SYMBOLS in selection_summary "
+                "and describe association without causal language. Rewrite selection_summary "
+                "as exactly three distinct sentences: begin each sentence with a different "
+                "listed symbol, end each with a period, and do not repeat a sentence."
             )
         )
         try:
             response, trace = client.complete(
                 system=system,
                 user=user + repair,
-                max_tokens=2400,
+                # The editorial prompt contains every sector and selected-security
+                # explanation. Keep the completion budget below the FLOW 16K context
+                # ceiling even when the input reaches the bounded 14K-token edge.
+                # Keep the final editor inside the FLOW 16K context after the
+                # explicit unsupported-symbol guard is included in the prompt.
+                max_tokens=1200,
                 response_schema=_editorial_schema(),
             )
             traces.append(trace)
@@ -784,14 +1290,14 @@ def _editorial_call(
                 "stage": "editorial",
                 "contract_attempts": len(traces),
                 "contract_repair_applied": len(traces) > 1,
-                "program_number_strip_applied": stripped,
+                "program_prose_normalization_applied": stripped,
                 "calls": traces,
             }
         except (ModelResponseParseError, ResponseContractError) as exc:
             if isinstance(exc, ModelResponseParseError) and exc.trace:
                 traces.append(exc.trace)
             contract_error = f"{type(exc).__name__}: {exc}"
-            if attempt == 3:
+            if attempt == NARRATIVE_MAX_ATTEMPTS:
                 raise
     raise ResponseContractError("editorial exhausted narrative attempts")
 
@@ -910,6 +1416,50 @@ def validate_report_narratives(report: Mapping[str, Any]) -> None:
         raise ResponseContractError(
             "v2 security narrative coverage does not match the deterministic lanes"
         )
+    required_security_fields = (
+        "headline",
+        "group_context",
+        "etf_transmission",
+        "counterpoint",
+        "watch_condition",
+        "learned_pattern",
+        "pattern_evidence",
+        "pattern_risk",
+    )
+    for row in security_rows:
+        if not isinstance(row, Mapping):
+            raise ResponseContractError("v2 security explanation must be an object")
+        symbol = str(row.get("symbol") or "")
+        if "action_view" in row:
+            raise ResponseContractError(
+                f"{symbol} daily security explanation must not contain action_view"
+            )
+        for field in required_security_fields:
+            text = str(row.get(field) or "").strip()
+            if not text:
+                raise ResponseContractError(
+                    f"{symbol} security explanation is missing {field}"
+                )
+            if NUMBER.search(text):
+                raise ResponseContractError(
+                    f"{symbol} security explanation {field} contains renderer-owned numbers"
+                )
+            if RAW_CODE.search(text):
+                raise ResponseContractError(
+                    f"{symbol} security explanation {field} contains a raw state code"
+                )
+            if CAUSAL_OVERCLAIM.search(text):
+                raise ResponseContractError(
+                    f"{symbol} security explanation {field} overstates causality"
+                )
+            if DAILY_FUTURE_OR_ACTION.search(text):
+                raise ResponseContractError(
+                    f"{symbol} security explanation {field} forecasts beyond the daily as-of scope"
+                )
+            if UNSUPPORTED_MOTIVE.search(text):
+                raise ResponseContractError(
+                    f"{symbol} security explanation {field} invents an investor motive"
+                )
 
 
 def build_multistage_narratives(
@@ -939,20 +1489,16 @@ def build_multistage_narratives(
         payload: tuple[int, list[Mapping[str, Any]]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         batch_number, batch = payload
-        prepared_batch = [
-            {
-                **dict(row),
-                "required_state_phrase": label_rotation_state(
-                    row.get("integrated_state")
-                ),
-            }
-            for row in batch
-        ]
+        prepared_batch = [dict(row) for row in batch]
         expected = [
             str(row.get("integrated_cluster") or "") for row in prepared_batch
         ]
         return _cached_call_items(
             checkpoint_dir=checkpoint_dir,
+            split_on_failure=len(prepared_batch) > 1,
+            max_attempts=(
+                0 if len(prepared_batch) > 1 else NARRATIVE_MAX_ATTEMPTS
+            ),
             client=client,
             stage=f"sector_batch_{batch_number}",
             id_key="cluster",
@@ -972,12 +1518,6 @@ def build_multistage_narratives(
                         for value in (row.get("top_related_stocks") or [])[:4]
                         if _parse_related_stock(value)
                     ]
-                }
-                for row in prepared_batch
-            },
-            required_all_mentions={
-                str(row.get("integrated_cluster") or ""): {
-                    "headline": [str(row["required_state_phrase"])]
                 }
                 for row in prepared_batch
             },
@@ -1003,6 +1543,8 @@ def build_multistage_narratives(
         expected = [str(row["symbol"]) for row in batch]
         return _cached_call_items(
             checkpoint_dir=checkpoint_dir,
+            split_on_failure=len(batch) > 1,
+            max_attempts=(0 if len(batch) > 1 else NARRATIVE_MAX_ATTEMPTS),
             client=client,
             stage=f"security_batch_{batch_number}",
             id_key="symbol",
@@ -1013,6 +1555,9 @@ def build_multistage_narratives(
                 "etf_transmission",
                 "counterpoint",
                 "watch_condition",
+                "learned_pattern",
+                "pattern_evidence",
+                "pattern_risk",
             ),
             global_context=global_context,
             batch_context=batch,
@@ -1067,10 +1612,22 @@ def build_multistage_narratives(
             },
             forbidden_mentions={
                 str(row["symbol"]): {
-                    "group_context": list(CLUSTER_TERMS)
+                    "group_context": (
+                        list(CLUSTER_TERMS)
+                        if not row.get("sector_memberships")
+                        else [
+                            *_unsupported_cluster_terms(
+                                str(
+                                    row.get(
+                                        "sector_memberships", [{}]
+                                    )[0].get("cluster")
+                                )
+                            ),
+                            *NO_DIRECT_CLUSTER_LINK_TERMS,
+                        ]
+                    )
                 }
                 for row in batch
-                if not row.get("sector_memberships")
             },
         )
 
@@ -1109,8 +1666,10 @@ def build_multistage_narratives(
         "sector_count": len(sector_items),
         "security_count": len(security_items),
         "model_call_count": len(traces),
+        "learned_pattern_prompt_contract": LEARNED_PATTERN_PROMPT_CONTRACT,
     }, {
         "schema_version": "quant.ai_radar_multistage_narrative_trace.v1",
         "stages": traces,
         "model_call_count": len(traces),
+        "learned_pattern_prompt_contract": LEARNED_PATTERN_PROMPT_CONTRACT,
     }

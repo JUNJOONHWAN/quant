@@ -165,6 +165,8 @@ def load_shared_market_binding(
     if status_schema not in {
         "quant.market_structure_oracle.incremental.v2",
         "quant.market_structure_oracle.incremental.v3",
+        "quant.market_structure_oracle.incremental.v4",
+        "quant.market_structure_oracle.incremental.v5",
     }:
         raise SharedMarketStoreError(
             f"unsupported Oracle incremental schema: {status_schema}"
@@ -225,14 +227,35 @@ def load_shared_market_binding(
     with sqlite3.connect(
         f"file:{incremental}?mode=ro", uri=True
     ) as incremental_connection:
+        target_price_sources = (
+            ("fmp",)
+            if status_schema in {
+                "quant.market_structure_oracle.incremental.v4",
+                "quant.market_structure_oracle.incremental.v5",
+            }
+            else ("massive", "fmp")
+        )
         target_rows = int(
             _scalar(
                 incremental_connection,
-                """
+                (
+                    """
                 SELECT COUNT(DISTINCT symbol) FROM daily_observations
-                WHERE source IN ('massive','fmp') AND trade_date=?
+                WHERE source IN ({}) AND trade_date=?
+                """.format(",".join("?" for _ in target_price_sources))
+                ),
+                (*target_price_sources, target),
+            )
+            or 0
+        )
+        massive_price_rows = int(
+            _scalar(
+                incremental_connection,
+                """
+                SELECT COUNT(*) FROM daily_observations
+                WHERE source='massive' AND trade_date>?
                 """,
-                (target,),
+                (base_end,),
             )
             or 0
         )
@@ -322,7 +345,17 @@ def load_shared_market_binding(
         raise SharedMarketStoreError(
             f"unsupported Oracle snapshot seal: {seal_schema}"
         )
-    if source_contract != "oracle_owned_fmp_massive_no_etf_radar_dependency":
+    expected_source_contract = {
+        "quant.market_structure_oracle.incremental.v5": (
+            "oracle_owned_fmp_ultimate_bulk_price_lifecycle_events_"
+            "massive_etf_flow_corporate_actions_no_etf_radar_dependency"
+        ),
+        "quant.market_structure_oracle.incremental.v4": (
+            "oracle_owned_fmp_price_massive_etf_flow_corporate_actions_"
+            "no_etf_radar_dependency"
+        ),
+    }.get(status_schema, "oracle_owned_fmp_massive_no_etf_radar_dependency")
+    if source_contract != expected_source_contract:
         raise SharedMarketStoreError(
             f"unexpected Oracle source contract: {source_contract}"
         )
@@ -338,7 +371,11 @@ def load_shared_market_binding(
         raise SharedMarketStoreError(
             "Oracle status and SQLite snapshot seal do not match"
         )
-    if status_schema == "quant.market_structure_oracle.incremental.v3":
+    if status_schema in {
+        "quant.market_structure_oracle.incremental.v3",
+        "quant.market_structure_oracle.incremental.v4",
+        "quant.market_structure_oracle.incremental.v5",
+    }:
         try:
             corporate_summary = corporate_action_summary(incremental, target)
         except sqlite3.Error as exc:
@@ -364,6 +401,125 @@ def load_shared_market_binding(
             "visible_record_count": 0,
             "visible_projection_sha256": hashlib.sha256(b"[]").hexdigest(),
         }
+    if status_schema in {
+        "quant.market_structure_oracle.incremental.v4",
+        "quant.market_structure_oracle.incremental.v5",
+    }:
+        if massive_price_rows:
+            raise SharedMarketStoreError(
+                "Massive stock daily rows violate the FMP-only price contract"
+            )
+        coverage = status.get("symbol_coverage_gate") or {}
+        target_coverage = (coverage.get("sessions") or {}).get(target) or {}
+        ledger = target_coverage.get("ledger") or {}
+        ledger_path = Path(str(ledger.get("path") or "")).expanduser()
+        if (
+            coverage.get("status") != "complete"
+            or int(coverage.get("error_count") or 0) != 0
+            or target_coverage.get("status") != "complete"
+            or int(target_coverage.get("error_count") or 0) != 0
+            or not ledger_path.is_file()
+            or _sha256(ledger_path) != str(ledger.get("sha256") or "")
+        ):
+            raise SharedMarketStoreError(
+                "Oracle FMP BAR/NO_BAR coverage ledger is incomplete or unsealed"
+            )
+        with sqlite3.connect(
+            f"file:{incremental}?mode=ro", uri=True
+        ) as lineage_connection:
+            lineage_rows = [
+                list(row)
+                for row in lineage_connection.execute(
+                    """
+                    SELECT old_symbol,new_symbol,event_date,
+                           first_available_date,record_hash
+                    FROM oracle_symbol_changes
+                    WHERE event_date<=? AND first_available_date<=?
+                    ORDER BY event_date,old_symbol,new_symbol
+                    """,
+                    (target, target),
+                )
+            ]
+            lineage_projection_count = int(
+                _scalar(
+                    lineage_connection,
+                    "SELECT COUNT(*) FROM oracle_symbol_changes",
+                )
+                or 0
+            )
+            lineage_version_count = int(
+                _scalar(
+                    lineage_connection,
+                    "SELECT COUNT(*) FROM oracle_symbol_change_versions",
+                )
+                or 0
+            )
+        expected_lineage = status.get("symbol_lineage") or {}
+        observed_lineage_sha = hashlib.sha256(
+            canonical_json(lineage_rows).encode("utf-8")
+        ).hexdigest()
+        if (
+            lineage_projection_count
+            != int(expected_lineage.get("projection_count") or 0)
+            or lineage_version_count
+            != int(expected_lineage.get("version_count") or 0)
+            or len(lineage_rows)
+            != int(expected_lineage.get("visible_as_of_count") or 0)
+            or observed_lineage_sha
+            != str(expected_lineage.get("visible_projection_sha256") or "")
+        ):
+            raise SharedMarketStoreError(
+                "Oracle FMP ticker-change lineage does not match the snapshot seal"
+            )
+        if status_schema == "quant.market_structure_oracle.incremental.v5":
+            with sqlite3.connect(
+                f"file:{incremental}?mode=ro", uri=True
+            ) as lifecycle_connection:
+                lifecycle_rows = [
+                    list(row)
+                    for row in lifecycle_connection.execute(
+                        """
+                        SELECT event_type,event_key,symbol,related_symbol,event_date,
+                               announcement_date,first_available_date,record_hash
+                        FROM oracle_lifecycle_events
+                        WHERE event_date<=? AND first_available_date<=?
+                        ORDER BY event_date,event_type,symbol,event_key
+                        """,
+                        (target, target),
+                    )
+                ]
+                lifecycle_projection_count = int(_scalar(
+                    lifecycle_connection,
+                    "SELECT COUNT(*) FROM oracle_lifecycle_events",
+                ) or 0)
+                lifecycle_version_count = int(_scalar(
+                    lifecycle_connection,
+                    "SELECT COUNT(*) FROM oracle_lifecycle_event_versions",
+                ) or 0)
+            expected_lifecycle = status.get("lifecycle_events") or {}
+            observed_lifecycle_sha = hashlib.sha256(
+                canonical_json(lifecycle_rows).encode("utf-8")
+            ).hexdigest()
+            if (
+                lifecycle_projection_count != int(expected_lifecycle.get("projection_count") or 0)
+                or lifecycle_version_count != int(expected_lifecycle.get("version_count") or 0)
+                or len(lifecycle_rows) != int(expected_lifecycle.get("visible_as_of_count") or 0)
+                or observed_lifecycle_sha != str(expected_lifecycle.get("visible_projection_sha256") or "")
+            ):
+                raise SharedMarketStoreError(
+                    "Oracle lifecycle-event registry does not match the snapshot seal"
+                )
+        else:
+            lifecycle_projection_count = 0
+            lifecycle_version_count = 0
+            observed_lifecycle_sha = hashlib.sha256(b"[]").hexdigest()
+    else:
+        lineage_projection_count = 0
+        lineage_version_count = 0
+        observed_lineage_sha = hashlib.sha256(b"[]").hexdigest()
+        lifecycle_projection_count = 0
+        lifecycle_version_count = 0
+        observed_lifecycle_sha = hashlib.sha256(b"[]").hexdigest()
 
     effective_candidates = [
         value
@@ -421,6 +577,12 @@ def load_shared_market_binding(
             "corporate_action_projection_sha256": corporate_summary[
                 "visible_projection_sha256"
             ],
+            "symbol_lineage_projection_count": lineage_projection_count,
+            "symbol_lineage_version_count": lineage_version_count,
+            "symbol_lineage_visible_sha256": observed_lineage_sha,
+            "lifecycle_event_projection_count": lifecycle_projection_count,
+            "lifecycle_event_version_count": lifecycle_version_count,
+            "lifecycle_event_visible_sha256": observed_lifecycle_sha,
             "snapshot_seal": {
                 "schema_version": seal_schema,
                 "source_contract": source_contract,

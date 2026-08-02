@@ -106,6 +106,8 @@ def _security_html(
     facts = judgement.get("facts") or {}
     brief = build_security_brief(judgement)
     narrative = narrative or {}
+    analog_forecast = result.get("historical_analog_forecast") or {}
+    qwen27_forecast = result.get("qwen27_forecast") or {}
     confirmation_rows = "".join(
         "<li><strong>{}</strong> · {} <span class=\"muted\">({})</span></li>".format(
             _e(row.get("label")),
@@ -130,6 +132,26 @@ def _security_html(
             _e(row.get("flow_training_available_session_date")),
         )
         for row in brief["flow"]["top_contributing_etfs"]
+    )
+    analog_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            _e(f"{row.get('horizon_sessions')}일"),
+            _e(whole(row.get("sample_count"))),
+            _e(whole(row.get("positive_probability_pct"), suffix="%")),
+            _e(whole(row.get("median_return_pct"), signed=True, suffix="%")),
+            _e(
+                "{} ~ {}".format(
+                    whole(row.get("p25_return_pct"), signed=True, suffix="%"),
+                    whole(row.get("p75_return_pct"), signed=True, suffix="%"),
+                )
+            ),
+        )
+        for row in (
+            (analog_forecast.get("horizon_statistics") or {}).get(str(horizon))
+            or {}
+            for horizon in (5, 20, 60)
+        )
+        if row
     )
     if navigation_html is None:
         navigation_html = (
@@ -164,15 +186,39 @@ def _security_html(
  <section class="card"><h2>ETF Flow 전달</h2><p>{_e(brief["flow"]["summary"])}</p></section>
  <section class="card"><h2>가격–Flow 관계</h2><p>{_e(brief["relationship"]["summary"])}</p></section>
 </div>
-<section class="card"><h2>학습 모델 해석</h2>
+<section class="card"><h2>1. 8B LoRA 학습 패턴 판독</h2>
+ <div class="metric">{_e(label_regime(judgement.get("regime")))}</div>
  <p>{_e(judgement.get("conclusion"))}</p>
 </section>
+{f'''<section class="card"><h2>2. 10년 DB 유사사례의 실제 후행 결과</h2>
+ <p>동일한 분석 유형과 학습 국면 안에서 {_e(whole(analog_forecast.get("selected_analog_count")))}개 사례를 비교했습니다.</p>
+ <table><thead><tr><th>기간</th><th>표본</th><th>상승</th><th>중앙값</th><th>중간 범위</th></tr></thead>
+ <tbody>{analog_rows or '<tr><td colspan="5">완결된 유사사례 없음</td></tr>'}</tbody></table>
+ <p class="muted">결과 종료일이 현재 분석 기준일 이전인 사례만 사용하며, 조정주가를 우선합니다.</p>
+</section>''' if analog_forecast else ""}
+{f'''<section class="card callout"><h2>3. Qwen 27B 미래 판단</h2>
+ <div class="metric">{_e(qwen27_forecast.get("forecast_view"))}</div>
+ <p><strong>주 판단 기간:</strong> {_e(whole(qwen27_forecast.get("primary_horizon_sessions"), suffix="거래일"))}</p>
+ <p><strong>종합 전망:</strong> {_e(qwen27_forecast.get("thesis"))}</p>
+ <p><strong>8B 학습 패턴 활용:</strong> {_e(qwen27_forecast.get("learned_pattern_use"))}</p>
+ <p><strong>과거 유사사례 해석:</strong> {_e(qwen27_forecast.get("historical_evidence"))}</p>
+ <p><strong>현재 시장 영향:</strong> {_e(qwen27_forecast.get("market_context_effect"))}</p>
+ <p><strong>확인 근거</strong></p><ul>{_list_items(qwen27_forecast.get("supporting_evidence") or [])}</ul>
+ <p><strong>반대 근거</strong></p><ul>{_list_items(qwen27_forecast.get("counter_evidence") or [])}</ul>
+ <p><strong>판단 무효화 조건</strong></p><ul>{_list_items(qwen27_forecast.get("invalidation_conditions") or [])}</ul>
+ <p><strong>판단 신뢰도:</strong> {_e(confidence_pct(qwen27_forecast.get("confidence")))}</p>
+ <p class="muted">8B가 현재 패턴을 판독하고 Python이 과거 성과를 계산한 뒤, 27B가 두 근거를 종합합니다. 참고용이며 주문을 실행하지 않습니다.</p>
+</section>''' if qwen27_forecast else ""}
 {f'''<section class="card callout"><h2>전체 시장 속 이 종목</h2>
  <h3>{_e(narrative.get("headline"))}</h3>
  <p><strong>소속 흐름:</strong> {_e(narrative.get("group_context"))}</p>
  <p><strong>ETF 전달 경로:</strong> {_e(narrative.get("etf_transmission"))}</p>
  <p><strong>반대 근거:</strong> {_e(narrative.get("counterpoint"))}</p>
  <p><strong>다음 확인:</strong> {_e(narrative.get("watch_condition"))}</p>
+ <hr><h3>8B가 학습한 현재 패턴</h3>
+ <p><strong>학습 패턴:</strong> {_e(narrative.get("learned_pattern"))}</p>
+ <p><strong>패턴 근거:</strong> {_e(narrative.get("pattern_evidence"))}</p>
+ <p><strong>패턴 반대 근거:</strong> {_e(narrative.get("pattern_risk"))}</p>
 </section>''' if narrative else ""}
 <div class="grid">
  <section class="card"><h2>확인 증거</h2><ul>{confirmation_rows or '<li>없음</li>'}</ul></section>

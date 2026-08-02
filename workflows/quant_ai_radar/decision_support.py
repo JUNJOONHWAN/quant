@@ -471,7 +471,10 @@ def build_market_dashboard(
     confirmation = positive_confirmation + negative_confirmation
 
     rotation = []
-    for row in (radar.get("integrated_rotation_clusters") or [])[:10]:
+    # Rotation is a fixed, deterministic sector taxonomy. Keep every row so
+    # the dashboard, LoRA sector explanations, quality audit, renderer, and
+    # email all share the same coverage contract.
+    for row in radar.get("integrated_rotation_clusters") or []:
         rotation.append(
             {
                 "cluster": row.get("integrated_cluster"),
@@ -580,7 +583,7 @@ def build_market_dashboard(
             divergence_regimes,
         ),
         "policy": (
-            "confirmation lanes are reference watchlists, not buy/sell orders; "
+            "confirmation lanes are model opinion candidates and never execute orders; "
             "positive requires price and ETF Flow positive, negative requires both "
             "negative, and divergence remains a separate verification lane"
         ),
@@ -781,7 +784,7 @@ def audit_report_quality(
     narrative_checks = (
         not requires_narratives
         or narratives.get("schema_version")
-        == "quant.ai_radar_multistage_narratives.v1",
+        == "quant.ai_radar_multistage_narratives.v2",
         not requires_narratives
         or (
             len(sector_explanations) == expected_sector_count

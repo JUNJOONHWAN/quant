@@ -9,9 +9,9 @@
   "category": "report",
   "contracts": {
     "external_overlay": false,
-    "current_market_incremental_store": "under one interprocess writer lock, repair all missing NYSE sessions after immutable FMP history using Massive grouped full-market daily data, capture PIT Massive ETF Flow, refresh new/stale FMP ETF constituents, and seal one shared snapshot",
+    "current_market_incremental_store": "under one interprocess writer lock, capture the daily FMP active NASDAQ/NYSE/AMEX/CBOE master union from Ultimate stable/eod-bulk CSV, preserve raw hashes, repair only verified missing or invalid symbols through stable per-symbol EOD, register FMP symbol changes, splits, delistings, and merger/acquisition events with point-in-time versions, reject every warning or ERROR, capture PIT Massive ETF Flow, refresh FMP ETF constituents, and seal one shared snapshot",
     "etf_radar_runtime_dependency": false,
-    "new_listing_policy": "Massive grouped daily discovers all new securities; Massive flow and FMP profile facts discover new ETFs; missing constituent snapshots have refresh priority",
+    "new_listing_policy": "the daily FMP active master and FMP EOD discover new stocks and ETFs; Massive flow and FMP profile facts corroborate new ETFs; missing constituent snapshots have refresh priority",
     "flow_policy_id": "massive_etf_flow_us_sessions_v1",
     "future_returns_role": "labels_only",
     "lookahead_in_features": false,
@@ -76,5 +76,5 @@
     "timezone": "Asia/Seoul"
   },
   "schema": "hermes-independent-app-v1",
-  "updated_at": "2026-07-30T00:00:00Z"
+  "updated_at": "2026-08-01T00:00:00Z"
 }

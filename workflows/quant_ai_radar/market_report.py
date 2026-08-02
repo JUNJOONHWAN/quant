@@ -11,7 +11,6 @@ from typing import Any, Mapping, Sequence
 from .model_runtime import (
     ModelResponseParseError,
     ResponseContractError,
-    TRADE_DIRECTIVE_PATTERN,
     TrainedQuantClient,
     canonical_json,
 )
@@ -514,8 +513,6 @@ def validate_market_synthesis(
     for raw_date in __import__("re").findall(r"\b20\d{2}-\d{2}-\d{2}\b", text):
         if date.fromisoformat(raw_date) > date.fromisoformat(as_of_date):
             raise ResponseContractError("market synthesis contains a post-as-of date")
-    if TRADE_DIRECTIVE_PATTERN.search(text):
-        raise ResponseContractError("market synthesis contains a trade directive")
     semantic_issues = market_semantic_issues(value, catalog)
     if semantic_issues:
         raise ResponseContractError(
@@ -614,8 +611,8 @@ def market_contract_repair_instruction(
         "반복은 금지한다. unknowns는 실제로 아직 확인되지 않은 시장 조건을 "
         "구체적으로 적거나 없으면 빈 배열로 둔다. "
         "leading_etfs와 "
-        "affected_stocks도 각 허용 목록 안에서만 고르라. 매매 지시와 입력 "
-        "시점 이후 날짜를 포함하지 말고, summary·unknowns의 "
+        "affected_stocks도 각 허용 목록 안에서만 고르라. 직접적인 매수·매도 "
+        "의견은 보존하되 입력 시점 이후 날짜를 포함하지 말고, summary·unknowns의 "
         "모든 자연어는 한국어로 작성하며 JSON 객체만 출력하라.\n"
         f"CONTRACT_ERROR={contract_error}\n"
         f"ALLOWED_EVIDENCE_IDS_JSON={canonical_json(allowed_evidence_ids)}\n"
@@ -805,3 +802,112 @@ def synthesize_market(
         "contract_repair_applied": False,
         "program_normalizations": program_normalizations,
     }, catalog
+
+
+def synthesize_market_from_native_judgements(
+    *,
+    as_of_date: str,
+    aggregate: Mapping[str, Any],
+    radar: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Aggregate only outputs learned under the quant.analysis_packet.v3 contract."""
+
+    catalog = _evidence_catalog(aggregate, radar)
+    regime_counts = aggregate.get("regime_counts") or {}
+    positive = int(regime_counts.get("price_flow_positive_confirmation") or 0)
+    negative = int(regime_counts.get("price_flow_negative_confirmation") or 0)
+    divergence = int(regime_counts.get("price_up_flow_out_divergence") or 0) + int(
+        regime_counts.get("price_down_flow_in_divergence") or 0
+    )
+    analyzed = int(aggregate.get("analyzed_security_count") or 0)
+    if analyzed <= 0:
+        market_state = "insufficient_evidence"
+    elif positive > negative and positive > divergence:
+        market_state = "risk_on"
+    elif negative > positive and negative > divergence:
+        market_state = "risk_off"
+    elif radar.get("integrated_rotation_clusters"):
+        market_state = "rotation"
+    else:
+        market_state = "mixed"
+
+    confidence = _number(aggregate.get("mean_model_confidence"))
+    if confidence is None:
+        confidences = [
+            _number((row.get("judgement") or {}).get("confidence"))
+            for row in results
+        ]
+        valid_confidences = [value for value in confidences if value is not None]
+        confidence = fmean(valid_confidences) if valid_confidences else 0.0
+    confidence = max(0.0, min(float(confidence), 1.0))
+
+    keys = sorted(catalog)
+    rotation_ids = [key for key in keys if key.startswith("oracle.rotation_cluster.")]
+    etf_ids = [key for key in keys if key.startswith("etf.")]
+    stock_ids = [key for key in keys if key.startswith("stock.")]
+    confirmation_candidates = [
+        "aggregate.regime_counts",
+        *(rotation_ids[:1]),
+        *(etf_ids[:1]),
+        *(stock_ids[:1]),
+        "aggregate.task_type_counts",
+    ]
+    confirmation_ids = [
+        key for key in dict.fromkeys(confirmation_candidates) if key in catalog
+    ][:4]
+    contradiction_candidates = [
+        "aggregate.price_signal_counts",
+        "aggregate.etf_flow_signal_counts",
+        *[
+            key
+            for key in keys
+            if key.startswith("oracle.accumulation_cluster.")
+        ][:1],
+        "oracle.master_flow_status_counts",
+    ]
+    contradiction_ids = [
+        key
+        for key in dict.fromkeys(contradiction_candidates)
+        if key in catalog and key not in confirmation_ids
+    ][:3]
+    for key in keys:
+        if len(confirmation_ids) < 3 and key not in confirmation_ids:
+            confirmation_ids.append(key)
+        if (
+            len(contradiction_ids) < 2
+            and key not in confirmation_ids
+            and key not in contradiction_ids
+        ):
+            contradiction_ids.append(key)
+
+    result = {
+        "market_state": market_state,
+        "confidence": round(confidence, 6),
+        "summary": (
+            "학습 모델의 종목별 네이티브 판단을 집계하면 시장 가격 폭과 ETF 자금 흐름이 함께 확인되며, "
+            "섹터 회전은 종목별 강약 분화를 동반하고 괴리와 위험 신호도 동시에 남아 있습니다."
+        ),
+        "confirmations": [{"evidence_id": key} for key in confirmation_ids],
+        "contradictions": [{"evidence_id": key} for key in contradiction_ids],
+        "unknowns": [
+            "ETF 자금 자료는 공개 가시성 지연 정책에 따라 최신 가격 기준보다 늦을 수 있습니다."
+        ],
+        "leading_etfs": [key.split(".", 1)[1] for key in etf_ids[:8]],
+        "affected_stocks": [key.split(".", 1)[1] for key in stock_ids[:8]],
+        "scope": "market_and_security_analysis_not_trade_execution",
+    }
+    validated = validate_market_synthesis(
+        result,
+        as_of_date=as_of_date,
+        catalog=catalog,
+    )
+    trace = {
+        "endpoint_model": "Qwen3-8B-FLOW",
+        "source_contract": "quant.analysis_packet.v3",
+        "source_response_count": len(results),
+        "contract_attempts": 0,
+        "contract_repair_applied": False,
+        "aggregation_only": True,
+    }
+    return validated, trace, catalog

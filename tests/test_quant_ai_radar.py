@@ -17,6 +17,12 @@ from quant_dataset.shared_market import (
     load_shared_market_binding,
 )
 from quant_dataset.storage import Database, canonical_json
+from workflows.quant_ai_radar.action_assessment import (
+    ACTION_PROMPT_CONTRACT,
+    ACTION_VIEWS,
+    build_action_assessment,
+)
+from workflows.quant_ai_radar.decision_support import build_market_dashboard
 from workflows.quant_ai_radar.analyze_on_demand import (
     OnDemandError,
     _analysis_packet as on_demand_analysis_packet,
@@ -41,7 +47,9 @@ from workflows.quant_ai_radar.model_runtime import (
     ResponseContractError,
     TrainedQuantClient,
     contract_repair_instruction,
+    judgement_prohibited_violations,
     load_model_release,
+    symbol_guided_json_schema,
     validate_symbol_judgement,
 )
 from workflows.quant_ai_radar.run_queue import RadarQueue
@@ -61,6 +69,9 @@ from workflows.quant_ai_radar.selection import select_daily_inference
 from workflows.quant_ai_radar.report_renderer import (
     render_reports,
     render_single_security_html,
+)
+from workflows.quant_ai_radar.report_narratives import (
+    _unsupported_cluster_terms,
 )
 from workflows.quant_ai_radar.validate_shadow_run import validate_shadow_run
 from workflows.quant_ai_radar.validate_runtime_readiness import (
@@ -1349,6 +1360,25 @@ class QuantAiRadarTest(unittest.TestCase):
         self.assertTrue(trace["contract_repair_applied"])
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0]["messages"][1]["content"], instruction)
+        self.assertEqual(
+            payloads[0]["response_format"]["type"], "json_schema"
+        )
+        guided = payloads[0]["response_format"]["json_schema"]["schema"]
+        self.assertEqual(
+            guided["required"],
+            [
+                "interpretation",
+                "counter_evidence",
+                "unknowns",
+                "regime",
+                "confidence",
+                "conclusion",
+            ],
+        )
+        self.assertEqual(
+            guided["properties"]["regime"]["enum"],
+            ["insufficient_joint_evidence"],
+        )
         repair = payloads[1]["messages"][-1]["content"]
         self.assertEqual(repair, contract_repair_instruction(
             expected, "trained model changed deterministic facts"
@@ -1374,6 +1404,336 @@ class QuantAiRadarTest(unittest.TestCase):
             '"allowed_etf_flow_signal_values":["flat","negative","positive","unknown"]',
             repair,
         )
+        self.assertNotIn("DETERMINISTIC_FACTS_JSON", repair)
+        self.assertNotIn('"facts"', guided["properties"])
+
+    def test_client_accepts_compact_model_response_and_reattaches_exact_facts(self):
+        expected = {
+            "facts": {
+                "symbol": "AAPL",
+                "as_of_date": "2026-07-31",
+                "etf_relations": {"membership_count": 128},
+            },
+            "interpretation": {
+                "price_signal": "positive",
+                "etf_flow_signal": "positive",
+                "etf_flow_signal_source": "constituent_etf_flow_exposure",
+                "relationship": "price_flow_positive_confirmation",
+                "scope": "data_interpretation_not_trade_execution",
+                "task_type": "stock_constituent_flow_analysis",
+            },
+            "counter_evidence": ["concentration_risk"],
+            "unknowns": ["future_outcome_unknown"],
+            "regime": "price_flow_positive_confirmation",
+            "confidence": 0.7,
+            "conclusion": "현재 증거에서는 가격과 ETF Flow가 함께 확인됩니다.",
+        }
+        compact = {
+            key: value for key, value in expected.items() if key != "facts"
+        }
+        payloads = []
+
+        def transport(payload, headers, timeout):
+            payloads.append(payload)
+            return {
+                "model": "quant-v1",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(compact, ensure_ascii=False)
+                        },
+                    }
+                ],
+                "usage": {"completion_tokens": 120},
+            }
+
+        release = ModelRelease(
+            manifest_path=Path("/tmp/release.json"),
+            manifest_sha256="a" * 64,
+            model_id="quant-v1",
+            endpoint_model="quant-v1",
+            base_model="Qwen3-8B",
+            adapter_root=Path("/tmp/adapter"),
+            adapter_set_sha256="b" * 64,
+            dataset_manifest_sha256="c" * 64,
+            evaluation_sha256="d" * 64,
+            raw={},
+        )
+        client = TrainedQuantClient(
+            endpoint="http://127.0.0.1:8018/v1/chat/completions",
+            release=release,
+            transport=transport,
+        )
+        value, trace = client.complete_validated(
+            system="EVIDENCE_JSON={}",
+            user="Return interpretation JSON only. /no_think",
+            expected_response=expected,
+        )
+        self.assertEqual(value["facts"], expected["facts"])
+        self.assertEqual(value["conclusion"], compact["conclusion"])
+        self.assertEqual(trace["contract_attempts"], 1)
+        schema = payloads[0]["response_format"]["json_schema"]["schema"]
+        self.assertNotIn("facts", schema["properties"])
+        self.assertNotIn("facts", schema["required"])
+
+    def test_buy_sell_opinion_language_is_preserved(self):
+        for opinion in (
+            "시장 참여자들이 자산을 매도하고 있음을 나타낸다.",
+            "지금 매도",
+            "매도하라",
+            "즉시 청산",
+            "매수해야 한다",
+        ):
+            self.assertEqual(
+                judgement_prohibited_violations(
+                    {"conclusion": opinion}, "2026-07-31"
+                ),
+                [],
+            )
+
+    def test_verified_cluster_label_substrings_are_not_forbidden(self):
+        forbidden = _unsupported_cluster_terms("Consumer Cyclical")
+        self.assertNotIn("경기소비재", forbidden)
+        self.assertNotIn("소비재", forbidden)
+        self.assertIn("금융", forbidden)
+
+    def test_action_assessment_uses_bounded_judgement_and_five_views(self):
+        captured = {}
+
+        class FakeClient:
+            def complete_messages(self, **kwargs):
+                captured.update(kwargs)
+                return (
+                    {
+                        "symbol": "AAPL",
+                        "action_view": "관망",
+                        "horizon": "단기",
+                        "historical_pattern": "기간별 가격과 자금 흐름이 엇갈리는 과거 패턴과 유사합니다.",
+                        "reason": "단기 가격 약세와 자금 흐름 강세가 충돌하여 추가 확인이 필요합니다.",
+                        "supporting_evidence": "중기 가격과 전체 자금 흐름의 방향은 함께 양수로 확인됩니다.",
+                        "counter_evidence": "최근 가격 약세와 상위 기여 항목의 음수 방향이 반대 근거입니다.",
+                        "invalidation_condition": "기간별 가격과 자금 흐름이 같은 방향으로 재확인되면 판단을 바꿉니다.",
+                    },
+                    {"finish_reason": "stop"},
+                )
+
+        result = {
+            "symbol": "AAPL",
+            "judgement": {
+                "facts": {
+                    "symbol": "AAPL",
+                    "as_of_date": "2026-07-31",
+                    "price": {"return_20_session_pct": 1.2},
+                    "etf_flow_to_constituent": {
+                        "net_weighted_flow_rate_contribution_pct": 0.1,
+                    },
+                    "large_unused_payload": {"rows": list(range(1000))},
+                },
+                "interpretation": {
+                    "price_signal": "positive",
+                    "etf_flow_signal": "positive",
+                    "etf_flow_signal_source": "constituent_etf_flow_exposure",
+                    "relationship": "price_flow_positive_confirmation",
+                    "scope": "data_interpretation_not_trade_execution",
+                    "task_type": "stock_constituent_flow_analysis",
+                },
+                "counter_evidence": [],
+                "unknowns": [],
+                "regime": "price_flow_positive_confirmation",
+                "confidence": 0.7,
+                "conclusion": "현재 증거는 두 방향의 일치를 보여 줍니다.",
+            },
+        }
+        assessment, trace = build_action_assessment(
+            client=FakeClient(), result=result
+        )
+        self.assertEqual(len(ACTION_VIEWS), 5)
+        self.assertEqual(assessment["action_view"], "관망")
+        self.assertEqual(
+            assessment["prompt_contract"], ACTION_PROMPT_CONTRACT
+        )
+        self.assertEqual(trace["contract_attempts"], 1)
+        user = captured["messages"][1]["content"]
+        bounded = user.split("CURRENT_JUDGEMENT=", 1)[1].split(
+            "\nEXACT_SECURITY_BRIEF=", 1
+        )[0]
+        self.assertNotIn("large_unused_payload", bounded)
+        self.assertNotIn('"facts"', bounded)
+        self.assertNotIn("SUPPORT_RULE", user)
+        self.assertNotIn("양수 regime만으로", user)
+
+    def test_client_repairs_missing_regime_on_third_model_turn(self):
+        expected = {
+            "facts": {"symbol": "SKY", "as_of_date": "2026-07-30"},
+            "interpretation": {
+                "price_signal": "negative",
+                "etf_flow_signal": "negative",
+                "etf_flow_signal_source": "constituent_etf_flow_exposure",
+                "relationship": "price_flow_negative_confirmation",
+                "scope": "data_interpretation_not_trade_execution",
+                "task_type": "stock_constituent_flow_analysis",
+            },
+            "counter_evidence": [],
+            "unknowns": [],
+            "regime": "price_flow_negative_confirmation",
+            "confidence": 0.5,
+            "conclusion": "Evidence as of 2026-07-30.",
+        }
+        missing_regime = json.loads(json.dumps(expected))
+        missing_regime.pop("regime")
+        responses = iter((missing_regime, missing_regime, expected))
+        payloads = []
+
+        def transport(payload, headers, timeout):
+            payloads.append(payload)
+            return {
+                "model": "quant-v1",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                next(responses), ensure_ascii=False
+                            )
+                        },
+                    }
+                ],
+                "usage": {"completion_tokens": 10},
+            }
+
+        release = ModelRelease(
+            manifest_path=Path("/tmp/release.json"),
+            manifest_sha256="a" * 64,
+            model_id="quant-v1",
+            endpoint_model="quant-v1",
+            base_model="Qwen3-8B",
+            adapter_root=Path("/tmp/adapter"),
+            adapter_set_sha256="b" * 64,
+            dataset_manifest_sha256="c" * 64,
+            evaluation_sha256="d" * 64,
+            raw={},
+        )
+        client = TrainedQuantClient(
+            endpoint="http://127.0.0.1:8018/v1/chat/completions",
+            release=release,
+            transport=transport,
+        )
+        value, trace = client.complete_validated(
+            system="EVIDENCE_JSON={}",
+            user="지정된 구조로 답하라. /no_think",
+            expected_response=expected,
+        )
+        self.assertEqual(value, expected)
+        self.assertEqual(trace["contract_attempts"], 3)
+        self.assertIn("missing=['regime']", trace["second_contract_error"])
+        self.assertEqual(len(payloads), 3)
+        for payload in payloads:
+            schema = payload["response_format"]["json_schema"]["schema"]
+            self.assertEqual(
+                schema["properties"]["regime"]["enum"],
+                ["price_flow_negative_confirmation"],
+            )
+
+    def test_client_preserves_final_invalid_json_for_failure_audit(self):
+        expected = {
+            "facts": {"symbol": "SKY", "as_of_date": "2026-07-30"},
+            "interpretation": {
+                "price_signal": "negative",
+                "etf_flow_signal": "positive",
+                "etf_flow_signal_source": "constituent_etf_flow_exposure",
+                "relationship": "price_down_flow_in_divergence",
+                "scope": "data_interpretation_not_trade_execution",
+                "task_type": "stock_constituent_flow_analysis",
+            },
+            "counter_evidence": [],
+            "unknowns": [],
+            "regime": "price_down_flow_in_divergence",
+            "confidence": 0.5,
+            "conclusion": "Evidence as of 2026-07-30.",
+        }
+        responses = iter(("not json", "still not json", "final broken json"))
+
+        def transport(payload, headers, timeout):
+            return {
+                "model": "quant-v1",
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": next(responses)},
+                    }
+                ],
+                "usage": {"completion_tokens": 1400},
+            }
+
+        release = ModelRelease(
+            manifest_path=Path("/tmp/release.json"),
+            manifest_sha256="a" * 64,
+            model_id="quant-v1",
+            endpoint_model="quant-v1",
+            base_model="Qwen3-8B",
+            adapter_root=Path("/tmp/adapter"),
+            adapter_set_sha256="b" * 64,
+            dataset_manifest_sha256="c" * 64,
+            evaluation_sha256="d" * 64,
+            raw={},
+        )
+        client = TrainedQuantClient(
+            endpoint="http://127.0.0.1:8018/v1/chat/completions",
+            release=release,
+            transport=transport,
+        )
+        with self.assertRaises(ModelResponseParseError) as caught:
+            client.complete_validated(
+                system="EVIDENCE_JSON={}",
+                user="Return JSON. /no_think",
+                expected_response=expected,
+            )
+        self.assertEqual(caught.exception.raw_content, "final broken json")
+        self.assertEqual(caught.exception.trace["contract_attempts"], 3)
+        self.assertEqual(caught.exception.trace["finish_reason"], "length")
+        self.assertIn(
+            "ModelResponseParseError",
+            caught.exception.trace["final_contract_error"],
+        )
+
+    def test_queue_error_preserves_failure_trace_and_raw_response(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            queue = RadarQueue(Path(temporary) / "queue.sqlite3")
+            queue.seed(
+                [
+                    Candidate(
+                        symbol="SKY",
+                        proxy_task_type="stock_constituent_flow_analysis",
+                        quality_status="pass",
+                        relation_types=("fmp_etf_membership",),
+                    )
+                ]
+            )
+            queue.mark_error(
+                "SKY",
+                "ModelResponseParseError: invalid JSON",
+                trace={
+                    "contract_attempts": 3,
+                    "finish_reason": "length",
+                    "failed_response_text": "broken",
+                },
+            )
+            with queue.connect() as connection:
+                row = connection.execute(
+                    "SELECT status,error,trace_json FROM items WHERE symbol='SKY'"
+                ).fetchone()
+        self.assertEqual(row["status"], "error")
+        self.assertIn("invalid JSON", row["error"])
+        trace = json.loads(row["trace_json"])
+        self.assertEqual(trace["contract_attempts"], 3)
+        self.assertEqual(trace["failed_response_text"], "broken")
+
+    def test_symbol_guided_schema_rejects_invalid_expected_contract(self):
+        with self.assertRaises(ResponseContractError):
+            symbol_guided_json_schema(
+                {"interpretation": {}, "regime": "not-a-regime"}
+            )
 
     def test_aggregate_uses_all_selected_results_and_limits_leaders(self):
         rows = []
@@ -1409,6 +1769,24 @@ class QuantAiRadarTest(unittest.TestCase):
         self.assertIn(
             "dynamically selected",
             aggregate["presentation_policy"],
+        )
+
+    def test_market_dashboard_keeps_every_deterministic_rotation_cluster(self):
+        clusters = [
+            {
+                "integrated_cluster": f"Sector {index}",
+                "integrated_state": "mixed",
+                "integrated_score": float(index),
+            }
+            for index in range(11)
+        ]
+        dashboard = build_market_dashboard(
+            {"analyzed_security_count": 0},
+            {"integrated_rotation_clusters": clusters},
+        )
+        self.assertEqual(
+            [row["cluster"] for row in dashboard["rotation_clusters"]],
+            [row["integrated_cluster"] for row in clusters],
         )
 
     def test_market_synthesis_catalog_is_bounded_and_excludes_verbose_notes(self):

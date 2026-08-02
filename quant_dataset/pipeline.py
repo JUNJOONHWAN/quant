@@ -25,6 +25,7 @@ from .etf_flow_exposure import (
     build_constituent_flow_exposure,
 )
 from .fmp_etf_constituents import FmpEtfConstituentLayer
+from .fmp_active_universe import FmpActiveUniverseCollector
 from .fmp_training import FmpTrainingBackfill
 from .fmp_universe import FmpUniverseCollector
 from .providers import (
@@ -44,10 +45,18 @@ from .storage import Database, RawStore, canonical_json, sha256_bytes, utc_now
 ENDPOINT_REGISTRY_VERSION = "2026-07-16.etf-flow-pit-training-v1"
 SOURCE_CAPABILITY_POLICY = {
     "massive_grouped_daily": {
-        "enabled": True,
-        "role": "preferred_full_universe_daily_path",
+        "enabled": False,
+        "role": "not_used_for_oracle_price_increment",
         "endpoint": "/v2/aggs/grouped/locale/us/market/stocks/{date}",
         "request_granularity": "one_request_per_date",
+        "retained_role": "ETF Flow only in the Oracle daily contract",
+    },
+    "fmp_legacy_batch_historical_eod": {
+        "enabled": True,
+        "role": "oracle_primary_full_market_daily_path",
+        "endpoint": "/api/v4/batch-historical-eod",
+        "request_granularity": "one_request_per_date",
+        "support_status": "legacy_best_effort_with_raw_evidence",
     },
     "fmp_historical_eod_full": {
         "enabled": True,
@@ -396,6 +405,9 @@ class DatasetPipeline:
         self.fmp_universe = FmpUniverseCollector(
             self.data_root, self.http, credentials.fmp_api_key
         )
+        self.fmp_active_universe = FmpActiveUniverseCollector(
+            self.data_root, self.http, credentials.fmp_api_key
+        )
         self.massive = MassiveProvider(self.http, credentials.massive_api_key)
         self.etf_flows = EtfFlowLayer(
             self.database,
@@ -539,6 +551,13 @@ class DatasetPipeline:
         """Capture current, ETF, delisted, and symbol-change FMP evidence."""
 
         result = self.fmp_universe.capture(as_of_date)
+        self.write_manifest()
+        return result
+
+    def capture_fmp_active_universe(self, as_of_date: str) -> dict:
+        """Capture the operational NASDAQ/NYSE/AMEX/CBOE active master."""
+
+        result = self.fmp_active_universe.capture(as_of_date)
         self.write_manifest()
         return result
 
