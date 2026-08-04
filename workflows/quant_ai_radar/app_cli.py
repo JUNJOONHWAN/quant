@@ -74,6 +74,7 @@ REQUEST_FIELDS = frozenset(
         "question",
         "query",
         "symbols",
+        "symbols_file",
         "shadow",
         "workers",
         "max_ai_etfs",
@@ -191,6 +192,33 @@ def normalize_symbols(values: Any) -> list[str]:
     if not symbols:
         raise AppCliError("at least one symbol is required")
     return symbols
+
+
+def load_symbols_file(value: Any) -> tuple[list[str], dict[str, Any]]:
+    """Load one complete symbol universe and seal its source provenance."""
+    raw_path = str(value or "").strip()
+    if not raw_path:
+        raise AppCliError("symbols_file must be a non-empty path")
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise AppCliError(f"symbols_file is missing: {path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise AppCliError(f"unable to read symbols_file {path}: {exc}") from exc
+    if len(raw) > 1024 * 1024:
+        raise AppCliError("symbols_file exceeds the 1 MiB safety limit")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppCliError(f"invalid symbols_file JSON: {path}: {exc}") from exc
+    values = payload.get("symbols") if isinstance(payload, dict) else payload
+    symbols = normalize_symbols(values)
+    return symbols, {
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "symbol_count": len(symbols),
+    }
 
 
 def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
@@ -605,28 +633,69 @@ def run_daily(
     return result
 
 
-def run_analysis(symbols: list[str]) -> dict[str, Any]:
+def run_analysis(
+    symbols: list[str],
+    *,
+    symbols_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_symbols = normalize_symbols(symbols)
     state = {
         "schema_version": "quant.ai_radar_app_run.v1",
         "status": "running_on_demand_analysis",
         "app_id": APP_ID,
         "action": "analyze",
-        "symbols": symbols,
+        "symbols": requested_symbols,
+        "requested_symbols": requested_symbols,
+        "requested_symbol_count": len(requested_symbols),
+        "symbols_source": symbols_source,
         "operations_app_run_id": os.environ.get("OPERATIONS_APP_RUN_ID"),
         "started_at_kst": _now_kst(),
     }
     write_json(APP_STATE_PATH, state)
-    receipt = run_json_command(build_analyze_command(symbols))
+    receipt = run_json_command(build_analyze_command(requested_symbols))
     if receipt.get("status") != "complete":
         raise AppCliError(
             f"on-demand analysis did not fully complete: {receipt.get('status')}"
+        )
+    engine_requested = receipt.get("requested_symbols")
+    if not isinstance(engine_requested, list):
+        raise AppCliError("on-demand receipt has no requested_symbols coverage")
+    engine_requested = normalize_symbols(engine_requested)
+    if engine_requested != requested_symbols:
+        raise AppCliError(
+            "on-demand requested_symbols coverage mismatch: "
+            f"expected={requested_symbols}, actual={engine_requested}"
+        )
+    rows = receipt.get("results")
+    if not isinstance(rows, list):
+        raise AppCliError("on-demand receipt results must be a list")
+    completed_symbols: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("status") != "complete":
+            raise AppCliError("on-demand receipt contains an incomplete result")
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not SYMBOL_PATTERN.fullmatch(symbol):
+            raise AppCliError("on-demand receipt contains an invalid result symbol")
+        if symbol in completed_symbols:
+            raise AppCliError(f"on-demand receipt duplicates symbol: {symbol}")
+        completed_symbols.append(symbol)
+    if completed_symbols != requested_symbols:
+        raise AppCliError(
+            "on-demand completed_symbols coverage mismatch: "
+            f"expected={requested_symbols}, actual={completed_symbols}"
         )
     result = {
         **state,
         "status": "PASS",
         "engine_status": receipt["status"],
         "as_of_date": receipt.get("as_of_date"),
-        "results": receipt.get("results", []),
+        "requested_symbols": requested_symbols,
+        "completed_symbols": completed_symbols,
+        "requested_symbol_count": len(requested_symbols),
+        "completed_symbol_count": len(completed_symbols),
+        "coverage_complete": True,
+        "symbols_source": symbols_source,
+        "results": rows,
         "completed_at_kst": _now_kst(),
     }
     write_json(APP_STATE_PATH, result)
@@ -1053,7 +1122,8 @@ def _parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser(
         "analyze", help="Analyze explicitly requested symbols"
     )
-    analyze.add_argument("symbols", nargs="+")
+    analyze.add_argument("symbols", nargs="*")
+    analyze.add_argument("--symbols-file", type=Path)
 
     ask = sub.add_parser(
         "ask", help="Ask for market, rotation, candidates, or symbol analysis"
@@ -1126,6 +1196,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         values = _daily_values(source)
         return run_daily(**values)
     if action == "analyze":
+        if source.get("symbols") and source.get("symbols_file"):
+            raise AppCliError("cannot combine symbols with symbols_file")
+        if source.get("symbols_file"):
+            symbols, symbols_source = load_symbols_file(source.get("symbols_file"))
+            return run_analysis(symbols, symbols_source=symbols_source)
         return run_analysis(normalize_symbols(source.get("symbols")))
     if action == "ask":
         return run_question(source.get("question") or source.get("query"))

@@ -488,6 +488,66 @@ class QuantAiRadarAppTest(unittest.TestCase):
             source_fingerprint_sha256="b" * 64,
         )
 
+    def test_symbols_file_loads_and_seals_the_complete_favorites_universe(self):
+        favorites = [
+            "RKLB", "IONQ", "VRT", "MPWR", "STX", "PL", "NVDA",
+            "CRDO", "ALAB", "QCOM", "GOOG", "SQQQ", "TZA",
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "favorites.json"
+            raw = json.dumps(favorites).encode("utf-8")
+            path.write_bytes(raw)
+            symbols, source = app_cli.load_symbols_file(path)
+        self.assertEqual(symbols, favorites)
+        self.assertEqual(source["symbol_count"], 13)
+        self.assertEqual(source["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(source["path"], str(path.resolve()))
+
+    def test_on_demand_analysis_requires_exact_requested_symbol_coverage(self):
+        receipt = {
+            "status": "complete",
+            "as_of_date": "2026-08-03",
+            "requested_symbols": ["NVDA", "QCOM"],
+            "results": [
+                {"symbol": "NVDA", "status": "complete"},
+            ],
+        }
+        with mock.patch.object(
+            app_cli, "run_json_command", return_value=receipt
+        ), mock.patch.object(
+            app_cli, "build_analyze_command", return_value=["analyze"]
+        ), mock.patch.object(app_cli, "write_json"):
+            with self.assertRaisesRegex(
+                app_cli.AppCliError, "completed_symbols coverage mismatch"
+            ):
+                app_cli.run_analysis(["NVDA", "QCOM"])
+
+    def test_on_demand_analysis_reports_complete_coverage_and_source(self):
+        receipt = {
+            "status": "complete",
+            "as_of_date": "2026-08-03",
+            "requested_symbols": ["NVDA", "QCOM"],
+            "results": [
+                {"symbol": "NVDA", "status": "complete"},
+                {"symbol": "QCOM", "status": "complete"},
+            ],
+        }
+        source = {"path": "/tmp/favorites.json", "symbol_count": 2}
+        with mock.patch.object(
+            app_cli, "run_json_command", return_value=receipt
+        ), mock.patch.object(
+            app_cli, "build_analyze_command", return_value=["analyze"]
+        ), mock.patch.object(app_cli, "write_json"):
+            result = app_cli.run_analysis(
+                ["NVDA", "QCOM"], symbols_source=source
+            )
+        self.assertTrue(result["coverage_complete"])
+        self.assertEqual(result["requested_symbol_count"], 2)
+        self.assertEqual(result["completed_symbol_count"], 2)
+        self.assertEqual(result["requested_symbols"], ["NVDA", "QCOM"])
+        self.assertEqual(result["completed_symbols"], ["NVDA", "QCOM"])
+        self.assertEqual(result["symbols_source"], source)
+
 
 if __name__ == "__main__":
     unittest.main()
