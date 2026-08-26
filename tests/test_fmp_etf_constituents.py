@@ -172,6 +172,19 @@ class FmpEtfConstituentTest(unittest.TestCase):
         self.assertTrue(
             all(row["etf_ticker"] == "QQQ" for row in apple["etf_memberships"])
         )
+        self.assertTrue(
+            all(not row["direct_equity_proxy_eligible"] for row in apple["etf_memberships"])
+        )
+        self.assertTrue(
+            all(
+                "snapshot_has_fewer_than_5_positions"
+                in row["direct_equity_proxy_reasons"]
+                for row in apple["etf_memberships"]
+            )
+        )
+        self.assertTrue(
+            all(row["snapshot_row_count"] == 2 for row in apple["etf_memberships"])
+        )
         self.assertEqual(
             qqq["constituents"][0]["training_available_session_date"],
             "2024-05-16",

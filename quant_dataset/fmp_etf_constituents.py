@@ -647,15 +647,13 @@ class FmpEtfConstituentStore:
                     for row in memberships
                 }
             )
-            for offset in range(0, len(membership_pairs), 400):
-                chunk = membership_pairs[offset : offset + 400]
-                if not chunk:
-                    continue
-                values_sql = ",".join("(?,?)" for _ in chunk)
-                parameters = [item for pair in chunk for item in pair]
-                metrics = connection.execute(
+            for etf_ticker, effective_date in membership_pairs:
+                # Keep both equality predicates on the observation table.
+                # SQLite otherwise chooses the provider prefix of the 20M-row
+                # primary index for a large VALUES join and scans the whole
+                # FMP history instead of using idx_etf_constituent_etf_date.
+                metric = connection.execute(
                     """
-                    WITH requested(etf_ticker, effective_date) AS (VALUES {})
                     SELECT o.etf_ticker, o.effective_date,
                            COUNT(*) AS row_count,
                            SUM(CASE WHEN o.constituent_ticker IS NOT NULL THEN 1 ELSE 0 END)
@@ -670,37 +668,37 @@ class FmpEtfConstituentStore:
                                AS positive_ticker_weight_sum,
                            SUM(COALESCE(o.weight_percent, 0)) AS total_weight_sum
                     FROM etf_constituent_observations o
-                    JOIN requested r ON r.etf_ticker=o.etf_ticker
-                                    AND r.effective_date=o.effective_date
                     WHERE o.provider='fmp'
+                      AND o.etf_ticker=? AND o.effective_date=?
                     GROUP BY o.etf_ticker, o.effective_date
-                    """.format(values_sql),
-                    parameters,
-                ).fetchall()
-                for metric in metrics:
-                    row_count = int(metric["row_count"] or 0)
-                    ticker_count = int(metric["ticker_count"] or 0)
-                    negative_count = int(metric["negative_weight_count"] or 0)
-                    positive_weight = float(metric["positive_ticker_weight_sum"] or 0.0)
-                    reasons = []
-                    if row_count < 5:
-                        reasons.append("snapshot_has_fewer_than_5_positions")
-                    if not row_count or ticker_count / row_count < 0.80:
-                        reasons.append("ticker_coverage_below_80_percent")
-                    if not 70.0 <= positive_weight <= 130.0:
-                        reasons.append("positive_ticker_weight_sum_outside_70_130")
-                    if negative_count:
-                        reasons.append("negative_weights_present")
-                    composition[(str(metric["etf_ticker"]), str(metric["effective_date"]))] = {
-                        "snapshot_row_count": row_count,
-                        "ticker_constituent_count": ticker_count,
-                        "unresolved_constituent_count": int(metric["unresolved_count"] or 0),
-                        "negative_weight_count": negative_count,
-                        "positive_ticker_weight_sum": positive_weight,
-                        "total_weight_sum": float(metric["total_weight_sum"] or 0.0),
-                        "direct_equity_proxy_eligible": not reasons,
-                        "direct_equity_proxy_reasons": reasons,
-                    }
+                    """,
+                    (etf_ticker, effective_date),
+                ).fetchone()
+                if metric is None:
+                    continue
+                row_count = int(metric["row_count"] or 0)
+                ticker_count = int(metric["ticker_count"] or 0)
+                negative_count = int(metric["negative_weight_count"] or 0)
+                positive_weight = float(metric["positive_ticker_weight_sum"] or 0.0)
+                reasons = []
+                if row_count < 5:
+                    reasons.append("snapshot_has_fewer_than_5_positions")
+                if not row_count or ticker_count / row_count < 0.80:
+                    reasons.append("ticker_coverage_below_80_percent")
+                if not 70.0 <= positive_weight <= 130.0:
+                    reasons.append("positive_ticker_weight_sum_outside_70_130")
+                if negative_count:
+                    reasons.append("negative_weights_present")
+                composition[(str(metric["etf_ticker"]), str(metric["effective_date"]))] = {
+                    "snapshot_row_count": row_count,
+                    "ticker_constituent_count": ticker_count,
+                    "unresolved_constituent_count": int(metric["unresolved_count"] or 0),
+                    "negative_weight_count": negative_count,
+                    "positive_ticker_weight_sum": positive_weight,
+                    "total_weight_sum": float(metric["total_weight_sum"] or 0.0),
+                    "direct_equity_proxy_eligible": not reasons,
+                    "direct_equity_proxy_reasons": reasons,
+                }
             artifact_ids = sorted(
                 {
                     int(row["raw_artifact_id"])
