@@ -6,7 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 def canonical_symbol(value: object) -> str:
@@ -102,6 +102,119 @@ class SourceBundle:
             for row in rows:
                 chosen[str(row["trade_date"])] = row
         return [chosen[key] for key in sorted(chosen)]
+
+    def latest_company_profiles(self) -> dict[str, dict[str, Any]]:
+        """Return the latest FMP company profile per symbol.
+
+        The base store is sealed, while a future Oracle increment may also carry
+        profile facts.  As with prices, the increment wins duplicate symbols.
+        """
+
+        chosen: dict[str, dict[str, Any]] = {}
+        for origin in ("base", "incremental"):
+            connection = self.connections.get(origin)
+            if connection is None or not self._has_table(
+                connection, "fmp_training_facts"
+            ):
+                continue
+            rows = connection.execute(
+                """
+                SELECT fact.symbol,fact.row_json
+                FROM fmp_training_facts fact
+                JOIN (
+                  SELECT symbol,MAX(id) id
+                  FROM fmp_training_facts
+                  WHERE endpoint_id='company_information_company_profile_data'
+                  GROUP BY symbol
+                ) latest ON latest.id=fact.id
+                """
+            )
+            for symbol, payload in rows:
+                normalized = canonical_symbol(symbol)
+                try:
+                    parsed = json.loads(str(payload))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if normalized and isinstance(parsed, Mapping):
+                    chosen[normalized] = dict(parsed)
+        return chosen
+
+    def active_us_exchange_stock_universe(
+        self, price_date: str
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Select the live U.S.-exchange individual-stock shadow universe.
+
+        This is intentionally a live operational selection, not a historical
+        point-in-time membership reconstruction.  A security must have a valid
+        FMP close and volume on ``price_date``, an active latest FMP profile, be
+        listed on NASDAQ/NYSE/AMEX, and not be classified as an ETF or fund.
+        Foreign issuers and ADRs remain eligible when they are U.S.-listed.
+        """
+
+        priced: dict[str, str] = {}
+        priced_by_origin: dict[str, int] = {}
+        for origin in ("base", "incremental"):
+            connection = self.connections.get(origin)
+            if connection is None:
+                continue
+            count = 0
+            for row in connection.execute(
+                "SELECT symbol FROM daily_observations "
+                "WHERE source='fmp' AND trade_date=? AND close>0 AND volume>0",
+                (price_date,),
+            ):
+                symbol = canonical_symbol(row[0])
+                if symbol:
+                    priced[symbol] = origin
+                    count += 1
+            priced_by_origin[origin] = count
+
+        profiles = self.latest_company_profiles()
+        allowed_exchanges = {"NASDAQ", "NYSE", "AMEX"}
+        exclusions = {
+            "missing_profile": 0,
+            "inactive": 0,
+            "etf": 0,
+            "fund": 0,
+            "non_us_exchange": 0,
+        }
+        selected: list[str] = []
+        for symbol in sorted(priced):
+            profile = profiles.get(symbol)
+            if profile is None:
+                exclusions["missing_profile"] += 1
+                continue
+            if profile.get("isActivelyTrading") is not True:
+                exclusions["inactive"] += 1
+                continue
+            if profile.get("isEtf") is True:
+                exclusions["etf"] += 1
+                continue
+            if profile.get("isFund") is True:
+                exclusions["fund"] += 1
+                continue
+            exchange = str(
+                profile.get("exchangeShortName") or profile.get("exchange") or ""
+            ).strip().upper()
+            if exchange not in allowed_exchanges:
+                exclusions["non_us_exchange"] += 1
+                continue
+            selected.append(symbol)
+
+        return selected, {
+            "selection_contract": (
+                "LIVE_T_MINUS_1_VALID_PRICE_AND_VOLUME_ACTIVE_FMP_PROFILE_"
+                "NASDAQ_NYSE_AMEX_EXCLUDING_ETF_AND_FUND"
+            ),
+            "selection_scope": "CURRENT_LIVE_GENERAL_UNIVERSE_SHADOW",
+            "point_in_time_status": "NOT_HISTORICAL_PIT_DO_NOT_USE_FOR_OOS",
+            "price_date": price_date,
+            "priced_symbol_count": len(priced),
+            "priced_rows_by_origin_before_precedence": priced_by_origin,
+            "profile_symbol_count": len(profiles),
+            "eligible_symbol_count": len(selected),
+            "exclusions": exclusions,
+        }
 
     def iter_flow_rows(self) -> Iterator[tuple]:
         """Yield normalized Massive flow records; increment wins duplicate keys."""

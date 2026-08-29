@@ -11,7 +11,7 @@ from training.quant_flow_graph_v11_r2.contracts import TIMING_CONTRACT
 
 SCHEMA_VERSION: Final = "quant.forecast_radar.v1"
 MODEL_SCHEMA_VERSION: Final = "quant.forecast_radar.model_bundle.v1"
-RUN_SCHEMA_VERSION: Final = "quant.forecast_radar.daily_run.v1"
+RUN_SCHEMA_VERSION: Final = "quant.forecast_radar.daily_run.v2.full_universe_shadow"
 TARGET_NAMES: Final = tuple(TARGET_COLUMNS)
 
 COVERAGE_VALIDATED_CORE: Final = "VALIDATED_CORE"

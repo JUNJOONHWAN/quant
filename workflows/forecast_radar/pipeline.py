@@ -69,32 +69,6 @@ def infer_signal_date(base_database: Path, incremental_database: Path) -> dict[s
     }
 
 
-def _profile_map(path: Path) -> dict[str, dict[str, Any]]:
-    connection = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
-    try:
-        rows = connection.execute(
-            """
-            SELECT fact.symbol,fact.row_json
-            FROM fmp_training_facts fact
-            JOIN (
-              SELECT symbol,MAX(id) id
-              FROM fmp_training_facts
-              WHERE endpoint_id='company_information_company_profile_data'
-              GROUP BY symbol
-            ) latest ON latest.id=fact.id
-            """
-        )
-        result = {}
-        for symbol, payload in rows:
-            try:
-                result[str(symbol).upper().replace(".", "-")] = json.loads(payload)
-            except (TypeError, json.JSONDecodeError):
-                continue
-        return result
-    finally:
-        connection.close()
-
-
 def _reference_close_map(panel_path: Path, signal_date: str) -> dict[str, float]:
     connection = sqlite3.connect(f"file:{Path(panel_path)}?mode=ro", uri=True)
     try:
@@ -110,6 +84,20 @@ def _reference_close_map(panel_path: Path, signal_date: str) -> dict[str, float]
         connection.close()
 
 
+def _short_history_symbols(panel_path: Path, signal_date: str) -> set[str]:
+    connection = sqlite3.connect(f"file:{Path(panel_path)}?mode=ro", uri=True)
+    try:
+        return {
+            str(symbol)
+            for (symbol,) in connection.execute(
+                "SELECT symbol FROM panel WHERE signal_date=? AND ret_120d IS NULL",
+                (signal_date,),
+            )
+        }
+    finally:
+        connection.close()
+
+
 def _predict_latest(
     *,
     bundle: Mapping[str, Any],
@@ -118,6 +106,7 @@ def _predict_latest(
     signal_date: str,
     reference_close: Mapping[str, float],
     profiles: Mapping[str, Mapping[str, Any]],
+    short_history_symbols: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     manifest = bundle["manifest"]
     if tuple(matrix["price_names"]) != tuple(manifest["feature_contract"]["price_names"]):
@@ -150,6 +139,7 @@ def _predict_latest(
         prediction[:, 6], bundle["calibration"]["heads"]["p_up_20d"]
     )
     validated = set(manifest["coverage"]["validated_core_symbols"])
+    short_history = short_history_symbols or set()
     symbols = tuple(matrix["symbol_values"])
     symbol_codes = np.asarray(matrix["symbol_codes"], dtype=np.int64)[selected]
     rows: list[dict[str, Any]] = []
@@ -166,7 +156,13 @@ def _predict_latest(
                 COVERAGE_VALIDATED_CORE if symbol in validated else COVERAGE_GENERAL_SHADOW
             ),
             "validation_status": (
-                "HISTORICAL_OOS_CORE" if symbol in validated else "EXTRAPOLATED_UNVALIDATED"
+                "HISTORICAL_OOS_CORE"
+                if symbol in validated
+                else (
+                    "EXTRAPOLATED_UNVALIDATED_SHORT_HISTORY"
+                    if symbol in short_history
+                    else "EXTRAPOLATED_UNVALIDATED"
+                )
             ),
             "p_up_5d": float(p5[local]),
             "p_up_20d": float(p20[local]),
@@ -238,6 +234,68 @@ def _aggregate(rows: Sequence[Mapping[str, Any]], key: str | None = None) -> lis
             }
         )
     return result
+
+
+def _build_coverage_gate(
+    *,
+    general_universe_symbols: Sequence[str],
+    live_panel_symbols: Sequence[str],
+    forecasts: Sequence[Mapping[str, Any]],
+    panel_live_general_shadow_source_symbol_count: int,
+) -> dict[str, Any]:
+    """Validate live panel/forecast coverage without conflating source and model tiers."""
+    candidate_symbols = {str(symbol) for symbol in general_universe_symbols}
+    expected_panel_symbols = {str(symbol) for symbol in live_panel_symbols}
+    forecast_symbols = {str(row["symbol"]) for row in forecasts}
+    validated_core_count = sum(
+        row["coverage_tier"] == COVERAGE_VALIDATED_CORE for row in forecasts
+    )
+    general_shadow_count = sum(
+        row["coverage_tier"] == COVERAGE_GENERAL_SHADOW for row in forecasts
+    )
+    missing_general_candidates = sorted(candidate_symbols.difference(forecast_symbols))
+    missing_live_panel_symbols = sorted(expected_panel_symbols.difference(forecast_symbols))
+    unexpected_forecast_symbols = sorted(forecast_symbols.difference(expected_panel_symbols))
+    gate = {
+        "eligible_general_universe_symbol_count": len(candidate_symbols),
+        "panel_live_symbol_count": len(expected_panel_symbols),
+        "panel_live_general_shadow_source_symbol_count": int(
+            panel_live_general_shadow_source_symbol_count
+        ),
+        "forecast_symbol_count": len(forecast_symbols),
+        "forecast_general_shadow_symbol_count": general_shadow_count,
+        "validated_core_forecast_count": validated_core_count,
+        "short_history_forecast_count": sum(
+            row["validation_status"] == "EXTRAPOLATED_UNVALIDATED_SHORT_HISTORY"
+            for row in forecasts
+        ),
+        "missing_general_candidate_count": len(missing_general_candidates),
+        "missing_general_candidate_symbols": missing_general_candidates,
+        "missing_live_panel_symbol_count": len(missing_live_panel_symbols),
+        "missing_live_panel_symbols": missing_live_panel_symbols,
+        "unexpected_forecast_symbol_count": len(unexpected_forecast_symbols),
+        "unexpected_forecast_symbols": unexpected_forecast_symbols,
+        "general_universe_minimum_gate": len(candidate_symbols) >= 1_000,
+        "live_panel_forecast_parity_gate": (
+            not missing_live_panel_symbols and not unexpected_forecast_symbols
+        ),
+        "general_candidate_full_coverage_gate": not missing_general_candidates,
+        "validated_core_minimum_gate": validated_core_count >= 400,
+    }
+    gate["status"] = (
+        "PASS"
+        if all(
+            gate[key]
+            for key in (
+                "general_universe_minimum_gate",
+                "live_panel_forecast_parity_gate",
+                "general_candidate_full_coverage_gate",
+                "validated_core_minimum_gate",
+            )
+        )
+        else "FAIL"
+    )
+    return gate
 
 
 def _write_forecast_database(
@@ -330,6 +388,8 @@ def current_completed_run(live_root: Path, signal_date: str) -> dict[str, Any] |
         if sha256_file(database_path) != latest["database_sha256"]:
             return None
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("schema_version") != RUN_SCHEMA_VERSION:
+            return None
         if summary.get("quality_gate") != "PASS_SHADOW_RUN":
             return None
         if summary.get("signal_date") != signal_date:
@@ -379,6 +439,16 @@ def run_daily(
     run_root.mkdir(parents=True, exist_ok=False)
     history_start = (date.fromisoformat(signal) - timedelta(days=420)).isoformat()
 
+    with SourceBundle(base_database, incremental_database) as source:
+        general_shadow_symbols, general_universe_audit = (
+            source.active_us_exchange_stock_universe(timing["price_date"])
+        )
+        profiles = source.latest_company_profiles()
+    if general_universe_audit["eligible_symbol_count"] < 1_000:
+        raise RuntimeError(
+            "general stock universe gate failed: fewer than 1000 eligible symbols"
+        )
+
     panel_manifest = build_panel(
         base_database=base_database,
         incremental_database=incremental_database,
@@ -388,6 +458,7 @@ def run_daily(
         end_date=signal,
         live_signal_date=signal,
         replace=False,
+        general_shadow_symbols=general_shadow_symbols,
     )
     session_overlay_path = run_root / "graph_session_overlay.sqlite3"
     session_overlay_receipt = build_graph_session_overlay_database(
@@ -450,7 +521,7 @@ def run_daily(
         source.close()
         event.close()
     references = _reference_close_map(panel_root / "panel.sqlite3", signal)
-    profiles = _profile_map(base_database)
+    short_history = _short_history_symbols(panel_root / "panel.sqlite3", signal)
     forecasts = _predict_latest(
         bundle=bundle,
         matrix=matrix,
@@ -458,12 +529,41 @@ def run_daily(
         signal_date=signal,
         reference_close=references,
         profiles=profiles,
+        short_history_symbols=short_history,
     )
-    market_rows = _aggregate(forecasts)
+    validated_core_forecasts = [
+        row
+        for row in forecasts
+        if row["coverage_tier"] == COVERAGE_VALIDATED_CORE
+    ]
+    general_shadow_forecasts = [
+        row
+        for row in forecasts
+        if row["coverage_tier"] == COVERAGE_GENERAL_SHADOW
+    ]
+    coverage_gate = _build_coverage_gate(
+        general_universe_symbols=general_shadow_symbols,
+        live_panel_symbols=references,
+        forecasts=forecasts,
+        panel_live_general_shadow_source_symbol_count=int(
+            panel_manifest["price_phase"]["live_general_shadow_inserted_symbol_count"]
+        ),
+    )
+    if coverage_gate["status"] != "PASS":
+        raise RuntimeError(f"Forecast RADAR coverage gate failed: {coverage_gate}")
+
+    market_rows = _aggregate(validated_core_forecasts)
     if len(market_rows) != 1:
         raise RuntimeError("market aggregation did not produce exactly one row")
-    market = market_rows[0]
-    sectors = _aggregate(forecasts, "sector")
+    exploratory_market_rows = _aggregate(forecasts)
+    market = {
+        **market_rows[0],
+        "aggregation_scope": "VALIDATED_CORE_ONLY",
+        "total_forecast_universe_count": len(forecasts),
+        "general_shadow_count": len(general_shadow_forecasts),
+        "exploratory_full_universe_shadow": exploratory_market_rows[0],
+    }
+    sectors = _aggregate(validated_core_forecasts, "sector")
     run_manifest = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
@@ -471,12 +571,8 @@ def run_daily(
         "timing_contract": TIMING_CONTRACT,
         **timing,
         "stock_count": len(forecasts),
-        "validated_core_count": sum(
-            row["coverage_tier"] == COVERAGE_VALIDATED_CORE for row in forecasts
-        ),
-        "general_shadow_count": sum(
-            row["coverage_tier"] == COVERAGE_GENERAL_SHADOW for row in forecasts
-        ),
+        "validated_core_count": len(validated_core_forecasts),
+        "general_shadow_count": len(general_shadow_forecasts),
         "activation_status": "SHADOW_ONLY",
         "model_manifest_sha256": sha256_file(Path(model_root) / "model_manifest.json"),
     }
@@ -493,11 +589,23 @@ def run_daily(
         "market": market,
         "sector_count": len(sectors),
         "top_utility_5d": sorted(
-            forecasts, key=lambda row: float(row["utility_5d"]), reverse=True
+            validated_core_forecasts,
+            key=lambda row: float(row["utility_5d"]),
+            reverse=True,
         )[:20],
         "bottom_utility_5d": sorted(
-            forecasts, key=lambda row: float(row["utility_5d"])
+            validated_core_forecasts, key=lambda row: float(row["utility_5d"])
         )[:20],
+        "exploratory_general_universe_top_utility_5d": sorted(
+            general_shadow_forecasts,
+            key=lambda row: float(row["utility_5d"]),
+            reverse=True,
+        )[:20],
+        "exploratory_general_universe_bottom_utility_5d": sorted(
+            general_shadow_forecasts, key=lambda row: float(row["utility_5d"])
+        )[:20],
+        "coverage_gate": coverage_gate,
+        "general_universe": general_universe_audit,
         "sources": {
             "panel_quality": panel_manifest["quality"],
             "graph_quality_gate": graph_manifest["quality_gate"],

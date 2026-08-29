@@ -5,10 +5,12 @@ import sqlite3
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from workflows.forecast_radar import cli
 from workflows.forecast_radar.contracts import (
     COVERAGE_VALIDATED_CORE,
+    RUN_SCHEMA_VERSION,
     TARGET_NAMES,
     TIMING_CONTRACT,
 )
@@ -24,9 +26,12 @@ from workflows.forecast_radar.model_bundle import (
 from workflows.forecast_radar.io import sha256_file
 from workflows.forecast_radar.pipeline import (
     _aggregate,
+    _build_coverage_gate,
     current_completed_run,
     query_latest,
 )
+from training.quant_forecast_v2.panel import _is_core_rank_reference, _rank_against_core
+from training.quant_forecast_v2.source import SourceBundle
 
 
 def _source(path: Path, *, incremental: bool) -> None:
@@ -128,6 +133,135 @@ def test_stock_aggregate_is_the_regime_source() -> None:
     assert result["regime_status"] == "SHADOW_HEURISTIC_FROM_STOCK_AGGREGATE"
 
 
+def test_coverage_gate_does_not_conflate_source_shadow_with_model_tier() -> None:
+    additional_symbols = [f"SHADOW_{index}" for index in range(1_000)]
+    additional_core_symbols = [f"CORE_{index}" for index in range(398)]
+    forecasts = [
+        {
+            "symbol": "A",
+            "coverage_tier": COVERAGE_VALIDATED_CORE,
+            "validation_status": "HISTORICAL_OOS_CORE",
+        },
+        {
+            "symbol": "CORE_ONLY",
+            "coverage_tier": COVERAGE_VALIDATED_CORE,
+            "validation_status": "HISTORICAL_OOS_CORE",
+        },
+        {
+            "symbol": "JOBY",
+            "coverage_tier": "GENERAL_UNIVERSE_SHADOW",
+            "validation_status": "EXTRAPOLATED_UNVALIDATED",
+        },
+        {
+            "symbol": "SHORT",
+            "coverage_tier": "GENERAL_UNIVERSE_SHADOW",
+            "validation_status": "EXTRAPOLATED_UNVALIDATED_SHORT_HISTORY",
+        },
+    ]
+    forecasts.extend(
+        {
+            "symbol": symbol,
+            "coverage_tier": "GENERAL_UNIVERSE_SHADOW",
+            "validation_status": "EXTRAPOLATED_UNVALIDATED",
+        }
+        for symbol in additional_symbols
+    )
+    forecasts.extend(
+        {
+            "symbol": symbol,
+            "coverage_tier": COVERAGE_VALIDATED_CORE,
+            "validation_status": "HISTORICAL_OOS_CORE",
+        }
+        for symbol in additional_core_symbols
+    )
+    general_universe_symbols = ["A", "JOBY", "SHORT", *additional_symbols]
+    gate = _build_coverage_gate(
+        general_universe_symbols=general_universe_symbols,
+        live_panel_symbols=[
+            *general_universe_symbols,
+            "CORE_ONLY",
+            *additional_core_symbols,
+        ],
+        forecasts=forecasts,
+        panel_live_general_shadow_source_symbol_count=len(general_universe_symbols),
+    )
+    assert gate["panel_live_general_shadow_source_symbol_count"] == 1_003
+    assert gate["forecast_general_shadow_symbol_count"] == 1_002
+    assert gate["live_panel_forecast_parity_gate"] is True
+    assert gate["general_candidate_full_coverage_gate"] is True
+    assert gate["status"] == "PASS"
+
+
+def test_shadow_ranks_do_not_change_validated_core_ranks() -> None:
+    values = np.asarray([10.0, 20.0, 15.0, 30.0])
+    series = pd.Series(values, index=["CORE_A", "CORE_B", "S", "H"])
+    core_mask = pd.Series(
+        [True, True, False, False], index=series.index
+    )
+    observed = _rank_against_core(series, core_mask)
+    assert observed["CORE_A"] == 0.5
+    assert observed["CORE_B"] == 1.0
+    assert observed["S"] == 0.5
+    assert observed["H"] == 1.0
+
+
+def test_short_history_index_member_is_not_a_core_rank_reference() -> None:
+    assert _is_core_rank_reference(1, 0, 0.25) is True
+    assert _is_core_rank_reference(0, 1, -0.10) is True
+    assert _is_core_rank_reference(1, 0, None) is False
+    assert _is_core_rank_reference(0, 0, 0.25) is False
+
+
+def test_live_general_universe_keeps_us_listed_foreign_stock_and_excludes_funds(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "source.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE daily_observations(
+          source TEXT,symbol TEXT,trade_date TEXT,open REAL,high REAL,low REAL,
+          close REAL,adjusted_close REAL,volume REAL,vwap REAL
+        );
+        CREATE TABLE fmp_training_facts(
+          id INTEGER PRIMARY KEY,endpoint_id TEXT,symbol TEXT,row_json TEXT
+        );
+        """
+    )
+    profiles = {
+        "JOBY": {"exchangeShortName": "NYSE", "isActivelyTrading": True},
+        "TSM": {"exchangeShortName": "NYSE", "country": "TW", "isActivelyTrading": True},
+        "SPY": {
+            "exchangeShortName": "AMEX",
+            "isActivelyTrading": True,
+            "isEtf": True,
+        },
+        "OLD": {"exchangeShortName": "NASDAQ", "isActivelyTrading": False},
+    }
+    for number, (symbol, profile) in enumerate(profiles.items(), 1):
+        connection.execute(
+            "INSERT INTO daily_observations VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("fmp", symbol, "2026-08-26", 1, 1, 1, 1, 1, 100, 1),
+        )
+        connection.execute(
+            "INSERT INTO fmp_training_facts VALUES(?,?,?,?)",
+            (
+                number,
+                "company_information_company_profile_data",
+                symbol,
+                json.dumps(profile),
+            ),
+        )
+    connection.commit()
+    connection.close()
+    with SourceBundle(database, None) as source:
+        symbols, audit = source.active_us_exchange_stock_universe("2026-08-26")
+    assert symbols == ["JOBY", "TSM"]
+    assert audit["point_in_time_status"] == "NOT_HISTORICAL_PIT_DO_NOT_USE_FOR_OOS"
+    assert audit["exclusions"]["etf"] == 1
+    assert audit["exclusions"]["inactive"] == 1
+
+
 def test_live_source_is_isolated_and_increment_wins(tmp_path: Path) -> None:
     base = tmp_path / "base.sqlite3"
     incremental = tmp_path / "incremental.sqlite3"
@@ -204,9 +338,18 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
     database.write_bytes(b"immutable forecast")
     summary = run / "summary.json"
     summary.write_text(
-        '{"quality_gate":"PASS_SHADOW_RUN","signal_date":"2026-08-27",'
-        '"price_date":"2026-08-26","flow_date":"2026-08-25",'
-        '"stock_count":479,"validated_core_count":477,"general_shadow_count":2}',
+        json.dumps(
+            {
+                "schema_version": RUN_SCHEMA_VERSION,
+                "quality_gate": "PASS_SHADOW_RUN",
+                "signal_date": "2026-08-27",
+                "price_date": "2026-08-26",
+                "flow_date": "2026-08-25",
+                "stock_count": 479,
+                "validated_core_count": 477,
+                "general_shadow_count": 2,
+            }
+        ),
         encoding="utf-8",
     )
     latest = {

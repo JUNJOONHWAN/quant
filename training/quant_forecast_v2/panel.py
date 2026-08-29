@@ -40,7 +40,7 @@ from .index_membership import (
     validate_against_holdings,
 )
 from .io_utils import sha256_file, utc_now, write_json_atomic
-from .source import SnapshotMeta, SourceBundle
+from .source import SnapshotMeta, SourceBundle, canonical_symbol
 
 
 DEFAULT_BASE_DATABASE = Path(
@@ -176,6 +176,7 @@ def _legacy_timing_rows(
 def _membership_symbols(
     memberships: Mapping[str, Mapping[str, frozenset[str]]],
     timing_rows: Sequence[TimingRow],
+    general_shadow_symbols: Sequence[str] | None = None,
 ) -> tuple[list[str], dict[str, tuple[frozenset[str], frozenset[str]]]]:
     by_price_date = {}
     union: set[str] = set()
@@ -185,7 +186,41 @@ def _membership_symbols(
         by_price_date[timing.price_date] = (spy, qqq)
         union.update(spy)
         union.update(qqq)
+    union.update(
+        canonical_symbol(symbol) for symbol in (general_shadow_symbols or ())
+    )
+    union.discard("")
     return sorted(union), by_price_date
+
+
+def _rank_against_core(values: pd.Series, core_mask: pd.Series) -> pd.Series:
+    """Preserve core rank semantics and project shadow rows onto that scale."""
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    result = pd.Series(np.nan, index=numeric.index, dtype=float)
+    core = numeric[core_mask].dropna()
+    if core.empty:
+        return numeric.rank(method="average", pct=True)
+    result.loc[core.index] = core.rank(method="average", pct=True)
+    sorted_core = np.sort(core.to_numpy(dtype=float))
+    denominator = float(len(sorted_core))
+    floor = 1.0 / denominator
+    for index, value in numeric[~core_mask].dropna().items():
+        left = int(np.searchsorted(sorted_core, float(value), side="left"))
+        right = int(np.searchsorted(sorted_core, float(value), side="right"))
+        projected = (left + 0.5 * (right - left)) / denominator
+        result.at[index] = min(1.0, max(floor, projected))
+    return result
+
+
+def _is_core_rank_reference(
+    is_spy_member: object, is_qqq_member: object, ret_120d: object
+) -> bool:
+    """Match the model-era core rank denominator: member plus 120-day history."""
+
+    return bool(int(is_spy_member or 0) == 1 or int(is_qqq_member or 0) == 1) and (
+        _finite_or_none(ret_120d) is not None
+    )
 
 
 def _row_values(record: Mapping[str, object]) -> tuple[object, ...]:
@@ -208,6 +243,7 @@ def _price_phase(
     timing_rows: Sequence[TimingRow],
     symbols: Sequence[str],
     memberships_by_date: Mapping[str, tuple[frozenset[str], frozenset[str]]],
+    general_shadow_symbols: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     spy_frame = price_frame(source.price_rows("SPY"), sessions)
     qqq_frame = price_frame(source.price_rows("QQQ"), sessions)
@@ -219,6 +255,13 @@ def _price_phase(
     excluded_price_history = 0
     symbols_without_price = 0
     batch: list[tuple[object, ...]] = []
+    general_shadow_set = {
+        canonical_symbol(symbol) for symbol in (general_shadow_symbols or ())
+    }
+    general_shadow_inserted_rows = 0
+    live_general_shadow_symbols: set[str] = set()
+    general_candidate_short_history_rows = 0
+    live_general_candidate_short_history_symbols: set[str] = set()
     legacy_dates = {
         row.signal_date: sessions[bisect.bisect_left(sessions, row.signal_date) - 3]
         for row in timing_rows
@@ -238,17 +281,26 @@ def _price_phase(
             spy_members, qqq_members = memberships_by_date[timing.price_date]
             is_spy = symbol in spy_members
             is_qqq = symbol in qqq_members
-            if not is_spy and not is_qqq:
+            is_general_candidate = symbol in general_shadow_set
+            is_general_shadow = is_general_candidate and not is_spy and not is_qqq
+            if not is_spy and not is_qqq and not is_general_candidate:
                 continue
             benchmark = "QQQ" if is_qqq else "SPY"
             feature_frame = qqq_features if benchmark == "QQQ" else spy_features
             price_values = feature_frame.loc[timing.price_date]
             reference_close = frame.at[timing.price_date, "close"]
-            if not math.isfinite(reference_close) or not math.isfinite(
+            has_long_history = math.isfinite(
                 float(price_values.get("ret_120d", np.nan))
+            )
+            if not math.isfinite(reference_close) or (
+                not has_long_history and not is_general_candidate
             ):
                 excluded_price_history += 1
                 continue
+            if is_general_candidate and not has_long_history:
+                general_candidate_short_history_rows += 1
+                if timing.signal_date == timing_rows[-1].signal_date:
+                    live_general_candidate_short_history_symbols.add(symbol)
             record: dict[str, object] = {
                 "signal_date": timing.signal_date,
                 "price_date": timing.price_date,
@@ -258,7 +310,11 @@ def _price_phase(
                 "benchmark": benchmark,
                 "is_spy_member": int(is_spy),
                 "is_qqq_member": int(is_qqq),
-                "membership_source": "fmp_index_history_reverse_v1",
+                "membership_source": (
+                    "fmp_current_active_us_exchange_shadow_v1"
+                    if is_general_shadow
+                    else "fmp_index_history_reverse_v1"
+                ),
                 "reference_close": reference_close,
             }
             for column in FEATURE_GROUPS["price"]:
@@ -271,6 +327,10 @@ def _price_phase(
                 record[column] = price_values.get(column)
             batch.append(_row_values(record))
             inserted += 1
+            if is_general_shadow:
+                general_shadow_inserted_rows += 1
+                if timing.signal_date == timing_rows[-1].signal_date:
+                    live_general_shadow_symbols.add(symbol)
             if len(batch) >= 10_000:
                 connection.executemany(insert_sql, batch)
                 batch.clear()
@@ -284,6 +344,13 @@ def _price_phase(
         "symbols_without_price": symbols_without_price,
         "inserted_rows": inserted,
         "excluded_insufficient_price_history": excluded_price_history,
+        "general_shadow_requested_symbol_count": len(general_shadow_set),
+        "general_shadow_inserted_rows": general_shadow_inserted_rows,
+        "live_general_shadow_inserted_symbol_count": len(live_general_shadow_symbols),
+        "general_candidate_short_history_rows": general_candidate_short_history_rows,
+        "live_general_candidate_short_history_symbol_count": len(
+            live_general_candidate_short_history_symbols
+        ),
     }
 
 
@@ -423,12 +490,13 @@ def _flow_phase(
             flow_missing_dates.append(timing.signal_date)
         price_rows = list(
             connection.execute(
-                "SELECT symbol,benchmark,ret_5d FROM panel WHERE signal_date=?",
+                "SELECT symbol,benchmark,ret_5d,is_spy_member,is_qqq_member,ret_120d "
+                "FROM panel WHERE signal_date=?",
                 (timing.signal_date,),
             )
         )
         raw_by_symbol: dict[str, dict[str, float]] = {}
-        for symbol, _, _ in price_rows:
+        for symbol, _, _, _, _, _ in price_rows:
             current_position = session_positions[timing.signal_date]
             if last_position.get(symbol, current_position - 1) != current_position - 1:
                 histories[symbol].clear()
@@ -442,13 +510,21 @@ def _flow_phase(
             raw_by_symbol[str(symbol)] = raw
         if raw_by_symbol:
             rank_frame = pd.DataFrame.from_dict(raw_by_symbol, orient="index")
+            core_symbols = {
+                str(symbol)
+                for symbol, _, _, is_spy, is_qqq, ret_120d in price_rows
+                if _is_core_rank_reference(is_spy, is_qqq, ret_120d)
+            }
+            core_mask = pd.Series(
+                rank_frame.index.isin(core_symbols), index=rank_frame.index
+            )
             for source_column, target_column in (
                 ("all_etf_flow_net", "all_etf_flow_rank"),
                 ("all_etf_flow_breadth", "all_etf_flow_breadth_rank"),
                 ("all_etf_flow_weight_coverage", "all_etf_flow_coverage_rank"),
             ):
-                rank_frame[target_column] = rank_frame[source_column].rank(
-                    method="average", pct=True
+                rank_frame[target_column] = _rank_against_core(
+                    rank_frame[source_column], core_mask
                 )
                 for symbol, value in rank_frame[target_column].items():
                     raw_by_symbol[str(symbol)][target_column] = float(value)
@@ -456,7 +532,7 @@ def _flow_phase(
         t3 = benchmark_t3[timing.price_date]
         updates = []
         coverage_values = []
-        for symbol, benchmark, ret_5d in price_rows:
+        for symbol, benchmark, ret_5d, _, _, _ in price_rows:
             values: dict[str, float] = {**t2, **t3}
             values.update(_benchmark_aliases(t2, str(benchmark)))
             values.update(_benchmark_aliases(t3, str(benchmark), legacy=True))
@@ -518,14 +594,26 @@ def _price_cross_section_ranks(connection: sqlite3.Connection) -> int:
     )
     for number, signal_date in enumerate(dates, 1):
         frame = pd.read_sql_query(
-            "SELECT symbol,ret_20d,realized_vol_20d,log_market_cap "
+            "SELECT symbol,ret_20d,realized_vol_20d,log_market_cap,ret_120d,"
+            "is_spy_member,is_qqq_member "
             "FROM panel WHERE signal_date=?",
             connection,
             params=(signal_date,),
         ).set_index("symbol")
-        frame["momentum_rank_20d"] = frame["ret_20d"].rank(pct=True)
-        frame["volatility_rank_20d"] = frame["realized_vol_20d"].rank(pct=True)
-        frame["size_rank"] = frame["log_market_cap"].rank(pct=True)
+        core_mask = pd.Series(
+            [
+                _is_core_rank_reference(row.is_spy_member, row.is_qqq_member, row.ret_120d)
+                for row in frame.itertuples()
+            ],
+            index=frame.index,
+        )
+        frame["momentum_rank_20d"] = _rank_against_core(
+            frame["ret_20d"], core_mask
+        )
+        frame["volatility_rank_20d"] = _rank_against_core(
+            frame["realized_vol_20d"], core_mask
+        )
+        frame["size_rank"] = _rank_against_core(frame["log_market_cap"], core_mask)
         rows = [
             (
                 _finite_or_none(row.momentum_rank_20d),
@@ -662,6 +750,7 @@ def build_panel(
     end_date: str | None,
     live_signal_date: str | None,
     replace: bool,
+    general_shadow_symbols: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -690,7 +779,9 @@ def build_panel(
         membership_validation = validate_against_holdings(
             source, metadata, memberships, sessions
         )
-        symbols, memberships_by_date = _membership_symbols(memberships, timing_rows)
+        symbols, memberships_by_date = _membership_symbols(
+            memberships, timing_rows, general_shadow_symbols
+        )
         flow_cache_audit = build_flow_cache(
             source, sessions, flow_cache_path, replace=replace or not flow_cache_path.exists()
         )
@@ -713,6 +804,7 @@ def build_panel(
                 timing_rows,
                 symbols,
                 memberships_by_date,
+                general_shadow_symbols,
             )
             with _flow_cache_context(flow_cache_path) as cache:
                 flow_audit = _flow_phase(
@@ -754,6 +846,17 @@ def build_panel(
             },
             "membership_reconstruction": reconstruction_audit,
             "membership_validation": membership_validation,
+            "general_shadow_universe": {
+                "requested_symbol_count": len(
+                    {
+                        canonical_symbol(symbol)
+                        for symbol in (general_shadow_symbols or ())
+                        if canonical_symbol(symbol)
+                    }
+                ),
+                "membership_source": "fmp_current_active_us_exchange_shadow_v1",
+                "historical_validation_status": "NOT_PIT_DO_NOT_USE_FOR_OOS",
+            },
             "live_flow_capture_audit": live_capture_audit,
             "flow_cache": flow_cache_audit,
             "price_phase": price_audit,
