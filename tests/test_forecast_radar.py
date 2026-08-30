@@ -462,8 +462,17 @@ def test_scheduled_daily_returns_one_compact_verified_payload(
             "market": {"large": "must not leak into scheduled output"},
         }
 
+    def fake_evaluate_outcomes(**kwargs):
+        assert kwargs == {"live_root": tmp_path}
+        return {
+            "status": "RECORDED",
+            "cohort_count": 477,
+            "latest_signal_date": "2026-08-27",
+        }
+
     monkeypatch.setattr(cli, "run_daily", fake_run_daily)
     monkeypatch.setattr(cli, "query_latest", fake_query_latest)
+    monkeypatch.setattr(cli, "evaluate_outcomes", fake_evaluate_outcomes)
     assert cli.main(["scheduled-daily", "--live-root", str(tmp_path)]) == 0
     observed = json.loads(capsys.readouterr().out)
     assert calls == [
@@ -472,4 +481,36 @@ def test_scheduled_daily_returns_one_compact_verified_payload(
     assert observed["batch"]["quality_gate"] == "NOOP_ALREADY_CURRENT"
     assert observed["latest"]["database_sha256"] == "db-hash"
     assert observed["probability_resolution"]["p_up_5d_distinct_count"] == 11
+    assert observed["evaluation_477"]["cohort_count"] == 477
     assert "market" not in observed
+
+
+def test_scheduled_daily_keeps_forecast_visible_when_evaluation_fails(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "run_daily",
+        lambda **kwargs: {"quality_gate": "NOOP_ALREADY_CURRENT", "run_id": "run-1"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "query_latest",
+        lambda **kwargs: {
+            "latest": {"run_id": "run-1", "quality_gate": "PASS_SHADOW_RUN"},
+            "probability_resolution": {"p_up_5d_distinct_count": 11},
+        },
+    )
+
+    def fail_evaluation(**kwargs):
+        raise RuntimeError("ledger locked")
+
+    monkeypatch.setattr(cli, "evaluate_outcomes", fail_evaluation)
+    assert cli.main(["scheduled-daily", "--live-root", str(tmp_path)]) == 0
+    observed = json.loads(capsys.readouterr().out)
+    assert observed["latest"]["quality_gate"] == "PASS_SHADOW_RUN"
+    assert observed["evaluation_477"] == {
+        "status": "ERROR_RECORDING_FAILED",
+        "error_type": "RuntimeError",
+        "error": "ledger locked",
+    }

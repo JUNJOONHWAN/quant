@@ -23,6 +23,22 @@ DEFAULT_DATA_ROOT: Final = Path(
 DEFAULT_MODEL_ROOT: Final = DEFAULT_DATA_ROOT / "model"
 DEFAULT_LIVE_ROOT: Final = DEFAULT_DATA_ROOT / "live"
 DEFAULT_RESEARCH_ROOT: Final = DEFAULT_DATA_ROOT / "research"
+DEFAULT_EVALUATION_477_ROOT: Final = DEFAULT_DATA_ROOT / "evaluation_477"
+DEFAULT_EVALUATION_477_DATABASE: Final = (
+    DEFAULT_EVALUATION_477_ROOT / "forecast_radar_477_outcomes.sqlite3"
+)
+
+# The validated-core evaluation universe is intentionally immutable.  It is
+# sourced from the last 477-name Forecast RADAR run before the live universe
+# expanded.  The digest is SHA-256 of the sorted symbols joined with a newline,
+# including a final newline.
+EVALUATION_477_COHORT_SOURCE_DATABASE: Final = DEFAULT_LIVE_ROOT / "runs" / (
+    "20260829T004147282951Z/forecast_radar.sqlite3"
+)
+EVALUATION_477_COHORT_COUNT: Final = 477
+EVALUATION_477_COHORT_SHA256: Final = (
+    "04b987525171a89eb3d6d185641f6471018fa6083a5518c07fe94527a7748714"
+)
 
 DEFAULT_BASE_DATABASE: Final = Path(
     "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET/normalized/"
