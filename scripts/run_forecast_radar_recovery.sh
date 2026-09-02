@@ -43,6 +43,8 @@ target = str(latest.get("oracle_target_as_of_date") or "")[:10]
 price_date = str(latest.get("price_date") or "")[:10]
 fingerprint = str(latest.get("oracle_source_fingerprint_sha256") or "")
 seal = str(latest.get("oracle_snapshot_seal_sha256") or "")
+data_quality_status = str(latest.get("oracle_data_quality_status") or "")
+data_quality_fingerprint = str(latest.get("oracle_data_quality_sha256") or "")
 if quality_gate not in allowed:
     raise SystemExit(f"Forecast RADAR quality gate failed: {quality_gate or 'missing'}")
 if not target or price_date != target:
@@ -51,6 +53,10 @@ if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
     raise SystemExit("Forecast RADAR Oracle source fingerprint is missing")
 if not re.fullmatch(r"[0-9a-f]{64}", seal):
     raise SystemExit("Forecast RADAR Oracle snapshot seal is missing")
+if data_quality_status != "PASS":
+    raise SystemExit("Forecast RADAR source-data quality gate did not pass")
+if not re.fullmatch(r"[0-9a-f]{64}", data_quality_fingerprint):
+    raise SystemExit("Forecast RADAR source-data quality fingerprint is missing")
 state = {
     "schema": "vectorman.forecast-radar-recovery/v1",
     "status": "complete",
@@ -60,6 +66,8 @@ state = {
         "target_as_of_date": target,
         "source_fingerprint_sha256": fingerprint,
         "snapshot_seal_sha256": seal,
+        "data_quality_status": data_quality_status,
+        "data_quality_sha256": data_quality_fingerprint,
     },
     "forecast": {
         "run_id": latest.get("run_id"),

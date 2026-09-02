@@ -6,7 +6,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from quant_dataset.shared_market import SharedMarketBinding
 from workflows.forecast_radar import cli
 from workflows.forecast_radar.contracts import (
     COVERAGE_VALIDATED_CORE,
@@ -30,6 +32,7 @@ from workflows.forecast_radar.pipeline import (
     current_completed_run,
     query_latest,
 )
+from workflows.forecast_radar.source_quality import validate_forecast_source_quality
 from training.quant_forecast_v2.panel import _is_core_rank_reference, _rank_against_core
 from training.quant_forecast_v2.source import SourceBundle
 
@@ -70,6 +73,99 @@ def _source(path: Path, *, incremental: bool) -> None:
     )
     connection.commit()
     connection.close()
+
+
+def _quality_binding(tmp_path: Path) -> SharedMarketBinding:
+    target = "2026-08-26"
+    previous = "2026-08-25"
+    incremental = tmp_path / "incremental.sqlite3"
+    status_path = tmp_path / "oracle_status.json"
+    connection = sqlite3.connect(incremental)
+    connection.executescript(
+        """
+        CREATE TABLE daily_observations(
+          source TEXT,symbol TEXT,trade_date TEXT,open REAL,high REAL,low REAL,
+          close REAL,adjusted_close REAL,volume REAL,raw_artifact_id INTEGER,
+          capture_event_id INTEGER,source_row_index INTEGER,source_timestamp_ms INTEGER,
+          PRIMARY KEY(source,symbol,trade_date)
+        );
+        CREATE TABLE quality_checks(
+          symbol TEXT,trade_date TEXT,status TEXT,sources_json TEXT,metrics_json TEXT,
+          reasons_json TEXT,tolerances_json TEXT,computed_at_utc TEXT,
+          PRIMARY KEY(symbol,trade_date)
+        );
+        """
+    )
+    for offset, symbol in enumerate(("SPY", "QQQ", "IWM", "DIA"), start=1):
+        for trade_date, close in ((previous, 100.0 + offset), (target, 101.0 + offset)):
+            connection.execute(
+                "INSERT INTO daily_observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "fmp", symbol, trade_date, close, close + 1.0, close - 1.0,
+                    close, close, 1_000_000.0, 1, 1, offset, 0,
+                ),
+            )
+        connection.execute(
+            "INSERT INTO quality_checks VALUES(?,?,?,?,?,?,?,?)",
+            (symbol, target, "single_source", "{}", "{}", "[]", "{}", "now"),
+        )
+    connection.commit()
+    connection.close()
+    status_path.write_text(
+        json.dumps(
+            {
+                "target_as_of_date": target,
+                "market_row_gate": {"rows_by_session": {target: 4}},
+                "symbol_coverage_gate": {
+                    "sessions": {
+                        target: {
+                            "status": "complete",
+                            "error_count": 0,
+                            "bar_count": 4,
+                            "missing_after": [],
+                            "invalid_before_count": 0,
+                            "invalid_no_bar_count": 0,
+                            "quarantined_invalid_bar_count": 0,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SharedMarketBinding(
+        base_database=tmp_path / "base.sqlite3",
+        incremental_database=incremental,
+        oracle_status_path=status_path,
+        base_history_end="2026-08-24",
+        target_as_of_date=target,
+        latest_flow_effective_date="2026-08-24",
+        latest_constituent_effective_date="2026-08-24",
+        latest_constituent_available_date="2026-08-24",
+        constituent_available_lag_days=2,
+        corporate_action_visible_record_count=0,
+        corporate_action_projection_sha256="a" * 64,
+        source_fingerprint_sha256="b" * 64,
+        source_fingerprint={},
+    )
+
+
+def test_source_quality_blocks_invalid_target_bars_before_forecast_generation(
+    tmp_path: Path,
+) -> None:
+    binding = _quality_binding(tmp_path)
+    passed = validate_forecast_source_quality(binding)
+    assert passed["status"] == "PASS"
+    assert len(passed["data_fingerprint_sha256"]) == 64
+    with sqlite3.connect(binding.incremental_database) as connection:
+        connection.execute(
+            "UPDATE daily_observations SET high=1.0 WHERE source='fmp' "
+            "AND symbol='SPY' AND trade_date=?",
+            (binding.target_as_of_date,),
+        )
+        connection.commit()
+    with pytest.raises(RuntimeError, match="invalid_ohlcv_rows=1"):
+        validate_forecast_source_quality(binding)
 
 
 def test_contract_has_exact_t_minus_2_flow() -> None:
@@ -352,7 +448,11 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
                     "shared_oracle_store": {
                         "target_as_of_date": "2026-08-26",
                         "source_fingerprint_sha256": "a" * 64,
-                    }
+                    },
+                    "forecast_source_data_quality": {
+                        "status": "PASS",
+                        "data_fingerprint_sha256": "c" * 64,
+                    },
                 },
             }
         ),
@@ -368,6 +468,8 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
         "database_sha256": sha256_file(database),
         "oracle_target_as_of_date": "2026-08-26",
         "oracle_source_fingerprint_sha256": "a" * 64,
+        "oracle_data_quality_status": "PASS",
+        "oracle_data_quality_sha256": "c" * 64,
     }
     (tmp_path / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
     observed = current_completed_run(
@@ -375,6 +477,7 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
         "2026-08-27",
         oracle_target_as_of_date="2026-08-26",
         oracle_source_fingerprint_sha256="a" * 64,
+        oracle_data_quality_sha256="c" * 64,
     )
     assert observed is not None
     assert observed["quality_gate"] == "NOOP_ALREADY_CURRENT"
@@ -384,6 +487,16 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
             "2026-08-27",
             oracle_target_as_of_date="2026-08-26",
             oracle_source_fingerprint_sha256="b" * 64,
+        )
+        is None
+    )
+    assert (
+        current_completed_run(
+            tmp_path,
+            "2026-08-27",
+            oracle_target_as_of_date="2026-08-26",
+            oracle_source_fingerprint_sha256="a" * 64,
+            oracle_data_quality_sha256="d" * 64,
         )
         is None
     )

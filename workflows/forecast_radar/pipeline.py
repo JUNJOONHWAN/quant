@@ -48,6 +48,7 @@ from .live_features import (
     project_fixed_latent,
 )
 from .model_bundle import calibrate_probability, load_bundle
+from .source_quality import validate_forecast_source_quality
 
 
 def _next_weekday(value: str) -> str:
@@ -106,6 +107,28 @@ def _matches_oracle_binding(
         == target_as_of_date
         and str(shared_oracle.get("source_fingerprint_sha256") or "")
         == source_fingerprint_sha256
+    )
+
+
+def _matches_source_quality(
+    latest: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    *,
+    data_fingerprint_sha256: str,
+) -> bool:
+    """Require the report to carry the same passing source-data attestation."""
+
+    source_status = summary.get("source_status")
+    source_status = source_status if isinstance(source_status, Mapping) else {}
+    quality = source_status.get("forecast_source_data_quality")
+    quality = quality if isinstance(quality, Mapping) else {}
+    return (
+        str(latest.get("oracle_data_quality_status") or "") == "PASS"
+        and str(latest.get("oracle_data_quality_sha256") or "")
+        == data_fingerprint_sha256
+        and str(quality.get("status") or "") == "PASS"
+        and str(quality.get("data_fingerprint_sha256") or "")
+        == data_fingerprint_sha256
     )
 
 
@@ -417,6 +440,7 @@ def current_completed_run(
     *,
     oracle_target_as_of_date: str | None = None,
     oracle_source_fingerprint_sha256: str | None = None,
+    oracle_data_quality_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a verified current run, or None when a fresh batch is required."""
 
@@ -450,6 +474,12 @@ def current_completed_run(
                 source_fingerprint_sha256=oracle_source_fingerprint_sha256,
             ):
                 return None
+        if oracle_data_quality_sha256 and not _matches_source_quality(
+            latest,
+            summary,
+            data_fingerprint_sha256=oracle_data_quality_sha256,
+        ):
+            return None
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return {
@@ -485,6 +515,7 @@ def run_daily(
         incremental_database=incremental_database,
     )
     oracle_binding = oracle_binding_metadata(binding)
+    source_quality = validate_forecast_source_quality(binding)
     timing = infer_signal_date(base_database, incremental_database)
     if binding.target_as_of_date != timing["price_date"]:
         raise RuntimeError(
@@ -506,6 +537,7 @@ def run_daily(
             signal,
             oracle_target_as_of_date=binding.target_as_of_date,
             oracle_source_fingerprint_sha256=binding.source_fingerprint_sha256,
+            oracle_data_quality_sha256=source_quality["data_fingerprint_sha256"],
         )
         if current is not None:
             return current
@@ -652,8 +684,26 @@ def run_daily(
         "general_shadow_count": len(general_shadow_forecasts),
         "activation_status": "SHADOW_ONLY",
         "model_manifest_sha256": sha256_file(Path(model_root) / "model_manifest.json"),
-        "source_status": {"shared_oracle_store": oracle_binding},
+        "source_status": {
+            "shared_oracle_store": oracle_binding,
+            "forecast_source_data_quality": source_quality,
+        },
     }
+    publish_binding = load_shared_market_binding(
+        base_database=base_database,
+        incremental_database=incremental_database,
+    )
+    publish_quality = validate_forecast_source_quality(publish_binding)
+    if (
+        publish_binding.target_as_of_date != binding.target_as_of_date
+        or publish_binding.source_fingerprint_sha256
+        != binding.source_fingerprint_sha256
+        or publish_quality["data_fingerprint_sha256"]
+        != source_quality["data_fingerprint_sha256"]
+    ):
+        raise RuntimeError(
+            "Forecast RADAR source changed during generation; refusing to publish"
+        )
     database_path = run_root / "forecast_radar.sqlite3"
     _write_forecast_database(
         path=database_path,
@@ -710,6 +760,8 @@ def run_daily(
         "activation_status": "SHADOW_ONLY",
         "oracle_target_as_of_date": binding.target_as_of_date,
         "oracle_source_fingerprint_sha256": binding.source_fingerprint_sha256,
+        "oracle_data_quality_status": source_quality["status"],
+        "oracle_data_quality_sha256": source_quality["data_fingerprint_sha256"],
         "oracle_snapshot_seal_sha256": str(
             oracle_binding["snapshot_seal"].get("receipt_sha256") or ""
         ),
@@ -753,6 +805,16 @@ def query_latest(
             raise ValueError(
                 "latest Forecast RADAR source fingerprint is stale relative to "
                 "the sealed Oracle; run forecast-radar scheduled-daily"
+            )
+        source_quality = validate_forecast_source_quality(binding)
+        if not _matches_source_quality(
+            latest,
+            summary,
+            data_fingerprint_sha256=source_quality["data_fingerprint_sha256"],
+        ):
+            raise ValueError(
+                "latest Forecast RADAR lacks a current passing source-data quality gate; "
+                "run forecast-radar scheduled-daily"
             )
     latest_view = {
         **latest,
