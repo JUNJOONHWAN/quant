@@ -348,6 +348,12 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
                 "stock_count": 479,
                 "validated_core_count": 477,
                 "general_shadow_count": 2,
+                "source_status": {
+                    "shared_oracle_store": {
+                        "target_as_of_date": "2026-08-26",
+                        "source_fingerprint_sha256": "a" * 64,
+                    }
+                },
             }
         ),
         encoding="utf-8",
@@ -360,11 +366,27 @@ def test_current_completed_run_is_idempotent_and_hash_gated(tmp_path: Path) -> N
         "summary_sha256": sha256_file(summary),
         "database_path": str(database),
         "database_sha256": sha256_file(database),
+        "oracle_target_as_of_date": "2026-08-26",
+        "oracle_source_fingerprint_sha256": "a" * 64,
     }
     (tmp_path / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
-    observed = current_completed_run(tmp_path, "2026-08-27")
+    observed = current_completed_run(
+        tmp_path,
+        "2026-08-27",
+        oracle_target_as_of_date="2026-08-26",
+        oracle_source_fingerprint_sha256="a" * 64,
+    )
     assert observed is not None
     assert observed["quality_gate"] == "NOOP_ALREADY_CURRENT"
+    assert (
+        current_completed_run(
+            tmp_path,
+            "2026-08-27",
+            oracle_target_as_of_date="2026-08-26",
+            oracle_source_fingerprint_sha256="b" * 64,
+        )
+        is None
+    )
     database.write_bytes(b"tampered")
     assert current_completed_run(tmp_path, "2026-08-27") is None
 
@@ -421,7 +443,11 @@ def test_query_latest_exposes_timing_and_probability_resolution(tmp_path: Path) 
         "database_sha256": sha256_file(database),
     }
     (tmp_path / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
-    observed = query_latest(live_root=tmp_path, symbol="NVDA")
+    observed = query_latest(
+        live_root=tmp_path,
+        symbol="NVDA",
+        verify_current_oracle=False,
+    )
     assert observed["latest"]["price_date"] == "2026-08-26"
     assert observed["latest"]["flow_date"] == "2026-08-25"
     assert observed["probability_resolution"]["p_up_5d_distinct_count"] == 2

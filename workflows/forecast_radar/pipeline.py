@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from quant_dataset.shared_market import SharedMarketBinding, load_shared_market_binding
 from training.quant_flow_graph.data import build_dataset
 from training.quant_flow_graph_v11_r2.phase_a import (
     build_event_cube,
@@ -67,6 +68,45 @@ def infer_signal_date(base_database: Path, incremental_database: Path) -> dict[s
         "price_date": sessions[-1],
         "flow_date": sessions[-2],
     }
+
+
+def oracle_binding_metadata(binding: SharedMarketBinding) -> dict[str, Any]:
+    """Return the sealed Oracle identity persisted with a Forecast RADAR run."""
+
+    metadata = binding.public_metadata()
+    incremental = binding.source_fingerprint.get("incremental")
+    snapshot_seal = (
+        incremental.get("snapshot_seal")
+        if isinstance(incremental, Mapping)
+        else {}
+    )
+    metadata["snapshot_seal"] = dict(snapshot_seal)
+    return metadata
+
+
+def _matches_oracle_binding(
+    latest: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    *,
+    target_as_of_date: str,
+    source_fingerprint_sha256: str,
+) -> bool:
+    """Reject a self-consistent run when its sealed source is no longer current."""
+
+    source_status = summary.get("source_status")
+    source_status = source_status if isinstance(source_status, Mapping) else {}
+    shared_oracle = source_status.get("shared_oracle_store")
+    shared_oracle = shared_oracle if isinstance(shared_oracle, Mapping) else {}
+    return (
+        str(latest.get("oracle_target_as_of_date") or "")
+        == target_as_of_date
+        and str(latest.get("oracle_source_fingerprint_sha256") or "")
+        == source_fingerprint_sha256
+        and str(shared_oracle.get("target_as_of_date") or "")
+        == target_as_of_date
+        and str(shared_oracle.get("source_fingerprint_sha256") or "")
+        == source_fingerprint_sha256
+    )
 
 
 def _reference_close_map(panel_path: Path, signal_date: str) -> dict[str, float]:
@@ -371,7 +411,13 @@ def _write_forecast_database(
     os.replace(temporary, path)
 
 
-def current_completed_run(live_root: Path, signal_date: str) -> dict[str, Any] | None:
+def current_completed_run(
+    live_root: Path,
+    signal_date: str,
+    *,
+    oracle_target_as_of_date: str | None = None,
+    oracle_source_fingerprint_sha256: str | None = None,
+) -> dict[str, Any] | None:
     """Return a verified current run, or None when a fresh batch is required."""
 
     latest_path = Path(live_root) / "latest.json"
@@ -394,6 +440,16 @@ def current_completed_run(live_root: Path, signal_date: str) -> dict[str, Any] |
             return None
         if summary.get("signal_date") != signal_date:
             return None
+        if oracle_target_as_of_date or oracle_source_fingerprint_sha256:
+            if not oracle_target_as_of_date or not oracle_source_fingerprint_sha256:
+                return None
+            if not _matches_oracle_binding(
+                latest,
+                summary,
+                target_as_of_date=oracle_target_as_of_date,
+                source_fingerprint_sha256=oracle_source_fingerprint_sha256,
+            ):
+                return None
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return {
@@ -424,12 +480,33 @@ def run_daily(
     model_root: Path = DEFAULT_MODEL_ROOT,
     live_root: Path = DEFAULT_LIVE_ROOT,
 ) -> dict[str, Any]:
+    binding = load_shared_market_binding(
+        base_database=base_database,
+        incremental_database=incremental_database,
+    )
+    oracle_binding = oracle_binding_metadata(binding)
     timing = infer_signal_date(base_database, incremental_database)
+    if binding.target_as_of_date != timing["price_date"]:
+        raise RuntimeError(
+            "Forecast RADAR price-date must equal the sealed Oracle target: "
+            f"price_date={timing['price_date']} oracle={binding.target_as_of_date}"
+        )
     if signal_date is not None:
         timing["signal_date"] = signal_date
     signal = timing["signal_date"]
+    expected_signal = _next_weekday(binding.target_as_of_date)
+    if signal != expected_signal:
+        raise RuntimeError(
+            "Forecast RADAR signal-date must be the next business day after "
+            f"the sealed Oracle target: signal_date={signal} expected={expected_signal}"
+        )
     if if_needed:
-        current = current_completed_run(live_root, signal)
+        current = current_completed_run(
+            live_root,
+            signal,
+            oracle_target_as_of_date=binding.target_as_of_date,
+            oracle_source_fingerprint_sha256=binding.source_fingerprint_sha256,
+        )
         if current is not None:
             return current
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -575,6 +652,7 @@ def run_daily(
         "general_shadow_count": len(general_shadow_forecasts),
         "activation_status": "SHADOW_ONLY",
         "model_manifest_sha256": sha256_file(Path(model_root) / "model_manifest.json"),
+        "source_status": {"shared_oracle_store": oracle_binding},
     }
     database_path = run_root / "forecast_radar.sqlite3"
     _write_forecast_database(
@@ -630,6 +708,11 @@ def run_daily(
         "database_path": str(database_path),
         "database_sha256": sha256_file(database_path),
         "activation_status": "SHADOW_ONLY",
+        "oracle_target_as_of_date": binding.target_as_of_date,
+        "oracle_source_fingerprint_sha256": binding.source_fingerprint_sha256,
+        "oracle_snapshot_seal_sha256": str(
+            oracle_binding["snapshot_seal"].get("receipt_sha256") or ""
+        ),
     }
     write_json_atomic(Path(live_root) / "latest.json", latest)
     return summary
@@ -640,12 +723,37 @@ def query_latest(
     live_root: Path,
     symbol: str | None = None,
     sector: str | None = None,
+    verify_current_oracle: bool = True,
+    base_database: Path = DEFAULT_BASE_DATABASE,
+    incremental_database: Path = DEFAULT_INCREMENTAL_DATABASE,
 ) -> dict[str, Any]:
     latest = json.loads((Path(live_root) / "latest.json").read_text(encoding="utf-8"))
     summary_path = Path(latest["summary_path"])
     if sha256_file(summary_path) != latest["summary_sha256"]:
         raise ValueError("latest Forecast RADAR summary hash mismatch")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if verify_current_oracle:
+        binding = load_shared_market_binding(
+            base_database=base_database,
+            incremental_database=incremental_database,
+        )
+        expected_signal = _next_weekday(binding.target_as_of_date)
+        if str(latest.get("signal_date") or "") != expected_signal:
+            raise ValueError(
+                "latest Forecast RADAR is stale relative to Oracle: "
+                f"signal_date={latest.get('signal_date')} expected={expected_signal}; "
+                "run forecast-radar scheduled-daily"
+            )
+        if not _matches_oracle_binding(
+            latest,
+            summary,
+            target_as_of_date=binding.target_as_of_date,
+            source_fingerprint_sha256=binding.source_fingerprint_sha256,
+        ):
+            raise ValueError(
+                "latest Forecast RADAR source fingerprint is stale relative to "
+                "the sealed Oracle; run forecast-radar scheduled-daily"
+            )
     latest_view = {
         **latest,
         "price_date": summary.get("price_date"),
