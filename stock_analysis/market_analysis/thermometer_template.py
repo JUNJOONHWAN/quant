@@ -11,14 +11,19 @@ from html import escape
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .dgx_paths import choose_output_dir
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE_PATH = PROJECT_ROOT / "reports/templates/thermometer_mobile420_base.html"
-LOCAL_THERMOMETER_DIR = PROJECT_ROOT / "sweet_spot_reports"
 ICLOUD_THERMOMETER_DIR = (
-    Path.home()
-    / "Library/Mobile Documents/com~apple~CloudDocs/STOCK/온도계"
+    choose_output_dir(
+        "STOCK_THERMOMETER_DIR",
+        "온도계",
+        legacy_mac_path=Path("/home/zooh/Documents/DGX_Outputs/STOCK/온도계"),
+    )
 )
+LOCAL_THERMOMETER_DIR = ICLOUD_THERMOMETER_DIR
 
 
 def _text(value: Any) -> str:
@@ -902,9 +907,7 @@ def write_thermometer_html(report: Mapping[str, Any], output_path: Path) -> Path
 
 
 def write_thermometer_archive(report: Mapping[str, Any], filename: str) -> Mapping[str, Path]:
-    """Write one thermometer report to the local cache and iCloud archive."""
-    local_path = LOCAL_THERMOMETER_DIR / filename
-    icloud_path = ICLOUD_THERMOMETER_DIR / filename
-    write_thermometer_html(report, local_path)
-    write_thermometer_html(report, icloud_path)
-    return {"local": local_path, "icloud": icloud_path}
+    """Write one thermometer report to the canonical DGX archive."""
+    output_path = ICLOUD_THERMOMETER_DIR / filename
+    write_thermometer_html(report, output_path)
+    return {"html": output_path, "local": output_path, "icloud": output_path}

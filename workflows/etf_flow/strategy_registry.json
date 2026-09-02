@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "default_strategy": "primary",
+  "execution_policy": "one strategy per refresh; select an alternative only after a rejected result",
+  "strategies": [
+    {
+      "id": "primary",
+      "executor": "run_hermes_etf_flow_analysis.py",
+      "purpose": "News-enriched six-question market analysis",
+      "selection_trigger": "routine refresh",
+      "acceptance": ["validated packet", "six sections", "exact evidence values", "coverage contract"]
+    },
+    {
+      "id": "evidence_editor",
+      "executor": "refine_etf_flow_analysis.py --strategy evidence_editor",
+      "purpose": "Polish Korean and correct evidence/session prose",
+      "selection_trigger": "primary answer fails editorial or evidence phrasing review",
+      "acceptance": ["primary acceptance", "natural Korean", "no non-Korean Han characters", "observed-session wording only"]
+    },
+    {
+      "id": "conservative_editor",
+      "executor": "refine_etf_flow_analysis.py --strategy conservative_editor",
+      "purpose": "Reframe overstated directional interpretation",
+      "selection_trigger": "primary overstates conviction under incomplete coverage",
+      "acceptance": ["primary acceptance", "coverage-weighted confidence", "observed facts separated from interpretation"]
+    },
+    {
+      "id": "coverage_editor",
+      "executor": "refine_etf_flow_analysis.py --strategy coverage_editor",
+      "purpose": "Repair chronology, data lag, and missing-coverage explanation",
+      "selection_trigger": "primary has an unclear or incorrect coverage narrative",
+      "acceptance": ["primary acceptance", "exact observed session dates", "exact report coverage", "no invented missing sessions"]
+    }
+  ],
+  "feedback_log": "artifacts/strategy_feedback.jsonl"
+}

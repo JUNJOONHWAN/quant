@@ -1,0 +1,115 @@
+{
+  "app_id": "quant-ai-radar",
+  "capabilities": {
+    "required": [
+      "filesystem",
+      "terminal"
+    ]
+  },
+  "category": "report",
+  "contracts": {
+    "accepted_model_only": true,
+    "current_market_source": "market_structure_oracle_single_writer",
+    "etf_radar_runtime_dependency": false,
+    "explicit_request_routing": {
+      "aliases": [
+        "AI RADAR",
+        "AI Radar",
+        "AI 레이더",
+        "Quant AI Radar",
+        "quant-ai-radar"
+      ],
+      "default_action": "ask",
+      "source_rules": [
+        {
+          "all_phrases": [
+            "즐겨찾기"
+          ],
+          "input": {
+            "action": "analyze",
+            "symbols_file": "/home/zooh/Documents/GitHub/STOCK/favorites.json"
+          }
+        }
+      ]
+    },
+    "new_listing_policy": "the daily FMP active NASDAQ/NYSE/AMEX/CBOE master union same-day FMP legacy EOD discovers new securities; Massive flow and FMP profiles corroborate new ETFs; Oracle refreshes missing constituent snapshots first",
+    "daily_default_action": "reference_publish",
+    "daily_completion_contract": "accepted report and 420px Gmail message_id must match the current Oracle source fingerprint and report SHA; unchanged retries dedupe and a changed same-date Oracle seal emits one correction delivery",
+    "daily_generation_trigger": "KST 06:00, 12:00, and 18:00 readiness checks; generate only when the sealed Oracle fingerprint is not already covered by a green v2 FLOW report and Gmail v3 proof",
+    "daily_inference_policy": "dynamic material-evidence selection with maximum 64 ETFs and 192 stocks",
+    "flow_policy": "provider availability D+1/D+2 point-in-time plus a 10-calendar-day current-observation gate and absolute flow-to-net-assets plausibility gate; no post-as-of visibility",
+    "lookahead_in_features": false,
+    "on_demand_policy": "explicit symbols bypass daily capacity selection but must pass the same packet and model gates",
+    "natural_request_policy": "action=ask accepts a bounded question, runs fresh trained-model inference for explicit tickers, and answers market, candidate, or rotation requests only from the latest Oracle-date-matched green AI Radar report",
+    "output_schema": "quant.ai_radar_app_result.v1",
+    "request_input": {
+      "fields": [
+        "action",
+        "question",
+        "query",
+        "symbols",
+        "symbols_file",
+        "shadow",
+        "workers",
+        "max_ai_etfs",
+        "max_ai_stocks",
+        "smoke_max_items"
+      ],
+      "handoff": "sealed_json_file",
+      "max_bytes": 32768,
+      "type": "object"
+    },
+    "trade_execution": false
+  },
+  "description": "Oracle 단일 writer가 봉인한 FMP/Massive 공통 DB와 승인된 Qwen3-8B Quant LoRA만 사용해 전체 시장 및 요청 종목의 AI Radar 리포트를 생성하는 독립 앱이다. ETF RADAR는 별도 앱이며 런타임 의존성이 없다.",
+  "execution": {
+    "bypass_operations_worker": false,
+    "default_worker": "hermes-worker-general",
+    "worker_skills": [
+      "quant-market-analysis"
+    ]
+  },
+  "final_gates": [
+    {
+      "equals": 0,
+      "type": "exit_code"
+    },
+    {
+      "type": "stdout_nonempty"
+    }
+  ],
+  "managed": true,
+  "name": "Quant AI Radar",
+  "ownership": {
+    "control_plane": "operations",
+    "logic_owner": "application",
+    "multitool_runtime_dependency": false,
+    "supervisor_adapter_dependency": false
+  },
+  "preflight": {
+    "env": {
+      "QUANT_AI_RADAR_APP_PREFLIGHT_ONLY": "1"
+    },
+    "production_completion_claim_allowed": false,
+    "success_status": "PREFLIGHT_PASS"
+  },
+  "registered_at": "2026-07-29T20:30:00Z",
+  "runtime": {
+    "agent_selection": "not-applicable",
+    "entrypoint": "/home/zooh/Documents/GitHub/quant/scripts/ai-radar",
+    "kind": "command",
+    "timeout_seconds": 14400,
+    "workdir": "/home/zooh/Documents/GitHub/quant"
+  },
+  "schedule": {
+    "cron_job_id": "df8877b710a4",
+    "enabled": true,
+    "executor": "hermes-cron",
+    "expression": "0 6,12,18 * * 2-6",
+    "owner": "operations",
+    "timezone": "Asia/Seoul",
+    "wrapper": "/home/zooh/.hermes/scripts/operations_app_df8877b710a4.py"
+  },
+  "schema": "hermes-independent-app-v1",
+  "updated_at": "2026-07-31T07:45:00Z"
+}

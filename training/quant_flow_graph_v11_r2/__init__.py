@@ -1,0 +1,15 @@
+"""ETF Flow v11-R2 Drift-Diffusion research pipeline."""
+
+from .contracts import (
+    EVENT_CUBE_SCHEMA_VERSION,
+    FAMILY_REGISTRY_SCHEMA_VERSION,
+    PHASE_A_AUDIT_SCHEMA_VERSION,
+    TIMING_CONTRACT,
+)
+
+__all__ = [
+    "EVENT_CUBE_SCHEMA_VERSION",
+    "FAMILY_REGISTRY_SCHEMA_VERSION",
+    "PHASE_A_AUDIT_SCHEMA_VERSION",
+    "TIMING_CONTRACT",
+]

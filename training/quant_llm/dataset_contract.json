@@ -1,0 +1,87 @@
+{
+  "schema_version": "quant.qwen3_8b_sft_contract.v2",
+  "input_packet_schema_required": "quant.analysis_packet.v3",
+  "model": "Qwen/Qwen3-8B",
+  "objective": "as-of quant data interpretation, not trade execution",
+  "sources_in_v1": [
+    "FMP daily OHLCV",
+    "Massive ETF Global fund flow",
+    "FMP historical ETF constituents"
+  ],
+  "excluded_until_complete": [
+    "paused partial FMP extended feature backfill",
+    "future returns in prompts",
+    "future returns in SFT targets",
+    "fabricated expert answers"
+  ],
+  "etf_flow_availability": {
+    "policy_id": "massive_etf_flow_us_sessions_v1",
+    "effective_date_min_lag_sessions": 2,
+    "processed_date_min_lag_sessions": 1,
+    "later_bound_wins": true,
+    "trading_calendar": "positive-volume SPY or QQQ daily sessions only",
+    "weekend_junk_rows_advance_lag_clock": false,
+    "missing_calendar_action": "exclude_row_fail_closed"
+  },
+  "etf_preprocessing": {
+    "liquidity_policy_id": "asof_etf_liquidity_20s_v1",
+    "trailing_window_sessions": 20,
+    "min_observed_sessions": 10,
+    "min_nonzero_volume_ratio": 0.75,
+    "min_median_dollar_volume_usd": 1000000,
+    "same_session_positive_volume_required": true,
+    "flow_dedupe": "ticker plus effective_date, latest visible revision only",
+    "flow_scaling": "as-of flow-to-assets plus trailing median and MAD only",
+    "outlier_policy": "retain raw fact, flag robust absolute z-score above 8",
+    "delisted_policy": "retain while historically traded; do not use current active list to delete history",
+    "post_delisting_policy": "no same-session price means no packet"
+  },
+  "price_preprocessing": {
+    "price_basis": "raw close",
+    "adjusted_absolute_price_allowed": false,
+    "rationale": "retrospective adjusted levels can encode later corporate actions",
+    "minimum_trailing_sessions": 5,
+    "packet_price_sessions": 21,
+    "reason_for_21": "twenty-session return requires twenty-one closes",
+    "same_session_positive_volume_required": true,
+    "unexplained_one_session_raw_return_exclusion_threshold": 0.45,
+    "future_relaxation_gate": "only after PIT split and corporate-action events are complete"
+  },
+  "split": {
+    "train_calendar_range": "2017 through 2023 before embargo",
+    "validation_calendar_range": "2024 before embargo",
+    "test_calendar_range": "2025 through latest complete packet",
+    "embargo_trading_sessions": 20
+  },
+  "answer_schema": [
+    "facts",
+    "interpretation",
+    "counter_evidence",
+    "unknowns",
+    "regime",
+    "confidence",
+    "conclusion"
+  ],
+  "prompt_compaction": {
+    "price_rows_in_prompt": 8,
+    "flow_rows_in_prompt": 5,
+    "relation_rows_in_primary_direction_in_prompt": 4,
+    "nonprimary_relation_direction_rows_in_prompt": 0,
+    "constituent_flow_rows_in_prompt": 3,
+    "constituent_flow_rows_in_target": 3,
+    "provenance_hash_samples_in_prompt": 2,
+    "full_raw_source_database_preserved": true,
+    "rich_v3_packet_built_and_validated_in_memory": true,
+    "rich_v3_packet_written_for_every_source_pair": false,
+    "full_token_audit_before_training": true,
+    "overlength_action": "fail_closed_no_truncation"
+  },
+  "baseline_target_origin": "deterministic_auditable_baseline_v1",
+  "reasoning_output_policy": {
+    "training_prompt_suffix": "/no_think",
+    "chain_of_thought_target": false,
+    "deployment_chat_template_kwargs": {"enable_thinking": false},
+    "reason": "structured auditable answer only"
+  },
+  "expert_label_phase": "separate future dataset version with provenance and inter-rater QA"
+}

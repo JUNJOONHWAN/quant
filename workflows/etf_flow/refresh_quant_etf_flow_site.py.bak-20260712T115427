@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Run the canonical quant ETF Flow analysis and publish the current artifact."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+KST = ZoneInfo("Asia/Seoul")
+QUANT_ROOT = Path("/home/zooh/Documents/GitHub/quant")
+WORKFLOW = QUANT_ROOT / "workflows" / "etf_flow"
+LEGACY_INPUT = Path("/home/zooh/Documents/GitHub/STOCK/quant/etf-flow-report/input")
+LEGACY_REPORTS = Path("/home/zooh/Documents/GitHub/STOCK/quant/etf-flow-report/output")
+
+
+class RefreshError(RuntimeError):
+    """Raised when a required quant refresh stage fails."""
+
+
+def run(command: list[str]) -> None:
+    completed = subprocess.run(command, cwd=WORKFLOW, text=True, check=False)
+    if completed.returncode != 0:
+        raise RefreshError(f"Command failed ({completed.returncode}): {' '.join(command)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--endpoint", required=True)
+    parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument("--site-access-token-file", type=Path)
+    parser.add_argument(
+        "--analysis-strategy",
+        choices=["primary", "evidence_editor", "conservative_editor", "coverage_editor"],
+        default="primary",
+    )
+    parser.add_argument("--report-date")
+    parser.add_argument("--timeout", type=int, default=420)
+    args = parser.parse_args()
+    report_date = args.report_date or datetime.now(KST).date().isoformat()
+    data_root = WORKFLOW / "data"
+    artifact_dir = WORKFLOW / "artifacts" / report_date
+    state_path = artifact_dir / "publish_state.json"
+    try:
+        run([
+            "python3", str(WORKFLOW / "stage_etf_flow_snapshot.py"),
+            "--source-input-dir", str(LEGACY_INPUT),
+            "--source-reports-dir", str(LEGACY_REPORTS),
+            "--quant-data-root", str(data_root),
+            "--report-date", report_date,
+        ])
+        run([
+            "python3", str(WORKFLOW / "run_hermes_etf_flow_analysis.py"),
+            "--input-dir", str(data_root / "snapshots" / report_date),
+            "--reports-dir", str(data_root / "daily_reports"),
+            "--output-dir", str(artifact_dir),
+            "--timeout", str(args.timeout),
+        ])
+        selected_analysis = artifact_dir / "analysis.json"
+        if args.analysis_strategy != "primary":
+            selected_analysis = artifact_dir / f"analysis-{args.analysis_strategy}.json"
+            run([
+                "python3", str(WORKFLOW / "refine_etf_flow_analysis.py"),
+                "--packet", str(artifact_dir / "packet.json"),
+                "--analysis", str(artifact_dir / "analysis.json"),
+                "--output", str(selected_analysis),
+                "--strategy", args.analysis_strategy,
+                "--timeout", str(args.timeout),
+            ])
+        publish_command = [
+            "python3", str(WORKFLOW / "publish_etf_flow_analysis.py"),
+            "--analysis", str(selected_analysis),
+            "--endpoint", args.endpoint,
+            "--token-file", str(args.token_file),
+        ]
+        if args.site_access_token_file:
+            publish_command.extend(["--site-access-token-file", str(args.site_access_token_file)])
+        run(publish_command)
+        state = {
+            "status": "ok",
+            "report_date": report_date,
+            "analysis_strategy": args.analysis_strategy,
+            "analysis_path": str(selected_analysis),
+            "published_at_kst": datetime.now(KST).isoformat(timespec="seconds"),
+        }
+    except RefreshError as exc:
+        state = {"status": "error", "report_date": report_date, "error": str(exc), "failed_at_kst": datetime.now(KST).isoformat(timespec="seconds")}
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(state, ensure_ascii=False))
+        return 1
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(state, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,18 @@
+[Unit]
+Description=Quant dataset FMP full-universe EOD backfill
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zooh/Documents/GitHub/quant
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m quant_dataset backfill --source fmp --from 2017-01-01 --to 2026-07-14 --symbols-file /home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET/state/universe/fmp_us_equity_etf_20260714.symbols.txt
+Restart=on-failure
+RestartSec=120
+TimeoutStopSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target

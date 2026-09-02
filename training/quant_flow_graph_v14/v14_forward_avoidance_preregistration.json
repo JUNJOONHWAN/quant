@@ -1,0 +1,142 @@
+{
+  "architecture": {
+    "adaptive_state_contract": "v13 deterministic causal graph-state filter reused without retuning",
+    "catboost_parameters_contract": "v12 CatBoost 1.2.10 parameters reused without retuning",
+    "current_baseline": "price plus full_current_no_rolling Flow and PIT structure",
+    "generative_denoising_diffusion_used": false,
+    "learned_gnn_used": false,
+    "residual_adapter": "v12 25 percent capped price-preserving residual reused unchanged",
+    "transformer_used": false
+  },
+  "controls": {
+    "adaptive_graph_state_lag5": true,
+    "adaptive_graph_state_topology_shuffle": true,
+    "fixed_20_session_graph_state": true,
+    "fresh_fit_current_flow_structure": true,
+    "fresh_fit_price_only": true,
+    "same_date_balancing": true,
+    "same_estimator_capacity": true
+  },
+  "data_contract": {
+    "base_database": {
+      "bytes": 100943228928,
+      "mtime_ns": 1787844753218246628,
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_DATASET/normalized/daily_observations.sqlite3",
+      "sqlite_schema_sha256": "49de9bf28c9c10a3184309df3a46b259bc9f130089eb8b2c7088d401d760af42"
+    },
+    "base_precedence": "base rows through 2026-07-14",
+    "family_registry": {
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_FORECAST/flow_graph_v11/r2_phase_a/v11_r2_etf_family_exposure_registry.sqlite3",
+      "sha256": "b8999da3b7cf0e1ec389385f430f7aa222924d58651ab094f24bff89f21c91e5"
+    },
+    "graph_manifest": {
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_FORECAST/flow_graph_v6/full_20180102_20260729_allpanel/manifest.json",
+      "sha256": "1dcbdbbd8127ec1659ebcc3c8123863c8e2fa1611c0636c86329daebc967179c"
+    },
+    "incremental_database": {
+      "daily_date_range": [
+        "2026-07-15",
+        "2026-08-26"
+      ],
+      "daily_row_count": 356243,
+      "flow_date_range": [
+        "2026-07-17",
+        "2026-08-25"
+      ],
+      "flow_row_count": 135464,
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/oracle/incremental/normalized/daily_observations.sqlite3",
+      "sha256": "275874b736568d1a5f6d2d4deb4bc7d494f576b77f4fb5d4751fd1d0ab4c3290"
+    },
+    "incremental_precedence": "incremental daily rows from 2026-07-15 and incremental Flow rows from 2026-07-17",
+    "old_event_cube": {
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_FORECAST/flow_graph_v11/r2_phase_a/v11_r2_flow_event_cube.sqlite3",
+      "sha256": "f50e2090312c56edf0681cf10028ef8a8adf074ac85740ed36412dfc51a24ec3",
+      "signal_end": "2026-07-14"
+    },
+    "prefix_identity_gate": "all event-cube rows and daily-state rows through 2026-07-14 must be exactly identical to old_event_cube",
+    "repaired_massive_flow_cache": {
+      "historical_backfill_is_true_point_in_time": false,
+      "path": "/home/zooh/Documents/GitHub/STOCKDATA/QUANT_FORECAST/flow_graph_v1/repaired_flow_cache_20260715_20260722.sqlite3",
+      "provider": "Massive ETF Global fund-flows",
+      "provider_availability_rule": "max(second positive-volume U.S. session after effective_date, first positive-volume U.S. session after processed_date)",
+      "quality_gate": "PASS",
+      "sha256": "8e49b20f74b73728bf65f1a27fe07117272cfd5b1f6136047a1f98190e8bc423",
+      "use_scope": "only previously absent 2026-07-15 and 2026-07-16 effective-date keys"
+    },
+    "timing_contract": "signal T; price and liquidity through T-1; Massive Flow effective T-2 and available by T; PIT holdings available no later than T-1; no T-3 fill"
+  },
+  "fmp_decision": {
+    "bulk_download_before_lockbox": false,
+    "current_holdings_as_historical": false,
+    "exact_missing_quarter_fetch_allowed_after_separate_full_gap_diff": true,
+    "reason": "FMP does not supply the missing Massive Flow observations and new FMP features would contaminate the frozen v12-v13 architecture comparison"
+  },
+  "frozen_before_results": true,
+  "gate": {
+    "all_required": true,
+    "data_validity": {
+      "complete_12_target_rows_required": true,
+      "exact_test_dates_required": 11,
+      "prefix_identity_required": true,
+      "relation_stock_coverage_minimum": 0.95,
+      "timing_violation_count": 0
+    },
+    "minimum_clean_future_dates_before_deployment_claim": 60,
+    "primary_target_checks_each": {
+      "adaptive_economic_basket_beats_current": true,
+      "adaptive_economic_basket_beats_topology_shuffle": true,
+      "adaptive_mae_beats_current": true,
+      "adaptive_mae_beats_fixed_state": true,
+      "adaptive_mae_beats_lag5": true,
+      "adaptive_mae_beats_topology_shuffle": true,
+      "adaptive_mean_daily_rank_ic_beats_current": true,
+      "adaptive_mean_daily_rank_ic_beats_topology_shuffle": true,
+      "positive_daily_mae_improvement_vs_current_minimum_dates": 6
+    },
+    "status_if_all_pass": "V14_FORWARD_AVOIDANCE_PRELIMINARY_PASS",
+    "status_otherwise": "V14_FORWARD_AVOIDANCE_FAIL"
+  },
+  "interpretation": {
+    "bf16_or_nvfp4_activation": false,
+    "deployment_activation": false,
+    "label_uninspected_before_preregistration": true,
+    "not_as_observed_flow_archive": true,
+    "preliminary_only_due_to_11_dates": true,
+    "retuning_on_lockbox_prohibited": true
+  },
+  "preregistered_at_utc": "2026-08-28T13:24:40Z",
+  "primary_targets": [
+    "loss_5d_pct",
+    "benchmark_downside_defense_20d_pct"
+  ],
+  "purpose": "test whether the v13 adaptive graph state provides a targeted ETF-Flow avoidance edge on a label-uninspected forward window beyond the v11-v13 event-cube end",
+  "reporting_scope": {
+    "all_12_targets_reported": true,
+    "primary_targets_cannot_be_changed_after_results": true,
+    "secondary_avoidance_targets": [
+      "loss_20d_pct",
+      "benchmark_downside_defense_5d_pct"
+    ]
+  },
+  "schema_version": "quant.etf_flow_v14.forward_avoidance_preregistration.v1",
+  "split": {
+    "date_balanced_training": true,
+    "no_row_or_symbol_sampling": true,
+    "purge_sessions_before_test": 20,
+    "test_signal_dates": [
+      "2026-07-15",
+      "2026-07-16",
+      "2026-07-17",
+      "2026-07-20",
+      "2026-07-21",
+      "2026-07-22",
+      "2026-07-23",
+      "2026-07-24",
+      "2026-07-27",
+      "2026-07-28",
+      "2026-07-29"
+    ],
+    "training_signal_dates": "all eligible dates strictly before the 20-session purge boundary",
+    "validation_or_hyperparameter_tuning": false
+  }
+}

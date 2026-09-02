@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+QUANT_ROOT=/home/zooh/Documents/GitHub/quant
+PYTHON_BIN=${QUANT_AI_PYTHON:-/usr/bin/python3}
+
+cd "$QUANT_ROOT"
+exec "$PYTHON_BIN" -m workflows.quant_ai_radar.app_cli "$@"

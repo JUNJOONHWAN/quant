@@ -1,0 +1,940 @@
+"""Strict release and inference contracts for the trained quant LoRA.
+
+There is deliberately no alternate writer backend in this module. A release
+that has not passed the frozen evaluation gate, an endpoint serving a different
+model, or a response that changes deterministic facts is a hard failure.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+
+RELEASE_SCHEMA = "quant.trained_model_release.v1"
+REQUIRED_RESPONSE_KEYS = (
+    "facts",
+    "interpretation",
+    "counter_evidence",
+    "unknowns",
+    "regime",
+    "confidence",
+    "conclusion",
+)
+MODEL_RESPONSE_KEYS = tuple(
+    key for key in REQUIRED_RESPONSE_KEYS if key != "facts"
+)
+REGIMES = {
+    "insufficient_joint_evidence",
+    "price_flow_positive_confirmation",
+    "price_flow_negative_confirmation",
+    "price_up_flow_out_divergence",
+    "price_down_flow_in_divergence",
+    "mixed_or_flat",
+}
+SIGNALS = {"positive", "negative", "flat", "unknown"}
+FLOW_SIGNAL_SOURCES = {
+    "own_etf_flow",
+    "constituent_etf_flow_exposure",
+    "none",
+}
+TASK_TYPES = {
+    "etf_own_flow_analysis",
+    "stock_constituent_flow_analysis",
+    "all_stock_control_analysis",
+}
+DETERMINISTIC_FACT_PRECISION = {
+    "etf_flow_to_constituent.net_weighted_flow_rate_contribution_pct": 6,
+}
+DATE_PATTERN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
+
+
+class ModelGateError(RuntimeError):
+    """Raised before inference when the released adapter is not trustworthy."""
+
+
+class InferenceError(RuntimeError):
+    """Raised when the one authorized model endpoint cannot answer."""
+
+
+class ModelResponseParseError(InferenceError):
+    """Raised when the endpoint answered but its assistant content is not JSON."""
+
+
+class ResponseContractError(RuntimeError):
+    """Raised when a model response mutates facts or violates analysis scope."""
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def contract_repair_instruction(
+    expected_response: Mapping[str, Any], contract_error: str
+) -> str:
+    """Build a compact repair turn without asking the model to echo facts."""
+
+    facts = expected_response.get("facts")
+    if not isinstance(facts, Mapping):
+        raise ResponseContractError(
+            "expected response has no deterministic facts for contract repair"
+        )
+    interpretation = expected_response.get("interpretation")
+    if not isinstance(interpretation, Mapping):
+        raise ResponseContractError(
+            "expected response has no interpretation contract for repair"
+        )
+    required_interpretation = {
+        "scope": interpretation.get("scope"),
+        "task_type": interpretation.get("task_type"),
+        "price_signal": interpretation.get("price_signal"),
+        "etf_flow_signal": interpretation.get("etf_flow_signal"),
+        "etf_flow_signal_source": interpretation.get(
+            "etf_flow_signal_source"
+        ),
+        "relationship": interpretation.get("relationship"),
+        "regime": expected_response.get("regime"),
+        "allowed_price_signal_values": sorted(SIGNALS),
+        "allowed_etf_flow_signal_values": sorted(SIGNALS),
+        "allowed_regime_values": sorted(REGIMES),
+    }
+    if (
+        required_interpretation["scope"]
+        != "data_interpretation_not_trade_execution"
+        or required_interpretation["task_type"] not in TASK_TYPES
+        or required_interpretation["price_signal"] not in SIGNALS
+        or required_interpretation["etf_flow_signal"] not in SIGNALS
+        or required_interpretation["etf_flow_signal_source"]
+        not in FLOW_SIGNAL_SOURCES
+        or required_interpretation["relationship"] not in REGIMES
+        or required_interpretation["regime"] not in REGIMES
+    ):
+        raise ResponseContractError(
+            "expected response has invalid deterministic interpretation fields"
+        )
+    interpretation_clause = (
+        "아래 REQUIRED_INTERPRETATION_CONTRACT_JSON의 scope, task_type, "
+        "price_signal, etf_flow_signal, etf_flow_signal_source, relationship, "
+        "regime은 정확히 그대로 사용하라. allowed 목록은 형식 검증용이며 "
+        "다른 허용값으로 바꾸면 안 된다.\n"
+        "REQUIRED_INTERPRETATION_CONTRACT_JSON="
+        f"{canonical_json(required_interpretation)}\n"
+    )
+    return (
+        "이전 응답은 계약 위반이다. 입력 시점 이후 날짜를 만들지 말고 "
+        "입력의 결정론적 facts를 변경하거나 다시 출력하지 마라. facts는 "
+        "Python이 원본에서 재결합한다. ALLOWED_TOP_LEVEL_KEYS_JSON의 해석 필드만 "
+        "각각 정확히 한 번씩 사용한 압축 JSON 객체로 다시 답하라. 해석은 "
+        "입력 시점의 증거만 사용하라. 이 응답은 주문을 실행하지 않는다.\n"
+        f"ALLOWED_TOP_LEVEL_KEYS_JSON={canonical_json(list(MODEL_RESPONSE_KEYS))}\n"
+        f"FACT_IDENTITY_JSON={canonical_json({'symbol': facts.get('symbol'), 'as_of_date': facts.get('as_of_date')})}\n"
+        f"{interpretation_clause}"
+        "/no_think"
+    )
+
+
+def symbol_guided_json_schema(
+    expected_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Constrain the model to interpretation only; Python owns exact facts."""
+
+    interpretation = expected_response.get("interpretation")
+    regime = expected_response.get("regime")
+    if not isinstance(interpretation, Mapping) or regime not in REGIMES:
+        raise ResponseContractError(
+            "expected response has no valid symbol schema contract"
+        )
+    return {
+        "type": "object",
+        "properties": {
+            "interpretation": {
+                "type": "object",
+                "properties": {
+                    "price_signal": {
+                        "type": "string",
+                        "enum": [interpretation.get("price_signal")],
+                    },
+                    "etf_flow_signal": {
+                        "type": "string",
+                        "enum": [interpretation.get("etf_flow_signal")],
+                    },
+                    "etf_flow_signal_source": {
+                        "type": "string",
+                        "enum": [
+                            interpretation.get("etf_flow_signal_source")
+                        ],
+                    },
+                    "relationship": {
+                        "type": "string",
+                        "enum": [regime],
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["data_interpretation_not_trade_execution"],
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": [interpretation.get("task_type")],
+                    },
+                },
+                "required": [
+                    "price_signal",
+                    "etf_flow_signal",
+                    "etf_flow_signal_source",
+                    "relationship",
+                    "scope",
+                    "task_type",
+                ],
+                "additionalProperties": False,
+            },
+            "counter_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "unknowns": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "regime": {"type": "string", "enum": [regime]},
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "conclusion": {"type": "string", "minLength": 1},
+        },
+        "required": list(MODEL_RESPONSE_KEYS),
+        "additionalProperties": False,
+    }
+
+
+def canonicalize_deterministic_facts(value: Any) -> Any:
+    """Apply only the numeric precision declared by the deterministic contract."""
+
+    if not isinstance(value, Mapping):
+        return value
+    normalized = copy.deepcopy(dict(value))
+    exposure = normalized.get("etf_flow_to_constituent")
+    if not isinstance(exposure, Mapping):
+        return normalized
+    exposure = dict(exposure)
+    normalized["etf_flow_to_constituent"] = exposure
+    field = "net_weighted_flow_rate_contribution_pct"
+    raw = exposure.get(field)
+    if (
+        isinstance(raw, (int, float))
+        and not isinstance(raw, bool)
+        and math.isfinite(float(raw))
+    ):
+        exposure[field] = round(
+            float(raw),
+            DETERMINISTIC_FACT_PRECISION[
+                "etf_flow_to_constituent."
+                "net_weighted_flow_rate_contribution_pct"
+            ],
+        )
+    return normalized
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def _read_object(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise ModelGateError(f"{label} is missing: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ModelGateError(f"{label} is invalid JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise ModelGateError(f"{label} must be one JSON object: {path}")
+    return value
+
+
+def _resolve_release_path(release_path: Path, raw_path: Any, label: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ModelGateError(f"{label} path is missing from the release manifest")
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = release_path.parent / candidate
+    return candidate.resolve()
+
+
+def _verify_bound_file(
+    release_path: Path, value: Mapping[str, Any], label: str
+) -> tuple[Path, str]:
+    path = _resolve_release_path(release_path, value.get("path"), label)
+    expected = str(value.get("sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ModelGateError(f"{label} SHA256 is missing or invalid")
+    if not path.is_file():
+        raise ModelGateError(f"{label} file is missing: {path}")
+    observed = sha256_file(path)
+    if observed != expected:
+        raise ModelGateError(
+            f"{label} SHA256 mismatch: expected={expected} observed={observed} path={path}"
+        )
+    return path, observed
+
+
+@dataclass(frozen=True)
+class ModelRelease:
+    manifest_path: Path
+    manifest_sha256: str
+    model_id: str
+    endpoint_model: str
+    base_model: str
+    adapter_root: Path
+    adapter_set_sha256: str
+    dataset_manifest_sha256: str
+    evaluation_sha256: str
+    raw: dict[str, Any]
+    merged_model_manifest_sha256: str | None = None
+
+    def public_metadata(self) -> dict[str, Any]:
+        metadata = {
+            "schema_version": RELEASE_SCHEMA,
+            "status": "accepted",
+            "model_id": self.model_id,
+            "endpoint_model": self.endpoint_model,
+            "base_model": self.base_model,
+            "adapter_set_sha256": self.adapter_set_sha256,
+            "dataset_manifest_sha256": self.dataset_manifest_sha256,
+            "evaluation_sha256": self.evaluation_sha256,
+            "release_manifest_sha256": self.manifest_sha256,
+        }
+        if self.merged_model_manifest_sha256:
+            merged = self.raw.get("merged_model") or {}
+            metadata["merged_model"] = {
+                "manifest_sha256": self.merged_model_manifest_sha256,
+                "content_sha256": merged.get("content_sha256"),
+                "precision": merged.get("precision"),
+                "file_count": merged.get("file_count"),
+                "total_bytes": merged.get("total_bytes"),
+            }
+        return metadata
+
+
+def load_model_release(path: Path) -> ModelRelease:
+    """Verify the frozen dataset, evaluation, and every adapter artifact."""
+
+    release_path = Path(path).expanduser().resolve()
+    value = _read_object(release_path, "trained-model release manifest")
+    if value.get("schema_version") != RELEASE_SCHEMA:
+        raise ModelGateError(
+            f"unsupported release schema: {value.get('schema_version')!r}"
+        )
+    if value.get("status") != "accepted":
+        raise ModelGateError(
+            f"trained-model release is not accepted: {value.get('status')!r}"
+        )
+    model_id = str(value.get("model_id") or "").strip()
+    endpoint_model = str(value.get("endpoint_model") or "").strip()
+    base_model = str(value.get("base_model") or "").strip()
+    if not model_id or not endpoint_model or not base_model:
+        raise ModelGateError("release model_id, endpoint_model, and base_model are required")
+
+    adapter_root = _resolve_release_path(
+        release_path, value.get("adapter_root"), "adapter_root"
+    )
+    if not adapter_root.is_dir():
+        raise ModelGateError(f"released adapter directory is missing: {adapter_root}")
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ModelGateError("release manifest has no adapter artifacts")
+    verified_artifacts: list[tuple[str, str]] = []
+    for index, item in enumerate(artifacts):
+        if not isinstance(item, dict):
+            raise ModelGateError(f"adapter artifact {index} is not an object")
+        artifact_path, digest = _verify_bound_file(
+            release_path, item, f"adapter artifact {index}"
+        )
+        try:
+            relative = artifact_path.relative_to(adapter_root)
+        except ValueError as exc:
+            raise ModelGateError(
+                f"adapter artifact escapes adapter_root: {artifact_path}"
+            ) from exc
+        verified_artifacts.append((relative.as_posix(), digest))
+
+    dataset = value.get("dataset_manifest")
+    evaluation = value.get("evaluation")
+    if not isinstance(dataset, dict) or not isinstance(evaluation, dict):
+        raise ModelGateError("release must bind dataset_manifest and evaluation")
+    _, dataset_sha = _verify_bound_file(release_path, dataset, "dataset manifest")
+    evaluation_path, evaluation_sha = _verify_bound_file(
+        release_path, evaluation, "evaluation report"
+    )
+    evaluation_value = _read_object(evaluation_path, "evaluation report")
+    if evaluation_value.get("status") != "green":
+        raise ModelGateError(
+            f"evaluation report is not green: {evaluation_value.get('status')!r}"
+        )
+    if int(evaluation_value.get("prohibited_violation_count", -1)) != 0:
+        raise ModelGateError("evaluation report contains prohibited violations")
+    required_gates = evaluation_value.get("required_gates")
+    if not isinstance(required_gates, dict) or not required_gates:
+        raise ModelGateError("evaluation report has no required_gates")
+    failed_gates = sorted(key for key, passed in required_gates.items() if passed is not True)
+    if failed_gates:
+        raise ModelGateError(f"evaluation gates are not green: {failed_gates}")
+    evaluation_inputs = value.get("evaluation_inputs")
+    if not isinstance(evaluation_inputs, dict):
+        raise ModelGateError("release has no bound evaluation_inputs")
+    for key in ("frozen_test", "predictions"):
+        item = evaluation_inputs.get(key)
+        if not isinstance(item, dict):
+            raise ModelGateError(f"release has no bound evaluation input: {key}")
+        _, bound_sha = _verify_bound_file(
+            release_path, item, f"evaluation input {key}"
+        )
+        evaluated_item = evaluation_value.get(key) or {}
+        if evaluated_item.get("sha256") != bound_sha:
+            raise ModelGateError(f"evaluation input {key} does not match its report")
+
+    adapter_set_sha = sha256_bytes(
+        canonical_json(sorted(verified_artifacts)).encode("utf-8")
+    )
+    declared_adapter_set_sha = str(value.get("adapter_set_sha256") or "")
+    if declared_adapter_set_sha != adapter_set_sha:
+        raise ModelGateError(
+            "adapter_set_sha256 does not match the verified released artifacts"
+        )
+    merged_model_manifest_sha = None
+    merged_model = value.get("merged_model")
+    if merged_model is not None:
+        if not isinstance(merged_model, dict):
+            raise ModelGateError("merged_model release binding must be an object")
+        merged_manifest_binding = merged_model.get("manifest")
+        if not isinstance(merged_manifest_binding, dict):
+            raise ModelGateError("merged_model has no bound manifest")
+        merged_manifest_path, merged_model_manifest_sha = _verify_bound_file(
+            release_path,
+            merged_manifest_binding,
+            "merged-model manifest",
+        )
+        merged_manifest = _read_object(
+            merged_manifest_path, "merged-model manifest"
+        )
+        if (
+            merged_manifest.get("schema_version")
+            != "quant.merged_hf_model.v1"
+            or merged_manifest.get("status") != "complete"
+            or merged_manifest.get("model_name") != endpoint_model
+            or merged_manifest.get("precision") != "bfloat16"
+        ):
+            raise ModelGateError(
+                "merged-model manifest does not match the release contract"
+            )
+        merged_root = _resolve_release_path(
+            release_path, merged_model.get("root"), "merged_model.root"
+        )
+        if not merged_root.is_dir():
+            raise ModelGateError(
+                f"released merged-model directory is missing: {merged_root}"
+            )
+        if Path(base_model).expanduser().resolve() != merged_root:
+            raise ModelGateError(
+                "release base_model does not match merged_model.root"
+            )
+        source_adapter_hashes = sorted(
+            digest for _, digest in verified_artifacts
+        )
+        merged_adapter_rows = merged_manifest.get("adapter_artifacts")
+        if not isinstance(merged_adapter_rows, list):
+            raise ModelGateError(
+                "merged-model manifest has no adapter artifacts"
+            )
+        merged_adapter_hashes = sorted(
+            str(row.get("sha256") or "")
+            for row in merged_adapter_rows
+            if isinstance(row, dict)
+        )
+        if merged_adapter_hashes != source_adapter_hashes:
+            raise ModelGateError(
+                "merged-model adapter artifacts differ from the release"
+            )
+        declared_files = merged_manifest.get("files")
+        if not isinstance(declared_files, list) or not declared_files:
+            raise ModelGateError("merged-model manifest has no model files")
+        total_bytes = 0
+        for index, row in enumerate(declared_files):
+            if not isinstance(row, dict):
+                raise ModelGateError(
+                    f"merged-model file {index} is not an object"
+                )
+            relative = Path(str(row.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ModelGateError(
+                    f"merged-model file escapes root: {relative}"
+                )
+            model_file = (merged_root / relative).resolve()
+            try:
+                model_file.relative_to(merged_root)
+            except ValueError as exc:
+                raise ModelGateError(
+                    f"merged-model file escapes root: {model_file}"
+                ) from exc
+            if not model_file.is_file():
+                raise ModelGateError(
+                    f"merged-model file is missing: {model_file}"
+                )
+            size = model_file.stat().st_size
+            if size != int(row.get("bytes") or -1):
+                raise ModelGateError(
+                    f"merged-model file size mismatch: {model_file}"
+                )
+            if sha256_file(model_file) != str(row.get("sha256") or ""):
+                raise ModelGateError(
+                    f"merged-model file SHA256 mismatch: {model_file}"
+                )
+            total_bytes += size
+        if int(merged_model.get("file_count") or -1) != len(declared_files):
+            raise ModelGateError("merged_model file_count is invalid")
+        if int(merged_model.get("total_bytes") or -1) != total_bytes:
+            raise ModelGateError("merged_model total_bytes is invalid")
+        content_core = dict(merged_manifest)
+        declared_content_sha = str(content_core.pop("content_sha256", ""))
+        observed_content_sha = sha256_bytes(
+            canonical_json(content_core).encode("utf-8")
+        )
+        if (
+            declared_content_sha != observed_content_sha
+            or str(merged_model.get("content_sha256") or "")
+            != observed_content_sha
+        ):
+            raise ModelGateError("merged-model content SHA256 is invalid")
+    return ModelRelease(
+        manifest_path=release_path,
+        manifest_sha256=sha256_file(release_path),
+        model_id=model_id,
+        endpoint_model=endpoint_model,
+        base_model=base_model,
+        adapter_root=adapter_root,
+        adapter_set_sha256=adapter_set_sha,
+        dataset_manifest_sha256=dataset_sha,
+        evaluation_sha256=evaluation_sha,
+        raw=value,
+        merged_model_manifest_sha256=merged_model_manifest_sha,
+    )
+
+
+def parse_json_object(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    candidates = [text]
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    candidates.extend(fenced)
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ModelResponseParseError(
+        "trained model response did not contain one valid JSON object"
+    )
+
+
+Transport = Callable[[dict[str, Any], Mapping[str, str], int], dict[str, Any]]
+
+
+class TrainedQuantClient:
+    """OpenAI-compatible client bound to exactly one accepted LoRA release."""
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        release: ModelRelease,
+        token: str | None = None,
+        timeout: int = 180,
+        transport: Transport | None = None,
+    ) -> None:
+        if not endpoint.startswith(("http://", "https://")):
+            raise ModelGateError("trained-model endpoint must be an absolute HTTP URL")
+        self.endpoint = endpoint
+        self.release = release
+        self.token = token
+        self.timeout = timeout
+        self.transport = transport or self._http_transport
+
+    def _http_transport(
+        self, payload: dict[str, Any], headers: Mapping[str, str], timeout: int
+    ) -> dict[str, Any]:
+        body = canonical_json(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint,
+            data=body,
+            method="POST",
+            headers={**dict(headers), "content-length": str(len(body))},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            suffix = f": {detail[:2000]}" if detail else ""
+            raise InferenceError(
+                f"trained-model endpoint request failed: HTTP {exc.code}{suffix}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise InferenceError(f"trained-model endpoint request failed: {exc}") from exc
+        if status != 200:
+            raise InferenceError(f"trained-model endpoint returned HTTP {status}")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise InferenceError("trained-model endpoint returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise InferenceError("trained-model endpoint returned a non-object response")
+        return value
+
+    def _complete_messages_raw(
+        self,
+        *,
+        messages: Sequence[Mapping[str, str]],
+        max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        payload = {
+            "model": self.release.endpoint_model,
+            "messages": [dict(message) for message in messages],
+            "temperature": 0,
+            "seed": 1111,
+            "max_tokens": max_tokens,
+            "response_format": (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "quant_ai_radar_response",
+                        "schema": dict(response_schema),
+                    },
+                }
+                if response_schema is not None
+                else {"type": "json_object"}
+            ),
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        headers = {
+            "content-type": "application/json",
+            "user-agent": "quant-ai-radar/1.0",
+        }
+        if self.token:
+            headers["authorization"] = f"Bearer {self.token}"
+        body = self.transport(payload, headers, self.timeout)
+        returned_model = str(body.get("model") or "")
+        if returned_model != self.release.endpoint_model:
+            raise InferenceError(
+                "endpoint served a different model: "
+                f"expected={self.release.endpoint_model!r} got={returned_model!r}"
+            )
+        try:
+            content = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise InferenceError("trained-model endpoint response has no assistant content") from exc
+        if not isinstance(content, str):
+            raise InferenceError("trained-model assistant content is not text")
+        trace = {
+            "endpoint_model": returned_model,
+            "request_sha256": sha256_bytes(canonical_json(payload).encode("utf-8")),
+            "response_sha256": sha256_bytes(content.encode("utf-8")),
+            "finish_reason": (body.get("choices") or [{}])[0].get("finish_reason"),
+            "usage": body.get("usage"),
+        }
+        return content, trace
+
+    def complete_messages(
+        self,
+        *,
+        messages: Sequence[Mapping[str, str]],
+        max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        content, trace = self._complete_messages_raw(
+            messages=messages,
+            max_tokens=max_tokens,
+            response_schema=response_schema,
+        )
+        try:
+            return parse_json_object(content), trace
+        except ModelResponseParseError as exc:
+            exc.trace = trace
+            exc.raw_content = content
+            raise
+
+    def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 1400,
+        response_schema: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.complete_messages(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            response_schema=response_schema,
+        )
+
+    def complete_validated(
+        self,
+        *,
+        system: str,
+        user: str,
+        expected_response: Mapping[str, Any],
+        max_tokens: int = 1400,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Run the trained prompt, then allow two explicit repair turns."""
+
+        initial_messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        guided_schema = symbol_guided_json_schema(expected_response)
+        content, initial_trace = self._complete_messages_raw(
+            messages=initial_messages,
+            max_tokens=max_tokens,
+            response_schema=guided_schema,
+        )
+        initial: dict[str, Any] | None = None
+        try:
+            initial = parse_json_object(content)
+            validated = validate_symbol_judgement(initial, expected_response)
+        except (InferenceError, ResponseContractError) as exc:
+            repair = contract_repair_instruction(expected_response, str(exc))
+            repaired_content, final_trace = self._complete_messages_raw(
+                messages=[
+                    *initial_messages,
+                    {
+                        "role": "assistant",
+                        "content": (
+                            canonical_json(initial)
+                            if initial is not None
+                            else content
+                        ),
+                    },
+                    {"role": "user", "content": repair},
+                ],
+                max_tokens=max_tokens,
+                response_schema=guided_schema,
+            )
+            repaired: dict[str, Any] | None = None
+            try:
+                repaired = parse_json_object(repaired_content)
+                validated = validate_symbol_judgement(
+                    repaired, expected_response
+                )
+            except (InferenceError, ResponseContractError) as second_exc:
+                final_repair = contract_repair_instruction(
+                    expected_response, str(second_exc)
+                )
+                final_content, last_trace = self._complete_messages_raw(
+                    messages=[
+                        *initial_messages,
+                        {
+                            "role": "assistant",
+                            "content": (
+                                canonical_json(repaired)
+                                if repaired is not None
+                                else repaired_content
+                            ),
+                        },
+                        {"role": "user", "content": final_repair},
+                    ],
+                    max_tokens=max_tokens,
+                    response_schema=guided_schema,
+                )
+                try:
+                    final = parse_json_object(final_content)
+                    validated = validate_symbol_judgement(
+                        final, expected_response
+                    )
+                except (InferenceError, ResponseContractError) as final_exc:
+                    final_trace = {
+                        **last_trace,
+                        "contract_attempts": 3,
+                        "contract_repair_applied": True,
+                        "initial_request_sha256": initial_trace[
+                            "request_sha256"
+                        ],
+                        "initial_response_sha256": initial_trace[
+                            "response_sha256"
+                        ],
+                        "initial_contract_error": (
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "second_contract_error": (
+                            f"{type(second_exc).__name__}: {second_exc}"
+                        ),
+                        "final_contract_error": (
+                            f"{type(final_exc).__name__}: {final_exc}"
+                        ),
+                    }
+                    setattr(final_exc, "trace", final_trace)
+                    setattr(final_exc, "raw_content", final_content)
+                    raise
+                return validated, {
+                    **last_trace,
+                    "contract_attempts": 3,
+                    "contract_repair_applied": True,
+                    "initial_request_sha256": initial_trace[
+                        "request_sha256"
+                    ],
+                    "initial_response_sha256": initial_trace[
+                        "response_sha256"
+                    ],
+                    "initial_contract_error": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "second_contract_error": (
+                        f"{type(second_exc).__name__}: {second_exc}"
+                    ),
+                }
+            return validated, {
+                **final_trace,
+                "contract_attempts": 2,
+                "contract_repair_applied": True,
+                "initial_request_sha256": initial_trace["request_sha256"],
+                "initial_response_sha256": initial_trace["response_sha256"],
+                "initial_contract_error": f"{type(exc).__name__}: {exc}",
+            }
+        return validated, {
+            **initial_trace,
+            "contract_attempts": 1,
+            "contract_repair_applied": False,
+        }
+
+
+def _future_dates(value: Any, as_of_date: str) -> list[str]:
+    found = set(DATE_PATTERN.findall(canonical_json(value)))
+    as_of = date.fromisoformat(as_of_date)
+    return sorted(item for item in found if date.fromisoformat(item) > as_of)
+
+
+def judgement_prohibited_violations(
+    value: Mapping[str, Any], as_of_date: str
+) -> list[str]:
+    """Return the release-blocking lookahead/scope violations in a judgement."""
+
+    violations = [f"post_as_of_date:{item}" for item in _future_dates(value, as_of_date)]
+    return violations
+
+
+def validate_symbol_judgement(
+    value: Mapping[str, Any], expected_response: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Keep model interpretation flexible while binding every supplied fact."""
+
+    missing = [key for key in MODEL_RESPONSE_KEYS if key not in value]
+    unexpected = [key for key in value if key not in REQUIRED_RESPONSE_KEYS]
+    if missing or unexpected:
+        raise ResponseContractError(
+            "symbol judgement fields do not match the contract: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    expected_facts = canonicalize_deterministic_facts(
+        expected_response.get("facts")
+    )
+    if "facts" in value:
+        observed_facts = canonicalize_deterministic_facts(value.get("facts"))
+        if observed_facts != expected_facts:
+            raise ResponseContractError("trained model changed deterministic facts")
+    interpretation = value.get("interpretation")
+    expected_interpretation = expected_response.get("interpretation") or {}
+    if not isinstance(interpretation, dict):
+        raise ResponseContractError("symbol interpretation must be an object")
+    if interpretation.get("scope") != "data_interpretation_not_trade_execution":
+        raise ResponseContractError("symbol judgement escaped the analysis-only scope")
+    if interpretation.get("task_type") != expected_interpretation.get("task_type"):
+        raise ResponseContractError("symbol judgement changed the deterministic task type")
+    if interpretation.get("price_signal") != expected_interpretation.get(
+        "price_signal"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic price signal"
+        )
+    if interpretation.get("etf_flow_signal") != expected_interpretation.get(
+        "etf_flow_signal"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic ETF-flow signal"
+        )
+    if interpretation.get("etf_flow_signal_source") != expected_interpretation.get(
+        "etf_flow_signal_source"
+    ):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic ETF-flow source"
+        )
+    if interpretation.get("price_signal") not in SIGNALS:
+        raise ResponseContractError("symbol judgement has an invalid price signal")
+    if interpretation.get("etf_flow_signal") not in SIGNALS:
+        raise ResponseContractError("symbol judgement has an invalid ETF-flow signal")
+    if interpretation.get("etf_flow_signal_source") not in FLOW_SIGNAL_SOURCES:
+        raise ResponseContractError("symbol judgement has an invalid ETF-flow source")
+    if interpretation.get("task_type") not in TASK_TYPES:
+        raise ResponseContractError("symbol judgement has an invalid task type")
+    if value.get("regime") not in REGIMES:
+        raise ResponseContractError("symbol judgement has an invalid regime")
+    if value.get("regime") != expected_response.get("regime"):
+        raise ResponseContractError(
+            "symbol judgement changed the deterministic regime"
+        )
+    if interpretation.get("relationship") != value.get("regime"):
+        raise ResponseContractError(
+            "symbol interpretation relationship does not match regime"
+        )
+    confidence = value.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        raise ResponseContractError("symbol judgement confidence must be numeric")
+    if not 0 <= float(confidence) <= 1:
+        raise ResponseContractError("symbol judgement confidence is outside [0,1]")
+    if not isinstance(value.get("counter_evidence"), list) or not all(
+        isinstance(item, str) for item in value["counter_evidence"]
+    ):
+        raise ResponseContractError("counter_evidence must be a string array")
+    if not isinstance(value.get("unknowns"), list) or not all(
+        isinstance(item, str) for item in value["unknowns"]
+    ):
+        raise ResponseContractError("unknowns must be a string array")
+    if not isinstance(value.get("conclusion"), str) or not value["conclusion"].strip():
+        raise ResponseContractError("symbol judgement conclusion is empty")
+    as_of_date = str((expected_response.get("facts") or {}).get("as_of_date") or "")
+    violations = judgement_prohibited_violations(value, as_of_date)
+    future_dates = [item.split(":", 1)[1] for item in violations if item.startswith("post_as_of_date:")]
+    if future_dates:
+        raise ResponseContractError(
+            f"symbol judgement contains post-as-of dates: {future_dates}"
+        )
+    normalized = dict(value)
+    normalized["facts"] = expected_facts
+    return normalized

@@ -1,0 +1,526 @@
+# Quant AI Radar
+
+This is the post-training market and security analysis workflow. It does not
+use the legacy 31-ticker ETF Flow dashboard, Hermes writer responses, or a
+hard-coded ticker list.
+
+## Standalone application and CLI
+
+Quant AI Radar is registered as the independent Hermes application
+`quant-ai-radar`. The `ai-radar` command automatically loads
+`/home/zooh/.config/quant/quant-ai-radar.env`; callers do not need to export the
+model endpoint or release manifest manually.
+
+```bash
+# Read-only readiness and current runtime state
+ai-radar preflight
+ai-radar status
+
+# Full daily run. This publishes status/latest.json only after the complete
+# selected queue and market synthesis finish.
+ai-radar daily
+
+# Complete non-publishing reference run
+ai-radar daily --shadow
+
+# Explicit symbols bypass the daily capacity selection while retaining every
+# packet, point-in-time, release, and response-contract gate.
+ai-radar analyze AAPL NVDA
+
+# Oracle처럼 자연어로 호출. 명시 ticker는 즉시 on-demand 분석하고,
+# 시장·후보·회전 질문은 Oracle 기준일과 일치하는 최신 green 리포트로 답한다.
+ai-radar ask "오늘 AI Radar 시장 분석 보여줘"
+ai-radar ask "강세와 약세 종목 후보는?"
+ai-radar ask "현재 섹터 로테이션은?"
+ai-radar ask "AAPL 분석해줘"
+```
+
+Hermes uses the same entrypoint through Operations App Manager:
+
+```bash
+hermes apps run quant-ai-radar --json
+
+hermes apps run quant-ai-radar \
+  --input-json '{"action":"daily","shadow":true}' \
+  --json
+
+hermes apps run quant-ai-radar \
+  --input-json '{"action":"analyze","symbols":["AAPL","NVDA"]}' \
+  --json
+
+hermes apps run quant-ai-radar \
+  --input-json '{"action":"ask","question":"현재 섹터 로테이션과 종목 후보를 보여줘"}' \
+  --json
+```
+
+App Manager seals request JSON and passes only its file path and canonical
+SHA-256 to the app. The active Hermes readiness schedule is Tue-Sat at
+06:00, 12:00, and 18:00 KST, with a 07:05 KST recovery run for an unfinished
+06:00 publication. Every invocation first seals or reuses the Oracle DB, then
+requires an Oracle-fingerprint-matched green report and a Gmail v3 message ID.
+Same-input retries do not resend mail. If the same market date receives a
+new Oracle seal, the old queue and artifacts are archived, inference is rebuilt
+from the revised source, and one explicitly labelled correction email is sent.
+The systemd timer remains a disabled fallback. Registering or running this
+application does not resume the paused FMP history backfill, modify ETF Flow,
+or place trades.
+
+Market Structure Oracle and Quant AI Radar remain separate applications.
+Oracle owns the current-market incremental database; AI Radar reads that
+sealed database as an input and creates its own trained-model reports. It does
+not run or embed an Oracle report.
+
+The complete model card, training recipe, daily operating contract, and
+input/output examples are in
+[`OPERATIONS_AND_MODEL_CARD.md`](OPERATIONS_AND_MODEL_CARD.md).
+The authoritative current-data ownership, new-listing, lookahead, locking, and
+recovery contract is
+[`ORACLE_SHARED_DATA_CONTRACT.md`](ORACLE_SHARED_DATA_CONTRACT.md).
+The daily collection, consistency, recovery, scheduling, email, and incident
+history runbook is
+[`DAILY_ORACLE_AI_RADAR_RUNBOOK.md`](DAILY_ORACLE_AI_RADAR_RUNBOOK.md).
+The staged plan for using the accepted LoRA more deeply through daily change
+memory, historical analogs, calibration, reviewer passes, and a future
+challenger adapter is [`V3_ROADMAP.md`](V3_ROADMAP.md).
+The implemented inference-only individual forecast contract is
+[`INFERENCE_ONLY_FORECAST_PRD.md`](INFERENCE_ONLY_FORECAST_PRD.md).
+
+## End-to-end contract
+
+```text
+historical FMP/Massive + PIT ETF relations
+  -> Qwen3-8B BF16 LoRA training
+  -> frozen test evaluation and accepted release manifest
+  -> Oracle single-writer current-market store
+  -> immutable FMP history + FMP daily EOD + Massive ETF Global Flow
+  -> bounded FMP ETF-constituent refresh (new ETFs first)
+  -> Oracle snapshot seal and SHA-256 receipt
+  -> sealed read-only shared source binding
+  -> persistent ETF/security relation index plus complete observed-universe scan
+  -> quant.analysis_packet.v3 PIT and liquidity gates
+  -> dynamic material-evidence selection (default max 64 ETFs + 192 stocks)
+  -> trained LoRA judgement for the selected daily evidence
+  -> complete coverage ledger for selected and nonselected securities
+  -> deterministic selected-scope aggregate
+  -> same trained LoRA market synthesis
+  -> market_report.json and security_judgements.jsonl
+```
+
+The deterministic layer computes all numbers. The model may interpret facts,
+counter-evidence, unknowns, regime, confidence, and conclusion. It may not
+change facts, use a post-as-of date, or issue a trade instruction.
+
+The inference response deliberately does not ask the LoRA to echo the complete
+`facts` object. The model returns only `interpretation`, `counter_evidence`,
+`unknowns`, `regime`, `confidence`, and `conclusion` under guided JSON Schema;
+Python then reattaches the byte-equivalent canonical facts. A legacy response
+that supplies `facts` is still accepted only when every deterministic value is
+identical. This keeps the fact-mutation gate while preventing long ETF relation
+payloads from exhausting the completion budget.
+
+Every explicit symbol analysis uses three separate inference-time layers. The
+accepted Qwen3-8B-FLOW LoRA identifies the current learned price--ETF Flow
+pattern. Python then searches the 131,568-example point-in-time candidate
+corpus, calculates fully observable 5/20/60-session outcomes from the read-only
+price ledger, and caps repeated examples per symbol. Qwen 27B receives that 8B
+pattern, the computed outcome distributions, and an available same-date market
+context, then returns one probabilistic research view: `매수 검토`, `보유 관찰`,
+`관망`, `비중 축소 검토`, or `회피`, with supporting evidence,
+counter-evidence, and invalidation conditions. Python does not choose or replace
+the 27B view. It owns neighbour selection, arithmetic, cutoff enforcement,
+schema validation, and rendering. This path performs no additional training and
+has no fallback model or hard-coded action prose.
+
+Daily reports do not use the five individual forecast labels. Their security
+cards use Qwen3-8B-FLOW only and contain the current learned pattern, pattern
+evidence, pattern risk, ETF transmission, and the next confirmation condition.
+
+## Source roles
+
+- `QUANT_DATASET`: source-preserving FMP/Massive daily observations, Massive
+  ETF Global flow revisions, and PIT FMP ETF constituents/memberships. This is
+  the training-aligned packet source.
+- `Market Structure Oracle incremental store`: the only current-session writer.
+  It repairs every session after the immutable FMP cutoff with the daily FMP
+  active master, legacy full-market EOD, and per-symbol
+  BAR/NO_BAR/QUARANTINED_INVALID_BAR/ERROR fallback. Provider-invalid OHLC is
+  retained only as
+  `QUARANTINED_INVALID_BAR`, never as a model-facing price. Oracle captures
+  Massive ETF Global revisions; refreshes FMP ticker
+  lineage and ETF constituents; and writes the snapshot seal. Quant AI Radar
+  attaches it read-only to the immutable long-history database.
+- `ETF RADAR`: a separate application. It is not a source, release gate,
+  universe gate, selection input, or runtime dependency of Oracle/AI Radar.
+- learned Qwen3-8B LoRA: the point-in-time pattern reader and the only daily
+  report writer.
+- Qwen 27B: individual-security forecast synthesis only, after the deterministic
+  historical-analogue engine. It is not called by the daily report.
+- neither path has cached/hard-coded prose or a model fallback.
+
+## Full-scan and selective-inference policy
+
+The universe scan starts from every positive-volume security observed on the
+as-of date. Every security with a visible ETF flow, ETF constituent snapshot,
+or ETF membership receives a full v3 packet review. Securities with no ETF
+relationship are counted as `all_stock_control_symbols` but are outside this
+ETF-grounded product. There is no fixed ticker list.
+
+The expensive model lane is intentionally not run over every related security.
+Oracle-derived evidence dynamically ranks material daily flow, rotation,
+price/flow disagreement, and constituent-transmission cases. The default
+capacity ceiling is 64 ETFs and 192 stocks. These are ceilings, not fixed daily
+counts or fixed symbol lists. Every nonselected candidate remains in
+`coverage_ledger.jsonl` with its quantitative priority and explicit reason.
+
+The SFT liquidity and leakage gates are reused unchanged:
+
+- same-session positive-volume price and at least five price sessions;
+- ETF trailing-20 liquidity gate: at least 10 sessions, 75% positive volume,
+  and USD 1 million median dollar volume;
+- raw one-session discontinuity below 45% unless a PIT corporate action exists;
+- Massive ETF flow visible only under `massive_etf_flow_us_sessions_v1`;
+- current-signal ETF Flow must be no more than 10 calendar days old, must
+  normalize through provider assets or `NAV * shares`, and must remain within
+  the absolute 100% flow-to-net-assets plausibility gate;
+- FMP ETF membership visible only after its derived next-session gate;
+- no present-day active list removes a historically valid observation.
+
+Split and reverse-split handling is owned by the Oracle database, not by the
+report renderer. Oracle stores source-preserving Massive and FMP provider
+versions plus any verified issuer/exchange notice. Provider rows become
+available only on their first observed capture date; an official notice may
+use its documented announcement date. AI Radar reads only rows whose
+`effective_date` and `available_date` are both no later than the report
+`as_of_date`, then accepts an event only when it is official or the exact ratio
+is corroborated by both Massive and FMP. Pre-effective price and volume rows
+are converted to the latest visible share basis before eligibility, feature
+calculation, training-example construction, or model inference. A provider
+event discovered after the analysis date is retained in the source ledger but
+cannot be backdated into that analysis.
+
+The current-signal gate does not delete history. It only prevents an ETF whose
+last visible observation is stale, malformed, or outside the plausibility
+contract from transmitting that old value into today's stock ranking. ETF
+selection also repeats the training liquidity contract: same-session price,
+at least 10 trailing sessions, at least 75% positive-volume sessions, and at
+least USD 1 million median dollar volume.
+
+The market report publishes separate reference lanes for price/Flow positive
+confirmation, price/Flow negative confirmation, and price/Flow divergence.
+They are watchlists and risk lists, never order instructions.
+
+Selected securities are written to the restartable inference queue. The
+25-item leader arrays in the final market report are presentation-only; every
+selected result remains in `security_judgements.jsonl`.
+
+## Prepare now without training or inference
+
+Run with the quant host Python runtime:
+
+```bash
+cd /home/zooh/Documents/GitHub/quant
+PYTHONPATH=$PWD /usr/bin/python3 \
+  -m workflows.quant_ai_radar.run_quant_ai_radar --prepare-only
+```
+
+This writes the universe/release manifests and a resumable queue. It does not
+start training, stop Qwen/Gemma, or call a model endpoint.
+
+## After training
+
+Training output is not deployable by itself. Serve the candidate adapter under
+an isolated endpoint, collect every frozen-test response, and evaluate it. The
+collector is resumable and rejects a server that returns a different model id:
+
+```bash
+python3 -m training.quant_llm.collect_frozen_predictions \
+  --test-file /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v3/test.jsonl \
+  --endpoint http://127.0.0.1:8018/v1/chat/completions \
+  --endpoint-model qwen3-8b-quant-lora-v1 \
+  --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/evaluations/qwen3_8b_quant_lora_v1/predictions.jsonl
+
+python3 -m training.quant_llm.evaluate_frozen_test \
+  --dataset-manifest /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_sft_v2/manifest.json \
+  --test-file /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_candidate_v3/test.jsonl \
+  --predictions /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/evaluations/qwen3_8b_quant_lora_v1/predictions.jsonl \
+  --endpoint-model qwen3-8b-quant-lora-v1 \
+  --adapter-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1 \
+  --artifact /absolute/path/to/adapter_model.safetensors \
+  --artifact /absolute/path/to/adapter_config.json \
+  --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/evaluations/qwen3_8b_quant_lora_v1/frozen_test_evaluation.json
+```
+
+The evaluator requires complete frozen-test coverage and gates schema validity,
+exact deterministic facts, regime/signal accuracy, counter-evidence/unknown
+recall, and zero post-as-of dates or trade directives. It hashes the test file,
+predictions, dataset manifest, and exact adapter artifact set. Only then create
+the release manifest:
+
+```bash
+python3 -m training.quant_llm.create_model_release \
+  --model-id qwen3-8b-quant-lora-v1 \
+  --endpoint-model qwen3-8b-quant-lora-v1 \
+  --base-model /home/zooh/models/Qwen3-8B-bf16 \
+  --adapter-root /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/checkpoints/qwen3_8b_quant_lora_v1 \
+  --artifact /absolute/path/to/adapter_model.safetensors \
+  --artifact /absolute/path/to/adapter_config.json \
+  --dataset-manifest /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/datasets/qwen3_8b_sft_v2/manifest.json \
+  --evaluation-report /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/evaluations/qwen3_8b_quant_lora_v1/frozen_test_evaluation.json \
+  --output /home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/qwen3_8b_quant_lora_v1/release_manifest.json
+```
+
+The evaluation report must be `green`, report zero prohibited violations, and
+have every required gate set to `true`. Release creation also proves that the
+evaluated endpoint model, dataset manifest, and adapter artifact set are exactly
+the ones being released. The runtime independently rechecks all bound hashes.
+
+Create `/home/zooh/.config/quant/quant-ai-radar.env` only after the accepted
+LoRA is served by an OpenAI-compatible endpoint:
+
+```text
+QUANT_AI_MODEL_ENDPOINT=http://127.0.0.1:8018/v1/chat/completions
+QUANT_AI_RELEASE_MANIFEST=/home/zooh/Documents/GitHub/STOCKDATA/QUANT_LLM/releases/Qwen3-8B-FLOW/release_manifest.json
+QUANT_AI_WORKERS=4
+QUANT_AI_MAX_ETFS=64
+QUANT_AI_MAX_STOCKS=192
+QUANT_AI_MAX_CONSTITUENT_AVAILABLE_LAG_DAYS=45
+# QUANT_AI_MODEL_TOKEN_FILE=/home/zooh/.config/quant/model-token
+```
+
+Daily and on-demand inference share
+`workflows.quant_ai_radar.training_native.complete_training_native_judgement`.
+It sends the exact `context` and `instruction` returned by the training
+`build_example()` function for `quant.analysis_packet.v3`; runtime code must not
+append a second instruction. The queue binds
+`quant.analysis_packet.v3.build_example.context_instruction.v1`, so results
+created under a different prompt contract cannot be silently reused. Daily
+market, sector, and security pages aggregate only those native 8B judgements
+and make no separate narrative-model call. On-demand analysis passes the same
+native 8B judgement to the completed historical-analogue calculation and then
+to the configured 27B forecast synthesizer.
+
+Use `--smoke-max-items N` for a non-publishable endpoint smoke. A production
+market judgement is written only when the entire queue has no pending, running,
+or error rows.
+
+Use `--shadow` for a complete selected-scope run that renders every report but
+does not update `status/latest.json`. Shadow is the required mode before timer
+approval.
+
+## On-demand symbol analysis
+
+The daily 64 ETF / 192 stock ceilings do not restrict an explicit user
+request. Any symbol with a valid current packet can be analyzed with the same
+accepted 8B pattern reader, the historical-analogue engine, and the configured
+27B forecast synthesizer, including a no-ETF-relation
+`all_stock_control_analysis`.
+On-demand analysis loads the same sealed Oracle corporate-action ledger and
+applies the same pre-feature price/volume basis conversion as the daily run:
+
+```bash
+PYTHONPATH=$PWD /usr/bin/python3 \
+  -m workflows.quant_ai_radar.analyze_on_demand AAPL NVDA
+```
+
+Results are written under
+`QUANT_AI_RADAR/on_demand/YYYY-MM-DD/<SYMBOL>.json|html`; the request receipt
+contains both paths. Missing current price, quality, or PIT evidence fails
+closed with a recorded reason.
+
+The first run builds the disposable derived index at
+`QUANT_AI_RADAR/analog/historical_analog_index.sqlite3`. The SFT
+materialization and price ledgers are always opened read-only. Useful optional
+settings are `QUANT_AI_FORECAST_MODEL_ENDPOINT`,
+`QUANT_AI_FORECAST_MODEL_NAME`, `QUANT_AI_ANALOG_EXAMPLE_DATABASE`,
+`QUANT_AI_ANALOG_PRICE_DATABASE`, and `QUANT_AI_ANALOG_INDEX_DATABASE`.
+
+## Shared Oracle data and scheduling
+
+`run_daily_cycle.py` performs the following in order:
+
+1. Run `prepare_shared_data.py`.
+2. Reuse the existing COMPLETE Oracle snapshot when it already matches the
+   latest fully closed NYSE session; otherwise let the Oracle single writer
+   repair the missing sessions.
+3. Verify the target-session row gate, D+1/D+2 flow freshness, Oracle snapshot
+   seal, PIT constituent visibility, and source fingerprint.
+4. Attach the immutable FMP history and Oracle incremental database read-only.
+5. Refresh the persistent relation index from only new source row markers.
+6. Scan the complete current universe, rank material evidence, and hand only
+   the selected daily scope to the restartable inference queue.
+
+This service does not run the old independent `refresh_daily_data.py` path and
+does not recollect the same FMP/Massive data into a second database. The
+historical FMP backfill remains an independent, paused/resumable job and is
+never resumed by this workflow. PIT FMP constituents come from the latest
+visible stored snapshot and fail closed when their provider-available date is
+older than the configured maximum lag.
+
+The active Operations-managed Hermes readiness schedule runs Tue-Sat at
+06:00, 12:00, and 18:00 KST using the timezone-bound expression
+`0 6,12,18 * * 2-6` with `Asia/Seoul`. It does not run hourly overnight.
+Production completion means
+the complete selected queue is empty of pending/running/error work, every
+report quality score is at least 8/10, the rendered report passes the 420px
+HTML contract, and Gmail returns a message id (or the same-date delivery ledger
+proves that the report was already sent). Shadow and smoke runs never send
+email.
+
+The Gmail implementation is owned by Quant AI Radar and does not import ETF
+RADAR application code. It reuses the protected host OAuth and recipient files
+as shared infrastructure, records only recipient count and Gmail message id,
+and deduplicates one message per US `as_of_date`.
+
+Validate a completed manual shadow with the observed wall-clock duration:
+
+```bash
+PYTHONPATH=$PWD /usr/bin/python3 \
+  -m workflows.quant_ai_radar.validate_shadow_run \
+  --run-dir /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/runs/YYYY-MM-DD \
+  --elapsed-seconds <OBSERVED_SECONDS>
+```
+
+The validator fails closed on queue residue, prompt/response hash gaps,
+post-as-of dates, trade directives, source fingerprint gaps, rendered artifact
+hash drift, accidental `status/latest.json` publication, or an over-window
+runtime. It writes `shadow_gate_audit.json`. One passing frozen-date shadow is
+only the first activation prerequisite; the timer still requires five
+consecutive daily passing shadows and explicit user approval.
+
+Capture the matching DGX runtime window after each shadow:
+
+```bash
+PYTHONPATH=$PWD /usr/bin/python3 \
+  -m workflows.quant_ai_radar.validate_runtime_readiness \
+  --run-dir /home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/runs/YYYY-MM-DD \
+  --since "<shadow start KST>"
+```
+
+`runtime_readiness_audit.json` keeps Linux OOM-kill, NVIDIA Xid, NVIDIA
+`NV_ERR_NO_MEMORY`, vLLM OOM/restart, Docker boot recovery, user linger, disabled
+Radar units, and paused FMP backfill as separate evidence. A graphics-context
+`NV_ERR_NO_MEMORY` warning does not invalidate hash-verified reference output
+when vLLM stayed healthy, but that shadow does not count toward timer activation.
+
+## Decision-grade report contract
+
+The released LoRA is used for structured judgement, not arithmetic. Python owns
+all point-in-time facts, ETF-to-constituent weighted flow calculations, breadth
+counts, and displayed values. The model selects the market state, relevant
+confirmation/contradiction evidence IDs, leaders, and qualitative summary.
+
+Market synthesis uses vLLM guided JSON Schema. Evidence IDs are enums built from
+the current immutable evidence catalog, so an unknown ID cannot be generated.
+Model-written evidence prose is discarded; confirmation and contradiction cards
+render the exact catalog object selected by the model. Digits in free-form
+summary/unknown text are removed because exact values are renderer-owned. A
+separate semantic gate still rejects reversed directional comparisons.
+
+`quality_audit.json` scores these six publication gates from zero to ten:
+
+- data integrity
+- numeric faithfulness
+- security analysis
+- market structure
+- model judgement integration
+- report usability
+
+Every category must be at least `8.0`. A lower score produces
+`shadow_quality_failed_not_published` or blocks reference publication. This is
+a program/runtime contract and does not require retraining the released adapter.
+
+## 다단계 AI 해설
+
+일일 production report는 숫자 계산과 AI 설명을 분리한다. Python이 전체
+정량 스캔, 시장 폭, 가격-ETF Flow regime, 섹터 회전, ETF-구성종목 전달
+값을 확정한다. 그 뒤 released Qwen3-8B LoRA가 다음 순서로만 설명한다.
+
+1. 모든 Oracle rotation cluster를 3개씩 나눠 전체 시장 문맥 안에서 해설
+2. 강세 확인, 약세 확인, 가격-Flow 괴리 lane의 상위 종목을 각각 최대
+   4개씩 골라 소속 섹터와 ETF 전달 경로, 현재 학습 패턴, 패턴 근거,
+   패턴 위험과 다음 확인 조건을 해설
+3. 앞의 모든 해설과 전체 결정론 집계를 다시 읽어 편집장 종합문 작성
+
+모델은 숫자, 날짜, raw 상태 코드, 매수·매도 지시를 쓸 수 없다. 정확한
+수치와 한국어 상태명은 renderer가 소유한다. sector 전체 coverage, 주요
+종목 coverage, 편집장 종합, 최소 다단계 호출이 하나라도 빠지면 v2
+production quality gate는 red로 닫힌다. 원문과 호출 hash는
+`market_report.json`의 `multistage_narratives`와
+`multistage_narrative_trace`에 남는다.
+
+v2 설명 경로에는 다른 writer 모델, 규칙 기반 해설, hardcoded 설명
+fallback이 없다. Qwen3-8B-FLOW 응답이 문장 완결성, 섹터 상태, 실제
+ETF-종목 연결, 현재 시점 전용 표현, 비인과적 표현, 종목 coverage 계약을
+통과하지 못하면 renderer와 420px 이메일 모두 실패한다. 숫자·날짜·미래
+전망·인과 과장·투자자 동기가 섞이면 Python이 문장을 잘라 고치지 않고
+같은 8B에 계약 재응답을 요구한다. Python은 항목 순서 복원, 한국어 상태
+label, 표시용 숫자와 반올림만 소유한다.
+
+각 sector/security/editorial stage는 결정론적 입력 SHA256과 검증된 모델
+원문을 `runs/YYYY-MM-DD/narrative_stages/`에 원자적으로 checkpoint한다.
+재시작은 입력 hash와 현재 계약을 다시 검증한 stage만 재사용하고, 실패한
+stage만 같은 trained model로 재호출한다. 성공 stage를 다른 문구로
+재작성하거나 모델 장애를 숨기지 않는다.
+
+## Hermes heartbeat production integration
+
+Hermes는 실행 조정, 상태 감시, 메일 완료 확인만 소유한다.
+`Qwen3-8B-FLOW`가 일일 리포트의 유일한 해설 writer다. 관리 앱 ID는
+`quant-ai-radar`이며 허트비트의 예약 리포트 층에는
+`AI Radar 종합`으로 표시된다.
+
+준비 확인 시각은 KST 화–토 `06:00`, `12:00`, `18:00`이다. 새벽
+반복 실행은 없다. 각 시각에도 데이터 준비나 모델 호출 전에 Oracle의
+봉인 기준일, v2 green 리포트, Gmail v3 원장을 비교한다. 정확히 일치하면
+`engine_status=already_complete`로 즉시 종료하며 추론과 메일 발송을
+반복하지 않는다. Oracle 기준일이 진전됐거나 리포트·메일 최종 게이트가
+미완료일 때만 모델 실행을 시작한다.
+
+허트비트는 다음 조건을 모두 통과한 결과만 완료로 인정한다.
+
+- Oracle 기준일과 리포트 `as_of_date` 일치
+- v2 스키마, `reference_publish`, 모든 품질 점수 8점 이상
+- 회전 군집 9개, 주요 종목 해설 12개 이상, 모델 단계 8개 이상
+- 기록된 모든 해설 호출 모델이 `Qwen3-8B-FLOW`
+- 승인 release가 BF16 merge manifest와 전체 shard hash를 결속
+- `status/latest.json`과 기준일 run report의 hash 일치
+- 전체 HTML과 420px HTML 존재
+- Gmail v3 원장의 message ID 및 report/mobile/attachment hash 일치
+
+관리 앱 lock은 겹치는 실행을 차단하고 Gmail 원장은 미국 시장 기준일별
+v2 메일을 한 번만 허용한다. 다른 writer 폴백과 거래 실행 경로는 없다.
+
+## Outputs
+
+```text
+/home/zooh/Documents/GitHub/STOCKDATA/QUANT_AI_RADAR/
+  runs/YYYY-MM-DD/
+    universe_manifest.json
+    candidates.jsonl
+    selection_manifest.json
+    selected_candidates.jsonl
+    coverage_ledger.jsonl
+    oracle_market_features.json
+    selected_run_queue.sqlite3
+    security_judgements.jsonl
+    market_report.json
+    market_report.html
+    quality_audit.json
+    security_index.html
+    security_reports/<SYMBOL>.json
+    security_reports/<SYMBOL>.html
+    rendered_reports_manifest.json
+    shadow_gate_audit.json
+    runtime_readiness_audit.json
+    run_state.json
+  on_demand/YYYY-MM-DD/
+    <SYMBOL>.json
+    <SYMBOL>.html
+    latest_request.json
+  status/latest.json
+  status/daily_data_refresh.json
+  status/daily_cycle.json
+```
+
+`market_report.json` is analysis only. Order generation and trade execution are
+not part of this repository or service.
